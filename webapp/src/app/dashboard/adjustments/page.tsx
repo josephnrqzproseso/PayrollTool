@@ -58,18 +58,6 @@ export default function AdjustmentsPage() {
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    Promise.all([
-      fetch("/api/employees?status=Active").then((r) => r.json()),
-      fetch("/api/adjustment-types").then((r) => r.json()),
-    ]).then(([emps, types]) => {
-      if (Array.isArray(emps)) setEmployees(emps);
-      if (Array.isArray(emps) && emps.length > 0) setEmployeeId(emps[0].id);
-      if (Array.isArray(types)) setAdjTypes(types);
-      setLoading(false);
-    });
-  }, []);
-
   const loadAdjustments = useCallback(async (selectedEmployeeId: string) => {
     if (!selectedEmployeeId) {
       setAdjustments([]);
@@ -82,6 +70,18 @@ export default function AdjustmentsPage() {
     const data: Adjustment[] = await res.json();
     setAdjustments(Array.isArray(data) ? data : []);
   }, [periodKey]);
+
+  useEffect(() => {
+    Promise.all([
+      fetch("/api/employees?status=Active").then((r) => r.json()),
+      fetch("/api/adjustment-types").then((r) => r.json()),
+    ]).then(([emps, types]) => {
+      if (Array.isArray(emps)) setEmployees(emps);
+      if (Array.isArray(emps) && emps.length > 0) setEmployeeId(emps[0].id);
+      if (Array.isArray(types)) setAdjTypes(types);
+      setLoading(false);
+    });
+  }, []);
 
   useEffect(() => {
     if (loading || !employeeId) return;
@@ -128,6 +128,11 @@ export default function AdjustmentsPage() {
     }> = [];
 
     const parsedAmount = Number(form.amount);
+    if (Number.isNaN(parsedAmount)) {
+      setMessage("Please enter a valid amount.");
+      setSaving(false);
+      return;
+    }
 
     payloadAdjustments.push({
       employeeId,
@@ -157,7 +162,7 @@ export default function AdjustmentsPage() {
       const result = await res.json();
       setMessage(`Saved: ${result.upserted} updated, ${result.removed} cleared.`);
       resetForm();
-      loadAdjustments(employeeId);
+      void loadAdjustments(employeeId);
     } else {
       setMessage("Failed to save.");
     }
@@ -176,7 +181,7 @@ export default function AdjustmentsPage() {
     if (res.ok) {
       setMessage(`Removed ${adj.name}.`);
       if (editingAdjustmentId === adj.id) resetForm();
-      loadAdjustments(employeeId);
+      void loadAdjustments(employeeId);
     } else {
       setMessage("Failed to remove adjustment.");
     }
@@ -194,7 +199,7 @@ export default function AdjustmentsPage() {
     if (res.ok) {
       const data = await res.json();
       setMessage(`Recurring applied: ${data.created} created, ${data.skipped} skipped.`);
-      loadAdjustments(employeeId);
+      void loadAdjustments(employeeId);
     } else {
       const err = await res.json().catch(() => null);
       setMessage(err?.error || "Failed to apply recurring adjustments.");
@@ -214,7 +219,8 @@ export default function AdjustmentsPage() {
           <select
             value={employeeId}
             onChange={(e) => {
-              setEmployeeId(e.target.value);
+              const nextEmployeeId = e.target.value;
+              setEmployeeId(nextEmployeeId);
               resetForm();
             }}
             style={{ padding: "8px 12px", borderRadius: 6, border: "1px solid #ddd", fontSize: 13, minWidth: 220 }}
