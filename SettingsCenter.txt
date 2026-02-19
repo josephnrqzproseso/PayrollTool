@@ -1,0 +1,582 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <style>
+    /* === GLOBAL === */
+    html, body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      font-family: "Segoe UI", Roboto, sans-serif;
+      color: #202124;
+      background-color: #fff;
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* === TAB HEADER === */
+    .tabs {
+      display: flex;
+      background: #1a73e8;
+      color: #fff;
+      font-weight: 500;
+      border-bottom: 2px solid #0f5ed0;
+      position: sticky;
+      top: 0;
+      z-index: 5;
+    }
+
+    .tab {
+      flex: 1;
+      text-align: center;
+      padding: 12px 0;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.2s ease;
+      font-size: 14px;
+      letter-spacing: 0.2px;
+    }
+
+    .tab.active {
+      background: #0f5ed0;
+      font-weight: 600;
+    }
+
+    .tab:hover {
+      background: #1665d8;
+    }
+
+    /* === CONTENT === */
+    .content {
+      flex: 1;
+      padding: 20px 24px;
+      overflow-y: auto;
+      box-sizing: border-box;
+    }
+
+    .tabcontent {
+      display: none;
+      animation: fadeIn 0.25s ease-in;
+    }
+
+    .tabcontent.active {
+      display: block;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(4px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    /* === TABLES === */
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 12px;
+    }
+
+    th, td {
+      padding: 8px 10px;
+      border: 1px solid #ddd;
+      font-size: 13px;
+      vertical-align: middle;
+    }
+
+    th {
+      background: #f8f9fa;
+      font-weight: 600;
+      text-align: left;
+    }
+
+    select, input {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 6px 8px;
+      font-size: 13px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      transition: border-color 0.2s;
+    }
+
+    select:focus, input:focus {
+      outline: none;
+      border-color: #1a73e8;
+      box-shadow: 0 0 2px rgba(26, 115, 232, 0.3);
+    }
+
+    /* === BUTTONS === */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 8px 14px;
+      margin-top: 12px;
+      background: #1a73e8;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 500;
+      transition: background 0.2s ease, transform 0.1s;
+    }
+
+    .btn:hover {
+      background: #155fcf;
+      transform: translateY(-1px);
+    }
+
+    .btn.secondary {
+      background: #777;
+    }
+
+    .btn.secondary:hover {
+      background: #555;
+    }
+
+    .btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
+    }
+
+    /* === STATUS TEXT === */
+    #result {
+      margin-top: 10px;
+      font-size: 13px;
+      white-space: pre-line;
+      color: #444;
+      background: #f8f9fa;
+      border: 1px solid #e0e0e0;
+      border-radius: 6px;
+      padding: 8px 10px;
+    }
+
+    /* === RESPONSIVE === */
+    @media (max-width: 600px) {
+      .content {
+        padding: 16px;
+      }
+      .tab {
+        font-size: 13px;
+        padding: 10px 0;
+      }
+    }
+
+    /* ✅ Brand logo INSIDE modal (sticky bottom, does not overlay scrollbar) */
+.brand-sticky-bottom{
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;  /* lower-right */
+  padding: 8px 0 2px;
+  background: #fff;
+}
+  </style>
+  <?!= include_('UiTheme'); ?>
+</head>
+<body class="ui-page">
+
+  <div class="tabs">
+    <div class="tab active" onclick="showTab('general')">General</div>
+    <div class="tab" onclick="showTab('company')">Company Details</div>
+        <div class="tab" onclick="showTab('accounting')">Accounting Integration</div>
+        
+
+
+
+  </div>
+
+  <div class="content">
+    <!-- General Settings Tab -->
+    <div id="tab-general" class="tabcontent active">
+      <?!= HtmlService.createTemplateFromFile('PayrollSettingsDialog').evaluate().getContent(); ?>
+    </div>
+
+    <div id="tab-company" class="tabcontent">
+  <h3 style="margin-top:0;">Company Details</h3>
+
+  <table>
+    <tr>
+      <th style="width:35%;">Field</th>
+      <th>Value</th>
+    </tr>
+    <tr>
+      <td>TIN</td>
+      <td><input type="text" id="cd_tin" disabled></td>
+    </tr>
+    <tr>
+      <td>Registered Name</td>
+      <td><input type="text" id="cd_registeredName" disabled></td>
+    </tr>
+    <tr>
+      <td>Registered Address 1</td>
+      <td><input type="text" id="cd_address1" disabled></td>
+    </tr>
+    <tr>
+      <td>Registered Address 2</td>
+      <td><input type="text" id="cd_address2" disabled></td>
+    </tr>
+    <tr>
+      <td>ZIP Code</td>
+      <td><input type="text" id="cd_zip" disabled></td>
+    </tr>
+    <tr>
+      <td>Authorized Representative</td>
+      <td><input type="text" id="cd_authRep" disabled></td>
+    </tr>
+  </table>
+
+  <div style="margin-top: 16px; display:flex; gap: 8px; flex-wrap: wrap;">
+  <button class="btn secondary" id="cd_editBtn" onclick="cd_enableEdit()">Edit</button>
+  <button class="btn" id="cd_saveBtn" onclick="cd_save()" disabled>Save</button>
+</div>
+
+<div id="cd_status" style="margin-top:10px;"></div>
+</div> <!-- END tab-company -->
+
+<!-- Accounting Integration Tab -->
+<div id="tab-accounting" class="tabcontent">
+  <h3 style="margin-top:0;">Accounting Integration</h3>
+
+  <table>
+    <tr>
+      <th style="width:35%;">Field</th>
+      <th>Value</th>
+    </tr>
+
+    <tr>
+      <td>Provider</td>
+      <td>
+        <select id="acc_provider" onchange="acc_showFields()">
+          <option value="">None</option>
+          <option value="XERO">Xero</option>
+          <option value="ODOO">Odoo</option>
+        </select>
+      </td>
+    </tr>
+  </table>
+
+  <div id="acc_xero_fields" style="display:none; margin-top:12px;">
+    <h4 style="margin:8px 0;">Xero</h4>
+    <table>
+      <tr><td style="width:35%;">Tenant ID</td><td><input id="xero_tenantId" type="text" placeholder="xero-tenant-id"></td></tr>
+      <tr><td>Access Token</td><td><input id="xero_accessToken" type="text" placeholder="Bearer token"></td></tr>
+    </table>
+    <div class="text-muted" style="margin-top:6px;">
+      Used for COA sync + direct posting (Manual Journals / Bills).
+    </div>
+  </div>
+
+  <div id="acc_odoo_fields" style="display:none; margin-top:12px;">
+    <h4 style="margin:8px 0;">Odoo</h4>
+    <table>
+      <tr><td style="width:35%;">Base URL</td><td><input id="odoo_baseUrl" type="text" placeholder="https://yourcompany.odoo.com"></td></tr>
+      <tr><td>Database</td><td><input id="odoo_db" type="text"></td></tr>
+      <tr><td>Username</td><td><input id="odoo_username" type="text"></td></tr>
+      <tr><td>API Key / Password</td><td><input id="odoo_apiKey" type="password"></td></tr>
+      <tr id="odoo_company_row" style="display:none;">
+  <td>Company</td>
+  <td>
+    <select id="odoo_companyId" style="width:100%;"></select>
+  </td>
+</tr>
+
+    </table>
+  </div>
+
+  <div style="margin-top: 16px; display:flex; gap: 8px; flex-wrap: wrap;">
+  <button class="btn secondary" onclick="acc_testConnection()">Test Connection</button>
+  <button class="btn" onclick="acc_save()">Save</button>
+</div>
+
+
+  <div id="acc_status" style="margin-top:10px;"></div>
+</div> <!-- END tab-accounting -->
+
+
+
+
+  </div>
+
+  <div class="brand-sticky-bottom">
+  <?!= include_('BrandWatermarkInline'); ?>
+</div>
+
+
+  <script>
+    // === TAB SWITCHING ===
+    function showTab(tab) {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      document.querySelectorAll('.tabcontent').forEach(c => c.classList.remove('active'));
+
+      const tabBtn = document.querySelector(`.tab[onclick*="${tab}"]`);
+if (tabBtn) tabBtn.classList.add('active');
+document.getElementById(`tab-${tab}`).classList.add('active');
+
+      document.getElementById(`tab-${tab}`).classList.add('active');
+
+      // optional: load company details when opening tab
+        if (tab === 'company') cd_load();
+    if (tab === 'accounting') acc_load();
+
+    }
+
+    function cd_setStatus(msg) {
+    const el = document.getElementById('cd_status');
+    el.textContent = msg || '';
+    el.style.whiteSpace = 'pre-line';
+    el.style.color = '#444';
+    el.style.background = '#f8f9fa';
+    el.style.border = '1px solid #e0e0e0';
+    el.style.borderRadius = '6px';
+    el.style.padding = '8px 10px';
+  }
+
+  function cd_setDisabled(disabled) {
+    ['cd_tin','cd_registeredName','cd_address1','cd_address2','cd_zip','cd_authRep']
+      .forEach(id => document.getElementById(id).disabled = !!disabled);
+
+    document.getElementById('cd_saveBtn').disabled = !!disabled;
+  }
+
+  function cd_enableEdit() {
+    cd_setDisabled(false);
+    cd_setStatus('Editing enabled. Update fields then click Save.');
+  }
+
+  function cd_load() {
+    cd_setDisabled(true);
+    cd_setStatus('Loading company details…');
+
+    google.script.run
+      .withSuccessHandler(res => {
+        // same response normalization pattern as Payroll Settings
+        const cfg = (res && (res.props || res.settings)) ? (res.props || res.settings) : (res || {});
+
+        document.getElementById('cd_tin').value            = cfg.COMPANY_TIN || cfg.companyTin || '';
+        document.getElementById('cd_registeredName').value = cfg.COMPANY_REGISTERED_NAME || cfg.companyRegisteredName || '';
+        document.getElementById('cd_address1').value       = cfg.COMPANY_REGISTERED_ADDRESS1 || cfg.companyAddress1 || '';
+        document.getElementById('cd_address2').value       = cfg.COMPANY_REGISTERED_ADDRESS2 || cfg.companyAddress2 || '';
+        document.getElementById('cd_zip').value            = cfg.COMPANY_ZIP_CODE || cfg.companyZip || '';
+        document.getElementById('cd_authRep').value        = cfg.COMPANY_AUTHORIZED_REP || cfg.companyAuthRep || '';
+
+        cd_setStatus('✅ Company details loaded. Click Edit to modify.');
+      })
+      .withFailureHandler(err => {
+        cd_setStatus('❌ ' + (err && err.message ? err.message : err));
+      })
+      .loadSettings(); // SAME loader function used by Payroll Settings
+  }
+
+  function cd_save() {
+    cd_setStatus('💾 Saving company details…');
+
+    const payload = {
+      // canonical keys
+      COMPANY_TIN: document.getElementById('cd_tin').value.trim(),
+      COMPANY_REGISTERED_NAME: document.getElementById('cd_registeredName').value.trim(),
+      COMPANY_REGISTERED_ADDRESS1: document.getElementById('cd_address1').value.trim(),
+      COMPANY_REGISTERED_ADDRESS2: document.getElementById('cd_address2').value.trim(),
+      COMPANY_ZIP_CODE: document.getElementById('cd_zip').value.trim(),
+      COMPANY_AUTHORIZED_REP: document.getElementById('cd_authRep').value.trim(),
+
+      // aliases (safe if ignored)
+      companyTin: document.getElementById('cd_tin').value.trim(),
+      companyRegisteredName: document.getElementById('cd_registeredName').value.trim(),
+      companyAddress1: document.getElementById('cd_address1').value.trim(),
+      companyAddress2: document.getElementById('cd_address2').value.trim(),
+      companyZip: document.getElementById('cd_zip').value.trim(),
+      companyAuthRep: document.getElementById('cd_authRep').value.trim()
+    };
+
+    google.script.run
+      .withSuccessHandler(() => {
+        cd_setDisabled(true);
+        cd_setStatus('✅ Company details saved.');
+      })
+      .withFailureHandler(err => {
+        cd_setStatus('❌ ' + (err && err.message ? err.message : err));
+      })
+      .saveSettings(payload); // SAME saver function used by Payroll Settings
+  }
+
+    function acc_setStatus(msg) {
+    const el = document.getElementById('acc_status');
+    el.textContent = msg || '';
+    el.style.whiteSpace = 'pre-line';
+    el.style.color = '#444';
+    el.style.background = '#f8f9fa';
+    el.style.border = '1px solid #e0e0e0';
+    el.style.borderRadius = '6px';
+    el.style.padding = '8px 10px';
+  }
+
+  function acc_showFields() {
+  const provider = (document.getElementById('acc_provider').value || '').toUpperCase();
+  document.getElementById('acc_xero_fields').style.display = (provider === 'XERO') ? '' : 'none';
+  document.getElementById('acc_odoo_fields').style.display = (provider === 'ODOO') ? '' : 'none';
+
+  // Hide company row unless provider is ODOO (it will be shown after successful test or if saved)
+  if (provider !== 'ODOO') {
+    document.getElementById('odoo_company_row').style.display = 'none';
+  }
+}
+
+
+  function acc_load() {
+    acc_setStatus('Loading accounting settings…');
+
+    google.script.run
+      .withSuccessHandler(res => {
+        const cfg = (res && (res.props || res.settings)) ? (res.props || res.settings) : (res || {});
+
+        document.getElementById('acc_provider').value = (cfg.ACC_PROVIDER || '').toUpperCase();
+
+        document.getElementById('xero_tenantId').value = cfg.XERO_TENANT_ID || '';
+        document.getElementById('xero_accessToken').value = cfg.XERO_ACCESS_TOKEN || '';
+
+        document.getElementById('odoo_baseUrl').value = cfg.ODOO_BASE_URL || '';
+        document.getElementById('odoo_db').value = cfg.ODOO_DB || '';
+        document.getElementById('odoo_username').value = cfg.ODOO_USERNAME || '';
+        document.getElementById('odoo_apiKey').value = cfg.ODOO_API_KEY || '';
+        // If a company was previously saved, show it as a placeholder option.
+// (User can click Test Connection to load real company names.)
+const savedCompanyId = cfg.ODOO_COMPANY_ID ? String(cfg.ODOO_COMPANY_ID) : '';
+const companyRow = document.getElementById('odoo_company_row');
+const companySel = document.getElementById('odoo_companyId');
+
+companySel.innerHTML = '';
+if (savedCompanyId) {
+  const opt = document.createElement('option');
+  opt.value = savedCompanyId;
+  opt.textContent = 'Company ID ' + savedCompanyId + ' (saved — click Test Connection to load names)';
+  companySel.appendChild(opt);
+  companySel.value = savedCompanyId;
+  companyRow.style.display = '';
+} else {
+  companyRow.style.display = 'none';
+}
+
+
+        acc_showFields();
+        acc_setStatus('✅ Loaded. Update then Save.');
+      })
+      .withFailureHandler(err => acc_setStatus('❌ ' + (err && err.message ? err.message : err)))
+      .loadAccountingSettings();
+
+  }
+
+  function acc_save() {
+    acc_setStatus('Saving accounting settings…');
+
+    const payload = {
+  ACC_PROVIDER: (document.getElementById('acc_provider').value || '').toUpperCase(),
+
+  XERO_TENANT_ID: (document.getElementById('xero_tenantId').value || '').trim(),
+  XERO_ACCESS_TOKEN: (document.getElementById('xero_accessToken').value || '').trim(),
+
+  ODOO_BASE_URL: (document.getElementById('odoo_baseUrl').value || '').trim(),
+  ODOO_DB: (document.getElementById('odoo_db').value || '').trim(),
+  ODOO_USERNAME: (document.getElementById('odoo_username').value || '').trim(),
+  ODOO_API_KEY: (document.getElementById('odoo_apiKey').value || '').trim(),
+
+  // ✅ NEW: company selection
+  ODOO_COMPANY_ID: (document.getElementById('odoo_companyId').value || '').trim(),
+
+  // aliases (safe if ignored)
+  accProvider: (document.getElementById('acc_provider').value || '').toUpperCase(),
+  xeroTenantId: (document.getElementById('xero_tenantId').value || '').trim(),
+  xeroAccessToken: (document.getElementById('xero_accessToken').value || '').trim(),
+  odooBaseUrl: (document.getElementById('odoo_baseUrl').value || '').trim(),
+  odooDb: (document.getElementById('odoo_db').value || '').trim(),
+  odooUsername: (document.getElementById('odoo_username').value || '').trim(),
+  odooApiKey: (document.getElementById('odoo_apiKey').value || '').trim(),
+
+  // ✅ NEW alias
+  odooCompanyId: (document.getElementById('odoo_companyId').value || '').trim()
+};
+
+
+    google.script.run
+      .withSuccessHandler(() => acc_setStatus('✅ Accounting settings saved.'))
+      .withFailureHandler(err => acc_setStatus('❌ ' + (err && err.message ? err.message : err)))
+   .saveAccountingSettings(payload);
+
+  }
+
+  function acc_fillOdooCompanies(companies, selectedCompanyId) {
+  const companyRow = document.getElementById('odoo_company_row');
+  const sel = document.getElementById('odoo_companyId');
+
+  sel.innerHTML = '';
+
+  const list = Array.isArray(companies) ? companies : [];
+  list.forEach(c => {
+    const opt = document.createElement('option');
+    opt.value = String(c.id);
+    opt.textContent = String(c.name || ('Company ' + c.id));
+    sel.appendChild(opt);
+  });
+
+  if (selectedCompanyId != null && selectedCompanyId !== '') {
+    sel.value = String(selectedCompanyId);
+  } else if (sel.options.length) {
+    sel.value = sel.options[0].value;
+  }
+
+  companyRow.style.display = sel.options.length ? '' : 'none';
+}
+
+function acc_testConnection() {
+  const provider = (document.getElementById('acc_provider').value || '').toUpperCase();
+  if (provider !== 'ODOO') {
+    acc_setStatus('Select Provider = Odoo, then click Test Connection.');
+    return;
+  }
+
+  acc_setStatus('Testing Odoo connection…');
+
+  const payload = {
+    ODOO_BASE_URL: (document.getElementById('odoo_baseUrl').value || '').trim(),
+    ODOO_DB: (document.getElementById('odoo_db').value || '').trim(),
+    ODOO_USERNAME: (document.getElementById('odoo_username').value || '').trim(),
+    ODOO_API_KEY: (document.getElementById('odoo_apiKey').value || '').trim(),
+
+    // if user already picked something, pass it (so server can keep selection if valid)
+    ODOO_COMPANY_ID: (document.getElementById('odoo_companyId').value || '').trim()
+  };
+
+  google.script.run
+    .withSuccessHandler(res => {
+      if (!res || !res.success) {
+        acc_setStatus('❌ Odoo test failed (no success flag returned).');
+        return;
+      }
+
+      acc_fillOdooCompanies(res.companies || [], res.selectedCompanyId);
+      acc_setStatus('✅ Connected to Odoo.\nSelect the Company dropdown, then click Save.');
+    })
+    .withFailureHandler(err => acc_setStatus('❌ ' + (err && err.message ? err.message : err)))
+    .testOdooConnection(payload);
+}
+
+
+
+  // Load once on dialog open (optional)
+  window.addEventListener('load', () => {
+    // Don’t force-load company if you don’t want; leaving it here is fine.
+    // cd_load();
+  });
+</script>
+</body>
+</html>
+
+
+  
+    

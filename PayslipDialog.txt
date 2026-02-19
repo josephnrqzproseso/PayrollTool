@@ -1,0 +1,984 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <style>
+    /* === GLOBAL LAYOUT === */
+    html, body {
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      font-family: "Segoe UI", Roboto, sans-serif;
+      color: #202124;
+      background: #fff;
+    }
+
+
+
+    body {
+      display: flex;
+      flex-direction: column;
+    }
+
+    h2 {
+      font-size: 20px;
+      font-weight: 600;
+      margin: 0 0 15px 0;
+      color: #1a73e8;
+      text-align: center;
+    }
+
+    /* === SCROLLABLE FORM SECTION === */
+    .form-container {
+      flex: 1;
+      overflow-y: auto;
+      padding: 20px 22px;
+      box-sizing: border-box;
+    }
+
+    label {
+      font-weight: 600;
+      margin-top: 12px;
+      display: block;
+      font-size: 14px;
+    }
+
+    input, select, textarea {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      box-sizing: border-box;
+      font-size: 13px;
+    }
+
+    textarea {
+      min-height: 90px;
+      resize: vertical;
+      font-family: "Segoe UI", Roboto, sans-serif;
+    }
+
+    .hint {
+      font-size: 12px;
+      color: #666;
+      margin-top: 3px;
+    }
+
+    /* === EMPLOYEE LIST === */
+    #employeeList {
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 8px;
+      max-height: 200px;
+      overflow-y: auto;
+      margin-top: 5px;
+      font-size: 13px;
+      background-color: #fafafa;
+    }
+
+    #employeeList label {
+      font-weight: normal;
+      margin: 2px 0;
+    }
+
+    /* Per-employee row layout */
+    .emp-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 2px 0;
+    }
+
+    .emp-row input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: #1a73e8;
+      margin: 0 4px 0 0;
+      flex-shrink: 0;
+    }
+
+    .emp-name {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .emp-actions {
+      display: flex;
+      gap: 4px;
+      flex-shrink: 0;
+    }
+
+    .emp-actions .mini {
+      padding: 3px 8px;
+      font-size: 11px;
+    }
+
+    /* === BUTTONS === */
+    button {
+      border: none;
+      border-radius: 6px;
+      padding: 8px 12px;
+      margin-top: 12px;
+      cursor: pointer;
+      font-size: 13px;
+      transition: all 0.2s ease-in-out;
+    }
+
+    button.primary {
+      background: #1a73e8;
+      color: #fff;
+    }
+    button.primary:hover {
+      background: #155fcf;
+    }
+
+    button.secondary {
+      background: #f1f3f4;
+      color: #202124;
+    }
+    button.secondary:hover {
+      background: #e4e7ea;
+    }
+
+    button.danger {
+      background: #f8d7da;
+      color: #842029;
+    }
+    button.danger:hover {
+      background: #f1b0b7;
+    }
+
+    .button-group {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+
+    /* === STICKY FOOTER (Progress + Actions) === */
+    .footer {
+      border-top: 1px solid #ddd;
+      padding: 14px 20px;
+      background: #fafafa;
+      box-shadow: 0 -1px 3px rgba(0,0,0,0.05);
+      position: sticky;
+      bottom: 0;
+      z-index: 5;
+    }
+
+    #status {
+      font-size: 13px;
+      color: #333;
+      white-space: pre-line;
+      text-align: left;
+      margin-top: 6px;
+    }
+
+    #progressSection {
+  text-align: center;
+  margin-top: 10px;
+}
+
+
+    #progressBarContainer {
+      width: 100%;
+      background: #eee;
+      border-radius: 8px;
+      height: 24px;
+      margin-top: 10px;
+      overflow: hidden;
+    }
+
+    #progressBar {
+      width: 0%;
+      height: 100%;
+      background: #1a73e8;
+      color: white;
+      text-align: center;
+      line-height: 24px;
+      border-radius: 8px;
+      transition: width 0.3s ease-in-out;
+    }
+
+    #progressStatus {
+      font-size: 13px;
+      margin-top: 8px;
+      color: #444;
+    }
+
+    /* Fix alignment for Send Email checkbox */
+    label > input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: #1a73e8;
+      vertical-align: middle;
+      margin-right: 6px;
+      position: relative;
+      top: -1px;
+    }
+
+/* ✅ Brand logo INSIDE modal (sticky bottom, does not overlay scrollbar) */
+.brand-sticky-bottom{
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;  /* lower-right */
+  padding: 8px 0 2px;
+  background: #fff;
+}
+
+/* Filters layout: Search full row, dims beside each other */
+.filters{
+  display:flex;
+  flex-wrap:wrap;
+  gap:10px;
+  margin:10px 0;
+  align-items:flex-end;
+}
+.filters .filter{ min-width:200px; }
+.filters .search{ flex: 1 1 100%; }   /* full row */
+.filters .dim{ flex: 1 1 0; }         /* side-by-side */
+.filters input, .filters select{ width:100%; }
+
+/* multi-select look */
+.filters select[multiple]{
+  height: 140px;           /* adjust */
+  padding: 6px;
+}
+
+/* Checkbox filter boxes */
+.filter-box{
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  background: #fff;
+  padding: 6px;
+  height: 140px;
+  overflow: auto;
+  font-size: 13px;
+}
+
+.filter-box .opt{
+  display:flex;
+  align-items:center;
+  gap:8px;
+  padding: 2px 2px;
+}
+
+.filter-box input[type="checkbox"]{
+  width: 16px;
+  height: 16px;
+  accent-color: #1a73e8;
+}
+
+
+
+/* ✅ UiTheme's ui-hidden still reserves space; force collapse */
+.ui-hidden { display: none !important; }
+
+
+
+  </style>
+  <?!= include_('UiTheme'); ?>
+</head>
+<body class="ui-page">
+<h1>Generate Payslips</h1>
+  <div class="form-container">
+    <h2>Generate Payslips</h2>
+
+    <label>Payroll Sheet</label>
+    <select id="sheetName" onchange="loadEmployees()">
+      <option>Loading…</option>
+    </select>
+
+    <label>Employees</label>
+    <div class="button-group">
+      <button class="secondary" type="button" onclick="selectAll(true)">Select All</button>
+      <button class="secondary" type="button" onclick="selectAll(false)">Clear All</button>
+      <button class="secondary" type="button" onclick="batchDownload()">Download Selected</button>
+      <button class="primary"   type="button" onclick="batchSend()">Send Selected</button>
+    </div>
+        <div class="filters">
+  <div class="filter search">
+    <label style="margin:0;">Search</label>
+    <input id="empSearch" type="text" placeholder="Search employee…">
+  </div>
+
+  <div class="filter dim">
+    <label id="dim1Label" style="margin:0;">Tracking Category 1</label>
+    <div id="dim1Filter" class="filter-box">Loading…</div>
+  </div>
+
+  <div class="filter dim">
+    <label id="dim2Label" style="margin:0;">Tracking Category 2</label>
+    <div id="dim2Filter" class="filter-box">Loading…</div>
+  </div>
+</div>
+
+
+    
+    <div id="employeeList">Loading…</div>
+
+
+    <label>Folder ID / URL</label>
+    <input id="folderId" placeholder="Drive Folder ID or URL">
+
+    <label>Template Sheet</label>
+    <input id="templateName" value="PayslipTemplate">
+
+    <label>Email Column</label>
+    <select id="emailColumn">
+      <option value="Company Email">Company Email</option>
+      <option value="Personal Email">Personal Email</option>
+    </select>
+
+    <label><input type="checkbox" id="sendEmail" checked> Send Email (default for “Send Selected”)</label>
+
+    <label>Filename Pattern</label>
+    <input id="filenamePattern" value="{{Employee Name}} - Payslip - {{Period}}">
+
+    <label>Email Subject</label>
+    <input id="emailSubject" value="Payslip - {{Period}}">
+
+    <label>CC</label>
+    <input type="text" name="cc" placeholder="cc@example.com">
+
+    <label>BCC</label>
+    <input type="text" name="bcc" placeholder="bcc@example.com">
+
+    <label>Reply-To</label>
+    <input type="text" name="replyTo" placeholder="replyto@example.com">
+
+    <label>Sender Alias (optional)</label>
+    <input type="text" name="senderEmail" placeholder="your.alias@domain.com">
+
+    <label>Email Body </label>
+    <textarea id="emailBody">Hi {{MF.FIRST NAME}},<br><br>
+Please find your payslip for <b>{{Period}}</b> attached.<br><br>
+Regards,<br>Payroll Team</textarea>
+
+<div style="display:flex;align-items:center;gap:10px;margin-top:8px;flex-wrap:wrap;">
+  <label style="margin:0;display:flex;align-items:center;gap:8px;">
+    <input type="checkbox" id="useGmailSignature">
+    Append Gmail signature
+  </label>
+  <button class="secondary" type="button" onclick="insertGmailSignature()">Insert signature now</button>
+  <span style="font-size:11px;color:#666;">If enabled, the generator will pull your current Gmail signature and append it when emailing.</span>
+</div>
+
+
+    <button class="secondary" type="button" onclick="saveEmailSettings()">💾 Save Settings</button>
+  </div>
+
+  <div class="footer">
+    <div class="button-group" style="justify-content: center;">
+      <!-- Removed: Preview & Generate buttons -->
+      <button class="secondary" type="button" onclick="checkPayslips()">Review Payslips</button>
+      <button class="danger"   type="button" onclick="google.script.host.close()">Close</button>
+    </div>
+
+    <div id="progressSection" class="ui-anim ui-hidden">
+
+      <h3 style="font-size:15px;margin-bottom:8px;">Processing Payslips...</h3>
+      <div id="progressBarContainer">
+        <div id="progressBar">0%</div>
+      </div>
+      <div id="progressStatus">Initializing...</div>
+    </div>
+
+    <div id="status"></div>
+  </div>
+
+  <div class="brand-sticky-bottom">
+  <?!= include_('BrandWatermarkInline'); ?>
+</div>
+
+  <script>
+    const sel    = document.getElementById('sheetName');
+    const list   = document.getElementById('employeeList');
+    const status = document.getElementById('status');
+    let progressTimer = null;
+
+    // ✅ Wait until google.script.run is ready
+    (function waitForContext(retries = 20) {
+      if (window.google && google.script && google.script.run) {
+        console.log("✅ Apps Script context ready.");
+        refreshSheets();
+
+        // 🧠 Load previously saved email settings
+        google.script.run
+  .withSuccessHandler(cfg => {
+    if (!cfg) return;
+
+    // 🔹 NEW: folder + template
+    document.getElementById('folderId').value =
+      cfg.folderIdOrUrl || '';
+
+    document.getElementById('templateName').value =
+      cfg.templateName || 'PayslipTemplate';
+
+    // 🔹 Email column + all existing email settings
+    document.getElementById('emailColumn').value =
+      cfg.emailColumn || 'Company Email';
+
+    document.getElementById('sendEmail').checked =
+      cfg.sendEmail !== false;
+
+    document.getElementById('filenamePattern').value =
+      cfg.filenamePattern || '{{Employee Name}} - Payslip - {{Period}}';
+
+    document.getElementById('emailSubject').value =
+      cfg.emailSubject || 'Payslip - {{Period}}';
+
+    document.getElementById('emailBody').value = cfg.emailBody || '';
+    document.getElementById('useGmailSignature').checked = !!cfg.useGmailSignature;
+
+    // ✅ Auto-append Gmail signature when checkbox is enabled (like BIR2316)
+const sigCb = document.getElementById('useGmailSignature');
+if (sigCb && !sigCb._bound) {
+  sigCb.addEventListener('change', () => {
+    if (!sigCb.checked) return;
+
+    google.script.run
+      .withSuccessHandler(sig => {
+        sig = String(sig || '').trim();
+        if (!sig) {
+          status.textContent = '⚠️ No Gmail signature found (or Gmail API not enabled).';
+          return;
+        }
+
+        const ta = document.getElementById('emailBody');
+        if (!ta) return;
+
+        const cur = String(ta.value || '');
+
+        // prevent double-append
+        if (cur.indexOf(sig) !== -1) return;
+
+        ta.value = cur + (cur.trim() ? '\n<br><br>\n' : '') + sig;
+      })
+      .withFailureHandler(err => {
+        status.textContent = '⚠️ Could not load Gmail signature: ' + (err && err.message ? err.message : err);
+      })
+      .payslipGetGmailSignatureHtml();
+  });
+
+  sigCb._bound = true;
+}
+
+// ✅ If already checked on load, append immediately (without needing the button)
+if (sigCb && sigCb.checked) {
+  sigCb.dispatchEvent(new Event('change'));
+}
+
+
+    document.querySelector('[name="cc"]').value = cfg.cc || '';
+    document.querySelector('[name="bcc"]').value = cfg.bcc || '';
+    document.querySelector('[name="replyTo"]').value = cfg.replyTo || '';
+    document.querySelector('[name="senderEmail"]').value = cfg.senderEmail || '';
+  })
+  .getSavedPayslipEmailSettings();
+
+
+      } else if (retries > 0) {
+        console.log("⏳ Waiting for Apps Script context...");
+        setTimeout(() => waitForContext(retries - 1), 300);
+      } else {
+        status.textContent = "❌ Not running inside Apps Script. Open via Payroll menu.";
+      }
+    })();
+
+    function refreshSheets() {
+      sel.innerHTML = '<option>Loading payroll sheets…</option>';
+      google.script.run
+        .withSuccessHandler(sheets => {
+          sel.innerHTML = '';
+          if (!sheets || sheets.length === 0) {
+            sel.innerHTML = '<option value="">⚠️ No Payroll computation sheets found</option>';
+            list.innerHTML = '<i>No employees loaded.</i>';
+            return;
+          }
+          sheets.forEach((n, i) => {
+            const opt = document.createElement('option');
+            opt.value = n;
+            opt.textContent = n;
+            sel.appendChild(opt);
+            if (i === 0) sel.value = n;
+          });
+
+          setTimeout(() => loadEmployees(), 300);
+        })
+        .withFailureHandler(err => {
+          sel.innerHTML = `<option value="">❌ ${err.message || err}</option>`;
+        })
+        .getPayrollComputationSheets();
+    }
+
+document.addEventListener('input', (e) => {
+  if (e && e.target && e.target.id === 'empSearch') renderPayslipEmployees_();
+});
+document.addEventListener('change', (e) => {
+  if (e && e.target && e.target.id === 'dim1Filter') renderPayslipEmployees_();
+});
+document.addEventListener('change', (e) => {
+  if (e && e.target && e.target.id === 'dim2Filter') renderPayslipEmployees_();
+});
+
+
+
+
+    let _allEmployees = []; // [{name, empId, dim1, dim2}]
+
+function loadEmployees() {
+  list.innerHTML = 'Loading employees…';
+  google.script.run
+    .withSuccessHandler(payload => {
+      const employees = (payload && payload.employees) ? payload.employees : [];
+const dim1Label = (payload && payload.dim1Label) ? payload.dim1Label : 'Tracking Category 1';
+const dim2Label = (payload && payload.dim2Label) ? payload.dim2Label : 'Tracking Category 2';
+
+const lbl1 = document.getElementById('dim1Label');
+if (lbl1) lbl1.textContent = dim1Label;
+
+const lbl2 = document.getElementById('dim2Label');
+if (lbl2) lbl2.textContent = dim2Label;
+
+_allEmployees = employees;
+
+buildDim1FilterOptions_(_allEmployees);
+buildDim2FilterOptions_(_allEmployees);
+renderPayslipEmployees_();
+
+    })
+    .getEmployeesFromSheet(sel.value);
+}
+
+function _getCheckedValues_(boxEl){
+  if (!boxEl) return [];
+  return Array.from(boxEl.querySelectorAll('input[type="checkbox"]:checked'))
+    .map(cb => String(cb.value || '').trim())
+    .filter(Boolean);
+}
+
+function _renderCheckboxOptions_(boxEl, values, keepSelected){
+  if (!boxEl) return;
+
+  const keep = new Set((keepSelected || []).map(v => String(v).trim()).filter(Boolean));
+  const vals = (values || []).map(v => String(v).trim()).filter(Boolean);
+
+  if (!vals.length){
+    boxEl.innerHTML = '<div class="hint">No options</div>';
+    return;
+  }
+
+  boxEl.innerHTML = vals.map(v => {
+    const esc = String(v)
+      .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    const checked = keep.has(v) ? 'checked' : '';
+    return `<label class="opt"><input type="checkbox" value="${esc}" ${checked}>${esc}</label>`;
+  }).join('');
+}
+
+
+function buildDim1FilterOptions_(rows) {
+  const box = document.getElementById('dim1Filter');
+  if (!box) return;
+
+  const keep = _getCheckedValues_(box);
+  const uniq = Object.create(null);
+
+  rows.forEach(r => {
+    const v = String((r && r.dim1) ? r.dim1 : '').trim();
+    if (!v) return;
+    uniq[v] = true;
+  });
+
+  const vals = Object.keys(uniq).sort((a,b) => a.localeCompare(b));
+  _renderCheckboxOptions_(box, vals, keep);
+
+  // re-render employees on click
+  box.onchange = renderPayslipEmployees_;
+}
+
+function buildDim2FilterOptions_(rows) {
+  const box = document.getElementById('dim2Filter');
+  if (!box) return;
+
+  const keep = _getCheckedValues_(box);
+  const uniq = Object.create(null);
+
+  rows.forEach(r => {
+    const v = String((r && r.dim2) ? r.dim2 : '').trim();
+    if (!v) return;
+    uniq[v] = true;
+  });
+
+  const vals = Object.keys(uniq).sort((a,b) => a.localeCompare(b));
+  _renderCheckboxOptions_(box, vals, keep);
+
+  box.onchange = renderPayslipEmployees_;
+}
+
+
+function renderPayslipEmployees_() {
+  const qEl = document.getElementById('empSearch');
+const fEl1 = document.getElementById('dim1Filter');
+const fEl2 = document.getElementById('dim2Filter');
+
+
+const q = qEl ? String(qEl.value || '').trim().toLowerCase() : '';
+const dim1Sel = _getCheckedValues_(fEl1);
+const dim2Sel = _getCheckedValues_(fEl2);
+const filtered = _allEmployees.filter(e => {
+  const name = String(e.name || '');
+  const okQ  = !q || name.toLowerCase().indexOf(q) >= 0;
+  const okD1 = !dim1Sel.length || dim1Sel.includes(String(e.dim1 || '').trim());
+const okD2 = !dim2Sel.length || dim2Sel.includes(String(e.dim2 || '').trim());
+  return okQ && okD1 && okD2;
+});
+
+
+  if (!filtered.length) {
+    list.innerHTML = '<i>No employees found.</i>';
+    return;
+  }
+
+  list.innerHTML = filtered.map(e => {
+    const encName = encodeURIComponent(String(e.name || ''));
+
+
+    return `
+      <label class="emp-row" data-name="${encName}">
+
+        <input type="checkbox" value="${encName}" checked>
+        <span class="emp-name">${String(e.name || '')}</span>
+
+
+        <span class="emp-actions">
+          <button type="button" class="secondary mini emp-download">Download</button>
+          <button type="button" class="primary mini emp-send">Send</button>
+        </span>
+      </label>
+    `;
+  }).join('');
+
+  attachEmployeeLineHandlers();
+}
+
+
+    function attachEmployeeLineHandlers() {
+  list.querySelectorAll('.emp-download').forEach(btn => {
+    btn.onclick = function() {
+      const row = this.closest('.emp-row');
+      if (!row) return;
+      const name = decodeURIComponent(row.getAttribute('data-name') || '');
+      downloadSingle(name);
+    };
+  });
+  list.querySelectorAll('.emp-send').forEach(btn => {
+    btn.onclick = function() {
+      const row = this.closest('.emp-row');
+      if (!row) return;
+      const name = decodeURIComponent(row.getAttribute('data-name') || '');
+      sendSingle(name);
+    };
+  });
+}
+
+
+    function selectAll(state) {
+      document.querySelectorAll('#employeeList input[type="checkbox"]').forEach(cb => cb.checked = state);
+    }
+
+    function gatherForm() {
+      const selected = Array.from(document.querySelectorAll('#employeeList input:checked'))
+  .map(cb => decodeURIComponent(cb.value));
+      return {
+        sheetName: sel.value,
+        folderIdOrUrl: document.getElementById('folderId').value,
+        templateName: document.getElementById('templateName').value,
+        emailColumn: document.getElementById('emailColumn').value,
+        sendEmail: document.getElementById('sendEmail').checked,
+        filenamePattern: document.getElementById('filenamePattern').value,
+        emailSubject: document.getElementById('emailSubject').value,
+        emailBody: document.getElementById('emailBody').value,
+        cc: document.querySelector('[name="cc"]').value || '',
+        bcc: document.querySelector('[name="bcc"]').value || '',
+        replyTo: document.querySelector('[name="replyTo"]').value || '',
+        senderEmail: document.querySelector('[name="senderEmail"]').value || '',
+        useGmailSignature: document.getElementById('useGmailSignature').checked,
+        selectedEmployees: selected
+      };
+    }
+
+    function insertGmailSignature() {
+  google.script.run
+    .withSuccessHandler(sig => {
+      sig = String(sig || '');
+      if (!sig) {
+        status.textContent = '⚠️ No Gmail signature found (or Gmail API not enabled).';
+        return;
+      }
+      const ta = document.getElementById('emailBody');
+      if (!ta) return;
+
+      const cur = String(ta.value || '');
+      const normCur = cur.replace(/\s+/g, '');
+      const normSig = sig.replace(/\s+/g, '');
+      if (normSig && normCur.indexOf(normSig) !== -1) {
+        status.textContent = 'ℹ️ Signature already present in Email Body.';
+        return;
+      }
+
+      const sep = cur.trim() ? '\n<br><br>\n' : '';
+      ta.value = cur + sep + sig;
+      status.textContent = '✅ Gmail signature inserted into Email Body.';
+    })
+    .withFailureHandler(err => { status.textContent = '❌ ' + (err.message || err); })
+    .payslipGetGmailSignatureHtml();
+}
+
+
+    /* ================
+     *  Single actions
+     * ================ */
+
+    // 🔹 Download for a single employee → direct browser open
+    function downloadSingle(name) {
+      if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+
+  const form = gatherForm();
+  form.selectedEmployees = [name];
+  form.sendEmail = false;
+
+  status.textContent = 'Generating payslip for ' + name + '…';
+
+  google.script.run
+    .withSuccessHandler(payload => {
+      try {
+        downloadPayload(payload);
+        status.textContent = '✅ Download started for ' + name;
+      } catch (e) {
+        status.textContent = '❌ ' + (e.message || e);
+      }
+    })
+    .withFailureHandler(err => {
+      status.textContent = '❌ ' + (err.message || err);
+    })
+    .downloadPayslip(form);
+}
+
+
+    // 🔹 Send for a single employee → uses batch engine with just 1 row
+    function sendSingle(name) {
+      const form = gatherForm();
+      form.selectedEmployees = [name];
+      form.sendEmail = true;
+      startBatchOperation(form, 'Sending payslip to ' + name);
+    }
+
+    /* =======================
+     *  Batch actions (top)
+     * ======================= */
+
+    function batchDownload() {
+      if (progressTimer) { clearInterval(progressTimer); progressTimer = null; }
+
+  const form = gatherForm();
+  if (form.selectedEmployees.length === 1) {
+  google.script.run
+    .withSuccessHandler(payload => {
+      try {
+        updateProgress(100, '✅ PDF ready. Starting download…');
+        downloadPayload(payload);
+        status.textContent = '✅ PDF download started.';
+      } catch (e) {
+        updateProgress(100, '❌ ' + (e.message || e));
+        status.textContent = '❌ ' + (e.message || e);
+      }
+    })
+    .withFailureHandler(err => {
+      updateProgress(100, '❌ ' + (err.message || err));
+      status.textContent = '❌ ' + (err.message || err);
+    })
+    .downloadPayslip(form);
+} else {
+  google.script.run
+    .withSuccessHandler(payload => {
+      try {
+        updateProgress(100, '✅ ZIP ready. Starting download…');
+        downloadPayload(payload);
+        status.textContent = '✅ ZIP download started.';
+      } catch (e) {
+        updateProgress(100, '❌ ' + (e.message || e));
+        status.textContent = '❌ ' + (e.message || e);
+      }
+    })
+    .withFailureHandler(err => {
+      updateProgress(100, '❌ ' + (err.message || err));
+      status.textContent = '❌ ' + (err.message || err);
+    })
+    .downloadPayslipsZip(form);
+}
+
+}
+
+
+    function batchSend() {
+      const form = gatherForm();
+      if (!form.selectedEmployees.length) {
+        status.textContent = '⚠️ Please select at least one employee.';
+        return;
+      }
+      // Respect the Send Email checkbox as a master toggle
+      form.sendEmail = document.getElementById('sendEmail').checked !== false;
+      if (!form.sendEmail) {
+        status.textContent = '⚠️ "Send Email" is disabled. Enable it to send.';
+        return;
+      }
+      startBatchOperation(form, 'Sending payslips to selected employees');
+    }
+
+    function startBatchOperation(form, label) {
+      UI.show(document.getElementById('progressSection'));
+      status.textContent = '';
+      updateProgress(0, label + '...');
+
+      google.script.run
+        .withFailureHandler(err => {
+          updateProgress(100, '❌ ' + (err.message || err));
+          clearInterval(progressTimer);
+        })
+        .withSuccessHandler(res => {
+          if (res && res.pending && res.pending > 0) {
+            updateProgress(99, `⏸️ Time limit reached. Resuming automatically… (${res.pending} left)`);
+            // Let auto-resume do its thing; keep polling
+            return;
+          }
+          updateProgress(
+            100,
+            `✅ ${label} completed. PDFs: ${res.created}, Emailed: ${res.emailed || 0}, Skipped: ${res.skipped}. Pending: ${res.pending || 0}`
+          );
+          clearInterval(progressTimer);
+        })
+        .generatePayslips(form);
+
+      if (progressTimer) clearInterval(progressTimer);
+      progressTimer = setInterval(fetchProgress, 1000);
+    }
+
+    /* =======================
+     *  Progress + Review
+     * ======================= */
+
+    function fetchProgress() {
+      google.script.run
+        .withSuccessHandler(progress => {
+          if (!progress) return;
+          updateProgress(progress.percent, progress.message);
+          if (progress.percent >= 100 && progressTimer) {
+            clearInterval(progressTimer);
+          }
+        })
+        .getPayslipProgress();
+    }
+
+    function updateProgress(percent, message) {
+      const bar = document.getElementById('progressBar');
+      bar.style.width = percent + '%';
+      bar.textContent = percent + '%';
+      document.getElementById('progressStatus').textContent = message || '';
+    }
+
+    function saveEmailSettings() {
+      const form = gatherForm();
+      google.script.run
+        .withSuccessHandler(() => {
+          status.textContent = '✅ Email settings saved!';
+        })
+        .generatePayslipsSettingsSave(form);
+    }
+
+function checkPayslips() {
+  const form = gatherForm();
+  if (form.selectedEmployees.length === 0) {
+    status.textContent = '⚠️ Please select at least one employee.';
+    return;
+  }
+
+  UI.show(document.getElementById('progressSection'));
+
+  status.textContent = '';
+  updateProgress(0, 'Starting payslip review...');
+
+  // ✅ Start polling immediately
+  if (progressTimer) clearInterval(progressTimer);
+  progressTimer = setInterval(fetchCheckProgress, 1000);
+  fetchCheckProgress();
+
+  google.script.run
+    .withSuccessHandler(res => {
+      // Leave polling running; fetchCheckProgress() will stop it at 100%
+      if (res && res.bad === 0) {
+        status.textContent = `✅ All ${res.ok} payslips match! Check sheet "${res.sheet}".`;
+      } else if (res) {
+        status.textContent = `⚠️ Checked ${res.checked}: ${res.ok} OK, ${res.bad} mismatch/error(s). See "${res.sheet}".`;
+      }
+      // Force a final refresh
+      fetchCheckProgress();
+    })
+    .withFailureHandler(err => {
+      updateProgress(100, '❌ ' + (err.message || err));
+      status.textContent = '❌ ' + (err.message || err);
+      if (progressTimer) clearInterval(progressTimer);
+    })
+    .checkPayslipsOnly(form);
+}
+
+    function fetchCheckProgress() {
+  google.script.run
+    .withFailureHandler(err => { status.textContent = '❌ ' + (err.message || err); })
+    .withSuccessHandler(progress => {
+      if (!progress) return;
+      UI.show(document.getElementById('progressSection'));
+
+      updateProgress(progress.percent, progress.message);
+      if (progress.percent >= 100 && progressTimer) clearInterval(progressTimer);
+    })
+    .getPayslipCheckProgress();
+}
+
+function b64ToBlob(base64, mimeType) {
+  const byteChars = atob(base64);
+  const byteNumbers = new Array(byteChars.length);
+  for (let i = 0; i < byteChars.length; i++) byteNumbers[i] = byteChars.charCodeAt(i);
+  const byteArray = new Uint8Array(byteNumbers);
+  return new Blob([byteArray], { type: mimeType || 'application/octet-stream' });
+}
+
+function downloadPayload(payload) {
+  if (!payload || !payload.base64) throw new Error('Missing download payload.');
+  const blob = b64ToBlob(payload.base64, payload.mimeType);
+  const url = URL.createObjectURL(blob);
+
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = payload.filename || 'download';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+
+  setTimeout(() => URL.revokeObjectURL(url), 30000);
+}
+
+
+  </script>
+  
+  
+
+</body>
+</html>

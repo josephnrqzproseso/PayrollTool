@@ -1,0 +1,2453 @@
+/*******************************************************
+ * BIR 2316 Generator (Sheets or Slides template)
+ * - Uses "Annualization - YYYY" (Final Annualization output)
+ * - Replaces {{tags}} (case-insensitive)
+ * - Supports:
+ *    A) Google Sheets template tab (e.g., Bir2316Template)
+ *    B) Google Slides template URL/ID
+ *******************************************************/
+
+const BIR2316_V1 = {
+  PROP_RUN: "BIR2316_RUN_STATE_V1",
+  PROP_PROGRESS: "BIR2316_PROGRESS_V1",
+  PROP_LAST: "BIR2316_LAST_SETTINGS_V1",
+  TRIGGER_FN: "runBir2316Auto",
+  MAX_MS: 270000, // batch cap (~4.5 mins)
+
+  // Slides-only
+  DEFAULT_FILENAME_PATTERN: "{{MF.LAST NAME}}_{{TIN}}000_1231{{YEAR}}",
+
+  // Email defaults (patterned after PayslipGenerator behavior)
+  DEFAULT_SEND_EMAIL: false,
+  DEFAULT_EMAIL_COLUMN: "Company Email",
+  DEFAULT_EMAIL_SUBJECT: "{{EMPLOYEE NAME}} - BIR 2316 - {{YEAR}}",
+  DEFAULT_EMAIL_BODY_HTML:
+    "<p>Hi {{MF.FIRST NAME}},</p>" +
+    "<p>Attached is your BIR 2316 for {{YEAR}}.</p>" +
+    "<p>— Payroll Team</p>",
+  DEFAULT_EMAIL_CC: "",
+  DEFAULT_EMAIL_BCC: "",
+  DEFAULT_EMAIL_REPLYTO: "",
+  DEFAULT_EMAIL_SENDER_NAME: "Payroll Team",
+
+  DEFAULT_APPEND_GMAIL_SIGNATURE: false,
+
+};
+
+
+// === Annualization short-tag map stored in Document Properties ===
+BIR2316_V1.PROP_ANN_SHORT_MAP = "BIR2316_ANN_SHORT_TAGMAP_V1"; // JSON: { "<HEADER>": "<SHORTTAG>" }
+BIR2316_V1.SHORT_TAG_MAXLEN = 10; // enforce 8-10 chars (max 10)
+
+
+// === Formatting rules ===
+BIR2316_V1.ACCOUNTING_FMT = '#,##0.00;(#,##0.00);""'; // Sheets number format
+
+function bir2316IsDate_(v) {
+  return Object.prototype.toString.call(v) === "[object Date]";
+}
+
+function bir2316IsFiniteNumber_(v) {
+  return typeof v === "number" && isFinite(v);
+}
+
+function bir2316ParseDate_(v) {
+  if (v == null || v === "") return null;
+
+  // Already a Date
+  if (bir2316IsDate_(v)) return new Date(v.getTime());
+
+  // Try common string formats
+  const s = String(v).trim();
+  if (!s) return null;
+
+  // yyyy-mm-dd or yyyy/mm/dd
+  let m = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+
+  // mm/dd/yyyy or mm-dd-yyyy
+  m = s.match(/^(\d{1,2})[-\/](\d{1,2})[-\/](\d{4})$/);
+  if (m) return new Date(Number(m[3]), Number(m[1]) - 1, Number(m[2]));
+
+  // Fallback
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) return d;
+
+  return null;
+}
+
+
+/**
+ * Decide if a numeric value should be treated as an AMOUNT (and not an ID-like code).
+ * We only apply accounting format when the cell is a single {{TAG}}.
+ */
+function bir2316IsAmountKey_(keyLower) {
+  const k = String(keyLower || "").toLowerCase();
+
+  // Exclude "code-like" numbers (no accounting formatting)
+  // (add more exclusions here if you find new numeric-but-not-amount fields)
+  if (
+    k.includes("tin") ||
+    k.includes("rdo") ||
+    k.includes("zip") ||
+    k.includes("employee id") ||
+    k === "year" ||
+     k === "month" ||
+  k === "day"
+  ) return false;
+
+  return true;
+}
+
+function bir2316Upper_(v) {
+  if (v == null) return "";
+  return String(v).toUpperCase();
+}
+
+function bir2316TitleCaseWords_(v) {
+  const s = String(v == null ? "" : v).trim();
+  if (!s) return "";
+
+  // Lower everything first, then capitalize each word segment.
+  // Also handles hyphenated names: "juan-pablo" -> "Juan-Pablo"
+  return s
+    .toLowerCase()
+    .split(/\s+/)
+    .map(w => w.split("-").map(part => {
+      if (!part) return part;
+      return part.charAt(0).toUpperCase() + part.slice(1);
+    }).join("-"))
+    .join(" ");
+}
+
+/**
+ * Email-only inline formatter:
+ * - Same as bir2316FormatInline_ EXCEPT:
+ *   MF.FIRST NAME / MF.FIRST_NAME => Title Case (NOT uppercased)
+ */
+function bir2316FormatInlineEmail_(keyLower, v) {
+  if (v == null) return "";
+  if (bir2316IsDate_(v)) {
+    return Utilities.formatDate(v, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  }
+  if (bir2316IsFiniteNumber_(v)) {
+    if (bir2316IsAmountKey_(keyLower)) return bir2316AccountingString_(v);
+    return String(v);
+  }
+
+  const k = String(keyLower || "").toLowerCase();
+  if (k === "mf.first name" || k === "mf.first_name") {
+    return bir2316TitleCaseWords_(v);
+  }
+
+  // keep original behavior for everything else (ALL CAPS)
+  return bir2316Upper_(v);
+}
+
+/** Email-only string template renderer (uses bir2316FormatInlineEmail_) */
+function bir2316RenderStringTemplateEmail_(s, map) {
+  const norm = {};
+  Object.keys(map || {}).forEach(k => { norm[String(k).trim().toLowerCase()] = map[k]; });
+
+  return String(s || "").replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_, key) => {
+    const k = String(key || "").trim().toLowerCase();
+    const v = norm[k];
+    return bir2316FormatInlineEmail_(k, v);
+  });
+}
+
+
+// For inline text replacements (strings in a cell/shape that contain tags + other text)
+function bir2316FormatInline_(keyLower, v) {
+  if (v == null) return "";
+  if (bir2316IsDate_(v)) {
+    return Utilities.formatDate(v, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  }
+  if (bir2316IsFiniteNumber_(v)) {
+    // Inline context: only use accounting string when tag is amount-like
+    if (bir2316IsAmountKey_(keyLower)) return bir2316AccountingString_(v);
+    return String(v); // e.g., YEAR / IDs should not get commas/decimals
+  }
+  return bir2316Upper_(v);
+}
+
+function bir2316AccountingString_(n) {
+  const abs = Math.abs(Number(n) || 0);
+  const s = abs.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  return (n < 0) ? `(${s})` : s;
+}
+
+function bir2316Num_(v) {
+  if (v == null || v === "") return 0;
+  if (typeof v === "number" && isFinite(v)) return v;
+
+  // handle strings like "1,234.56" or "(1,234.56)"
+  let s = String(v).trim();
+  if (!s) return 0;
+
+  let neg = false;
+  if (s.startsWith("(") && s.endsWith(")")) {
+    neg = true;
+    s = s.slice(1, -1);
+  }
+
+  s = s.replace(/,/g, "").replace(/[^\d.\-]/g, "");
+  const n = parseFloat(s);
+  if (!isFinite(n)) return 0;
+  return neg ? -Math.abs(n) : n;
+}
+
+
+function showBir2316Dialog() {
+  const html = HtmlService.createTemplateFromFile("Bir2316Dialog")
+    .evaluate()
+    .setWidth(560)
+    .setHeight(760);
+  SpreadsheetApp.getUi().showModalDialog(html, "Generate BIR 2316");
+}
+
+/** UI bootstrap: years + last settings */
+function getBir2316Init() {
+  const years = getBir2316Years_();
+  const last = bir2316GetLastSettings_();
+
+  let masterfileHeaders = [];
+  try {
+    const wanted = new Set(["company email", "personal email"]);
+masterfileHeaders = (bir2316ReadMasterfile_().headers || [])
+  .map(h => String(h || "").trim())
+  .filter(h => h && wanted.has(h.toLowerCase()));
+
+  } catch (e) {
+    masterfileHeaders = [];
+  }
+
+  return {
+    years,
+    last,
+    masterfileHeaders,
+    defaults: {
+      filenamePattern: BIR2316_V1.DEFAULT_FILENAME_PATTERN,
+      sendEmail: BIR2316_V1.DEFAULT_SEND_EMAIL,
+      emailColumn: BIR2316_V1.DEFAULT_EMAIL_COLUMN,
+      emailSubject: BIR2316_V1.DEFAULT_EMAIL_SUBJECT,
+      emailBodyHtml: BIR2316_V1.DEFAULT_EMAIL_BODY_HTML,
+      cc: BIR2316_V1.DEFAULT_EMAIL_CC,
+      bcc: BIR2316_V1.DEFAULT_EMAIL_BCC,
+      replyTo: BIR2316_V1.DEFAULT_EMAIL_REPLYTO,
+      senderName: BIR2316_V1.DEFAULT_EMAIL_SENDER_NAME,
+      appendGmailSignature: BIR2316_V1.DEFAULT_APPEND_GMAIL_SIGNATURE,
+
+    },
+  };
+}
+// Returns the user's primary Gmail signature HTML (requires Advanced Gmail service enabled)
+function bir2316GetGmailSignature() {
+  return bir2316GetPrimaryGmailSignatureHtml_();
+}
+
+function bir2316GetPrimaryGmailSignatureHtml_() {
+  try {
+    const resp = Gmail.Users.Settings.SendAs.list('me');
+    const arr = (resp && resp.sendAs) ? resp.sendAs : [];
+    if (!arr.length) return "";
+
+    const primary = arr.find(s => s && s.isPrimary) || arr[0];
+    return String((primary && primary.signature) ? primary.signature : "");
+  } catch (e) {
+    Logger.log("bir2316GetPrimaryGmailSignatureHtml_ error: " + e);
+    return "";
+  }
+}
+
+
+
+/** Years are inferred from existing "Annualization - YYYY" tabs; fallback = current year. */
+function getBir2316Years_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const names = ss.getSheets().map(s => s.getName());
+  const years = [];
+  names.forEach(n => {
+    const m = String(n).match(/^Annualization\s*-\s*(\d{4})$/i);
+    if (m) years.push(Number(m[1]));
+  });
+  years.sort((a, b) => b - a);
+  if (!years.length) years.push(new Date().getFullYear());
+  return years;
+}
+
+
+
+/** Employee list comes from the Annualization sheet (Employee ID + Employee Name). */
+function getBir2316Employees(year) {
+  year = Number(year);
+  const { headers, rows } = bir2316ReadAnnualization_(year);
+
+  const idxId = headers.findIndex(h => /^EMPLOYEE ID$/i.test(h));
+  const idxNm = headers.findIndex(h => /^EMPLOYEE NAME$/i.test(h));
+
+  if (idxId < 0) return [];
+  const out = [];
+  rows.forEach(r => {
+    const id = String(r[idxId] || "").trim();
+    if (!id) return;
+    const name = idxNm >= 0 ? String(r[idxNm] || "").trim() : "";
+    out.push({ id, name });
+  });
+
+  // stable sort by name then id
+  out.sort((a, b) => (a.name || "").localeCompare(b.name || "") || a.id.localeCompare(b.id));
+  return out;
+}
+
+function bir2316FindHeaderIndex_(headers, candidates) {
+  const hs = (headers || []).map(h => String(h || "").trim());
+  const lower = hs.map(h => h.toLowerCase());
+
+  for (let i = 0; i < (candidates || []).length; i++) {
+    const c = String(candidates[i] || "").trim().toLowerCase();
+    const idx = lower.indexOf(c);
+    if (idx >= 0) return idx;
+  }
+  return -1;
+}
+
+function bir2316BuildDimsByEmpIdFromMaster_() {
+  // Defaults (will be overwritten if the Masterfile has actual column headers)
+  let dim1Label = "Entity";
+  let dim2Label = "Payroll Group";
+
+  const out = {
+    dim1Label,
+    dim2Label,
+    dimsByEmpId: new Map(), // empId -> {dim1, dim2}
+  };
+
+  let mf;
+  try {
+    mf = bir2316ReadMasterfile_(); // must return {headers, rows}
+  } catch (e) {
+    return out; // masterfile not available => empty dims
+  }
+
+  const headers = mf.headers || [];
+  const rows = mf.rows || [];
+
+  const idxEmpId = headers.findIndex(h => /^EMPLOYEE ID$/i.test(String(h || "").trim()));
+  if (idxEmpId < 0) return out;
+
+  // Prefer Entity / Payroll Group, fallback to Tracking Category 1 / 2
+  const idxDim1 = bir2316FindHeaderIndex_(headers, ["Entity", "Tracking Category 1"]);
+  const idxDim2 = bir2316FindHeaderIndex_(headers, ["Payroll Group", "Tracking Category 2"]);
+
+  if (idxDim1 >= 0) dim1Label = String(headers[idxDim1] || "").trim() || dim1Label;
+  if (idxDim2 >= 0) dim2Label = String(headers[idxDim2] || "").trim() || dim2Label;
+
+  out.dim1Label = dim1Label;
+  out.dim2Label = dim2Label;
+
+  rows.forEach(r => {
+    const id = String(r[idxEmpId] || "").trim();
+    if (!id) return;
+
+    const dim1 = (idxDim1 >= 0) ? String(r[idxDim1] || "").trim() : "";
+    const dim2 = (idxDim2 >= 0) ? String(r[idxDim2] || "").trim() : "";
+
+    out.dimsByEmpId.set(id, { dim1, dim2 });
+  });
+
+  return out;
+}
+
+
+function getBir2316EmployeesWithDims(year) {
+  year = Number(year);
+  const { headers, rows } = bir2316ReadAnnualization_(year);
+
+  const idxId = headers.findIndex(h => /^EMPLOYEE ID$/i.test(h));
+  const idxNm = headers.findIndex(h => /^EMPLOYEE NAME$/i.test(h));
+
+  // Match PayslipDialog payload shape
+  const payload = {
+    dim1Label: "Entity",
+    dim2Label: "Payroll Group",
+    employees: [],
+  };
+
+  if (idxId < 0) return payload;
+
+  const dimInfo = bir2316BuildDimsByEmpIdFromMaster_();
+  payload.dim1Label = dimInfo.dim1Label || payload.dim1Label;
+  payload.dim2Label = dimInfo.dim2Label || payload.dim2Label;
+
+  const out = [];
+  rows.forEach(r => {
+    const id = String(r[idxId] || "").trim();
+    if (!id) return;
+
+    const name = (idxNm >= 0) ? String(r[idxNm] || "").trim() : "";
+    const dims = dimInfo.dimsByEmpId.get(id) || { dim1: "", dim2: "" };
+
+    out.push({
+      id,
+      name,
+      dim1: dims.dim1 || "",
+      dim2: dims.dim2 || "",
+    });
+  });
+
+  out.sort((a, b) => (a.name || "").localeCompare(b.name || "") || a.id.localeCompare(b.id));
+  payload.employees = out;
+
+  return payload;
+}
+
+
+/**
+ * Full tag catalog for the chosen year:
+ * - Meta tags
+ * - Company tags (Settings Center)
+ * - Masterfile tags (MF.<header> and MF.<slug>)
+ * - Annualization tags (raw header and ANN.<slug>)
+ */
+function getBir2316TagCatalog(year) {
+  year = Number(year);
+
+  
+
+  const metaTags = [
+  "{{YEAR}}",
+  "{{DATE_ISSUED}}",
+  "{{DATE_ISSUED_LONG}}",
+
+  "{{STAT_MIN_WAGE_DAY}}",
+"{{STAT_MIN_WAGE_MONTH}}",
+"{{MWE_X}}",
+
+
+  // Section 2 period covered (MM/DD)
+  "{{PERIOD_FROM_MM}}",
+  "{{PERIOD_FROM_DD}}",
+  "{{PERIOD_TO_MM}}",
+  "{{PERIOD_TO_DD}}",
+
+   // TIN split tags (9 digits => 3 parts)
+  "{{EMP_TIN_1}}",
+  "{{EMP_TIN_2}}",
+  "{{EMP_TIN_3}}",
+
+  "{{COMPANY_TIN_1}}",
+  "{{COMPANY_TIN_2}}",
+  "{{COMPANY_TIN_3}}",
+
+  "{{PREV_EMP_TIN_1}}",
+  "{{PREV_EMP_TIN_2}}",
+  "{{PREV_EMP_TIN_3}}",
+
+  "{{EMP_BDAY_MM}}",
+"{{EMP_BDAY_DD}}",
+"{{EMP_BDAY_YYYY}}",
+
+"{{EMP_MI}}",
+"{{SF_EMP_NAME}}",
+"{{SF_AUTH_REP}}",
+"{{EECONTRIB}}",
+
+"{{NTDM_TOTAL}}",
+"{{NTO_TOTAL}}",
+
+"{{OTHER13_TOTAL}}",
+"{{OTHER13_NONTAX_90K}}",
+"{{OTHER13_TAXABLE}}",
+
+"{{TAXABLE_TOTAL}}",
+
+"{{TAXABLE_TOTAL_FIELD}}",
+
+"{{TCIPE}}",
+"{{TNTCI}}",
+
+
+];
+
+
+  const companyKeys = [
+  // base company details
+  "COMPANY_REGISTERED_NAME",
+  "COMPANY_TIN",
+  "COMPANY_REGISTERED_ADDRESS1",
+  "COMPANY_REGISTERED_ADDRESS2",
+  "COMPANY_ZIP_CODE",
+  "COMPANY_AUTHORIZED_REP",
+
+  // derived tags (TIN split)
+  "COMPANY_TIN_1",
+  "COMPANY_TIN_2",
+  "COMPANY_TIN_3",
+];
+
+const companyTags = companyKeys.map(k => `{{${k}}}`);
+
+
+  // Masterfile tags
+  let masterfileTagsRaw = [];
+  let masterfileTagsSlug = [];
+  try {
+    const { headers } = bir2316ReadMasterfile_();
+    headers.forEach(h => {
+      if (!h) return;
+      masterfileTagsRaw.push(`{{MF.${h}}}`);
+      masterfileTagsSlug.push(`{{MF.${bir2316Slug_(h)}}}`);
+    });
+  } catch (e) {
+    // ignore (missing masterfile / permissions)
+  }
+
+    let annualizationTagsRaw = [];
+  let annualizationTagsSlug = [];
+  let annualizationTagsShort = [];
+
+  try {
+    const { headers } = bir2316ReadAnnualization_(year);
+
+    // ensure short tags exist for ALL headers (including new ones)
+    const shortMap = bir2316EnsureAnnShortTags_(headers);
+
+    headers.forEach(h => {
+      if (!h) return;
+      const header = String(h).trim();
+      if (!header) return;
+
+      // raw header tag
+      annualizationTagsRaw.push(`{{${header}}}`);
+
+      // slug tag
+      annualizationTagsSlug.push(`{{ANN.${bir2316Slug_(header)}}}`);
+
+      // short tag (8-10 chars, no ANN. prefix)
+      const sk = shortMap[header];
+      if (sk) annualizationTagsShort.push(`{{${sk}}}`);
+    });
+
+  } catch (e) {
+    // ignore (missing annualization sheet)
+  }
+
+
+  return {
+    metaTags,
+    companyTags,
+    masterfileTagsRaw,
+    masterfileTagsSlug,
+    annualizationTagsRaw,
+    annualizationTagsSlug,
+    annualizationTagsShort,
+  };
+}
+
+/** Start a run (batch + auto-resume trigger if needed). */
+function generateBir2316(form) {
+  const f = form || {};
+  const year = Number(f.year);
+  if (!year || year < 2000 || year > 2100) throw new Error("Invalid year.");
+
+  // Ensure annualization exists
+  bir2316ReadAnnualization_(year);
+
+  const employeeIds = Array.isArray(f.employeeIds) ? f.employeeIds.map(String).map(s => s.trim()).filter(Boolean) : [];
+  if (!employeeIds.length) throw new Error("No employees selected.");
+
+  const folderId = bir2316ParseFileId_(f.folderId);
+  if (!folderId) throw new Error("Please provide a valid Drive Folder ID/URL.");
+
+  // Slides-only template
+const slidesTemplateId = bir2316ParseFileId_(f.slidesTemplateUrl);
+if (!slidesTemplateId) throw new Error("Slides template URL/ID is required.");
+
+const filenamePattern = String(f.filenamePattern || BIR2316_V1.DEFAULT_FILENAME_PATTERN).trim();
+
+// Email settings
+const sendEmail = !!f.sendEmail;
+const appendGmailSignature = !!f.appendGmailSignature;
+
+const emailColumn = String(f.emailColumn || BIR2316_V1.DEFAULT_EMAIL_COLUMN).trim();
+const emailSubject = String(f.emailSubject || BIR2316_V1.DEFAULT_EMAIL_SUBJECT).trim();
+const emailBodyHtml = String(f.emailBodyHtml || BIR2316_V1.DEFAULT_EMAIL_BODY_HTML);
+const cc = String(f.cc || "").trim();
+const bcc = String(f.bcc || "").trim();
+const replyTo = String(f.replyTo || "").trim();
+const senderName = String(f.senderName || BIR2316_V1.DEFAULT_EMAIL_SENDER_NAME).trim();
+
+    // Save last settings
+bir2316SetLastSettings_({
+  year,
+  folderId: String(f.folderId || "").trim(), // preserve raw
+  slidesTemplateUrl: String(f.slidesTemplateUrl || "").trim(),
+  filenamePattern,
+
+  // email
+  sendEmail,
+  appendGmailSignature,
+
+  emailColumn,
+  emailSubject,
+  emailBodyHtml,
+  cc,
+  bcc,
+  replyTo,
+  senderName,
+});
+
+
+  // reset progress + run state
+  bir2316ClearTriggers_();
+  bir2316SetProgress_({
+    running: true,
+    finished: false,
+    cancelled: false,
+    percent: 0,
+    statusText: "Starting BIR 2316 generation…",
+    detail: "",
+    done: 0,
+    total: employeeIds.length,
+    errors: 0,
+  });
+
+const state = {
+  year,
+  folderId,
+  slidesTemplateId,
+  filenamePattern,
+  employeeIds,
+  idx: 0,
+  startedAt: new Date().toISOString(),
+
+  // email
+  sendEmail,
+  appendGmailSignature,
+
+  emailColumn,
+  emailSubject,
+  emailBodyHtml,
+  cc,
+  bcc,
+  replyTo,
+  senderName,
+};
+
+
+  bir2316DocProps_().setProperty(BIR2316_V1.PROP_RUN, JSON.stringify(state));
+
+  // Run first batch immediately
+  bir2316RunBatch_();
+}
+
+/** Trigger entrypoint */
+function runBir2316Auto() {
+  bir2316RunBatch_();
+}
+
+/** UI polling */
+function getBir2316Progress() {
+  const raw = bir2316DocProps_().getProperty(BIR2316_V1.PROP_PROGRESS);
+  return raw ? JSON.parse(raw) : { running: false, finished: false };
+}
+
+// PLACE THIS near getBir2316Progress() / bir2316SetProgress_()
+function resetBir2316Progress() {
+  // safest: wipe progress to empty idle state
+  bir2316DocProps_().deleteProperty(BIR2316_V1.PROP_PROGRESS);
+  return true;
+}
+
+
+function previewBir2316(form) {
+  const f = form || {};
+  const year = Number(f.year);
+  if (!year || year < 2000 || year > 2100) throw new Error("Invalid year.");
+
+  const slidesTemplateId = bir2316ParseFileId_(f.slidesTemplateUrl);
+  if (!slidesTemplateId) throw new Error("Slides template URL/ID is required for preview.");
+
+  const employeeIds = Array.isArray(f.employeeIds) ? f.employeeIds.map(String).map(s => s.trim()).filter(Boolean) : [];
+  if (!employeeIds.length) throw new Error("Select at least 1 employee.");
+  const empId = employeeIds[0]; // preview first selected
+
+  // Build tag map (same source as generation)
+  const ann = bir2316BuildAnnualizationIndex_(year);
+  const mf = bir2316TryBuildMasterIndex_();
+  const cfg = bir2316GetSettings_();
+
+  const annRowObj = ann.byEmpId.get(empId);
+  if (!annRowObj) throw new Error(`Employee ID not found in Annualization: ${empId}`);
+  const mfRowObj = mf && mf.byEmpId ? mf.byEmpId.get(empId) : null;
+
+  const tagMap = bir2316BuildTagMap_(year, ann.headers, annRowObj, mfRowObj, cfg);
+  const slidesMap = bir2316MapForSlides_(tagMap);
+
+  // Make a temp copy of the Slides template (so we don’t overwrite the original)
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const presName = `__BIR2316_PREVIEW__ ${slidesMap["EMPLOYEE NAME"] || empId} ${year}`;
+  const copy = DriveApp.getFileById(slidesTemplateId).makeCopy(presName);
+  const copyId = copy.getId();
+
+  // Fill tags in the copied Slides
+  bir2316FillSlidesTags_(copyId, slidesMap);
+
+  // Create/replace preview sheet
+  const previewSheetName = `BIR2316 Preview`;
+  let sh = ss.getSheetByName(previewSheetName);
+  if (sh) ss.deleteSheet(sh);
+  sh = ss.insertSheet(previewSheetName);
+
+  // Nice canvas
+  sh.setHiddenGridlines(true);
+  sh.setColumnWidth(1, 40);
+  sh.setColumnWidth(2, 900);
+  sh.setRowHeights(1, sh.getMaxRows(), 20);
+
+  // Insert slide PNGs into the sheet
+  const pres = SlidesApp.openById(copyId);
+  const slides = pres.getSlides();
+
+  let row = 1;
+  slides.forEach((s, idx) => {
+    const pageId = s.getObjectId();
+
+    // Export PNG of each slide page
+    const pngBlob = bir2316ExportSlidePng_(copyId, pageId, 2); // scale=2
+
+    sh.getRange(row, 2).setValue(`Slide ${idx + 1}`);
+    row += 1;
+
+    const img = sh.insertImage(pngBlob, 2, row);
+    // You can tweak size if needed:
+    // img.setWidth(850); // optional fixed width
+    row += 28; // spacing; adjust if your slide images are taller/shorter
+  });
+
+  // Cleanup temp Slides copy (preview doesn’t need to keep it)
+  try { DriveApp.getFileById(copyId).setTrashed(true); } catch (e) {}
+
+  return {
+    ok: true,
+    previewSheetName,
+    employeeId: empId,
+  };
+}
+
+
+/** Cancel button */
+function cancelBir2316Run() {
+  bir2316DocProps_().deleteProperty(BIR2316_V1.PROP_RUN);
+  bir2316SetProgress_({
+    running: false,
+    finished: false,
+    cancelled: true,
+    percent: 0,
+    statusText: "Cancelled.",
+    detail: "",
+  });
+  bir2316ClearTriggers_();
+}
+
+/* =========================
+ * Core batch runner
+ * ========================= */
+function bir2316RunBatch_() {
+  const props = bir2316DocProps_();
+
+  const raw = props.getProperty(BIR2316_V1.PROP_RUN);
+  if (!raw) {
+    bir2316ClearTriggers_();
+    bir2316SetProgress_({
+      running: false,
+      finished: false,
+      cancelled: false,
+      percent: 0,
+      statusText: "Idle.",
+      detail: "",
+    });
+    return;
+  }
+
+  let state;
+  try {
+    state = JSON.parse(raw);
+  } catch (e) {
+    props.deleteProperty(BIR2316_V1.PROP_RUN);
+    bir2316ClearTriggers_();
+    bir2316SetProgress_({
+      running: false,
+      finished: false,
+      cancelled: false,
+      percent: 0,
+      statusText: "Idle.",
+      detail: "Invalid run state (corrupt).",
+    });
+    return;
+  }
+
+  if (!state || !state.employeeIds || state.idx == null) {
+    props.deleteProperty(BIR2316_V1.PROP_RUN);
+    bir2316ClearTriggers_();
+    bir2316SetProgress_({
+      running: false,
+      finished: false,
+      cancelled: false,
+      percent: 0,
+      statusText: "Idle.",
+      detail: "",
+    });
+    return;
+  }
+
+  const start = Date.now();
+
+  const year = Number(state.year);
+  const folder = DriveApp.getFolderById(state.folderId);
+
+  const ann = bir2316BuildAnnualizationIndex_(year);
+  const mf = bir2316TryBuildMasterIndex_(); // may be null
+  const cfg = bir2316GetSettings_();
+
+  // ---- Batch counters (per trigger run) ----
+  let batchDone = 0;
+  let batchErrors = 0;
+
+  // ---- Persisted totals (across trigger runs) ----
+  state.totalErrors = Number(state.totalErrors || 0);
+state.totalOk = Number(state.totalOk || 0);
+
+
+
+  while (state.idx < state.employeeIds.length && (Date.now() - start) < BIR2316_V1.MAX_MS) {
+    const empId = String(state.employeeIds[state.idx] || "").trim();
+    state.idx++;
+
+    try {
+      const annRowObj = ann.byEmpId.get(empId);
+      if (!annRowObj) throw new Error(`Employee ID not found in Annualization: ${empId}`);
+
+      const mfRowObj = mf && mf.byEmpId ? mf.byEmpId.get(empId) : null;
+      const tagMap = bir2316BuildTagMap_(year, ann.headers, annRowObj, mfRowObj, cfg);
+
+      const fileName = bir2316SanitizeFilename_(
+        bir2316RenderStringTemplate_(state.filenamePattern, tagMap) || (`BIR2316-${empId}-${year}`)
+      );
+
+      const pdfFile = bir2316GenerateFromSlidesTemplate_(state.slidesTemplateId, folder, fileName, tagMap);
+
+      // Email (patterned after PayslipGenerator)
+      if (state.sendEmail) {
+        const quota = MailApp.getRemainingDailyQuota();
+        if (quota > 0) {
+          const empEmail = bir2316GetEmployeeEmailFromMaster_(mfRowObj, state.emailColumn);
+          if (empEmail && empEmail.includes("@")) {
+            const subj = bir2316RenderStringTemplateEmail_(state.emailSubject, tagMap);
+let bodyHtml = bir2316RenderStringTemplateEmail_(state.emailBodyHtml, tagMap);
+
+if (state.appendGmailSignature) {
+  const sig = bir2316GetPrimaryGmailSignatureHtml_();
+  if (sig) bodyHtml = bodyHtml + "<br><br>" + sig;
+}
+
+
+
+
+            bir2316SendEmailWithAttachment_(
+              empEmail,
+              subj,
+              bodyHtml,
+              {
+                cc: state.cc || "",
+                bcc: state.bcc || "",
+                replyTo: state.replyTo || "",
+                senderName: state.senderName || "Payroll Team",
+              },
+              pdfFile.getBlob()
+            );
+          }
+        }
+      }
+
+      const empName =
+  String(tagMap["EMPLOYEE NAME"] || annRowObj["EMPLOYEE NAME"] || "").trim();
+
+let resultText = "PDF OK";
+let lastErr = "";
+
+if (state.sendEmail) {
+  const quota = MailApp.getRemainingDailyQuota();
+  if (quota <= 0) {
+    resultText = "PDF OK — EMAIL ERROR (quota)";
+    lastErr = `⚠️ ${empId}: Email quota exceeded.`;
+  } else {
+    const empEmail = bir2316GetEmployeeEmailFromMaster_(mfRowObj, state.emailColumn);
+    if (!empEmail || !empEmail.includes("@")) {
+      resultText = "PDF OK — EMAIL ERROR (missing/invalid email)";
+      lastErr = `⚠️ ${empId}: No valid email in Masterfile column "${state.emailColumn}".`;
+    } else {
+      // you already send here; if it reaches here it’s “sent”
+      resultText = "PDF OK — EMAIL SENT";
+    }
+  }
+}
+
+state.totalOk = Number(state.totalOk || 0) + 1;
+batchDone++;
+
+bir2316UpdateProgress_(state, empId, empName, resultText, lastErr);
+
+
+    } catch (e) {
+      batchErrors++;
+state.totalErrors = Number(state.totalErrors || 0) + 1;
+
+const errLine = `❌ ${empId}: ${e && e.message ? e.message : e}`;
+bir2316UpdateProgress_(state, empId, "", "ERROR", errLine);
+
+    }
+  }
+
+  // Persist new state
+  props.setProperty(BIR2316_V1.PROP_RUN, JSON.stringify(state));
+
+  // Finished?
+  if (state.idx >= state.employeeIds.length) {
+    props.deleteProperty(BIR2316_V1.PROP_RUN);
+    bir2316ClearTriggers_();
+    bir2316SetProgress_({
+      running: false,
+      finished: true,
+      cancelled: false,
+      percent: 100,
+      statusText: `Done. Generated ${state.employeeIds.length - state.totalErrors} file(s).`,
+      detail: state.totalErrors ? `Completed with ${state.totalErrors} error(s).` : "Completed successfully.",
+      errors: state.totalErrors,
+      done: state.employeeIds.length,
+      total: state.employeeIds.length,
+    });
+    return;
+  }
+
+  // Not finished: ensure trigger exists to resume
+  bir2316EnsureTrigger_();
+  bir2316SetProgress_({
+    running: true,
+    finished: false,
+    cancelled: false,
+    percent: Math.max(0, Math.min(100, Math.round((state.idx / state.employeeIds.length) * 100))),
+    statusText: "Continuing… (auto-resume scheduled)",
+    detail: getBir2316Progress().detail || "",
+    done: state.idx,
+    total: state.employeeIds.length,
+    errors: Number(state.totalErrors || 0),
+  });
+}
+
+function bir2316UpdateProgress_(state, empId, empName, resultText, lastErrorLine) {
+  const total = state.employeeIds.length;
+  const done = state.idx; // already advanced
+  const pct = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+
+  const line =
+    `${empName || "(NO NAME)"} (${empId}) — ${resultText} | OK:${Number(state.totalOk || 0)} ERR:${Number(state.totalErrors || 0)} — ${done}/${total}`;
+
+  bir2316SetProgress_({
+    running: true,
+    finished: false,
+    cancelled: false,
+    percent: pct,
+    // put the exact format you want in statusText (most UIs show this)
+    statusText: line,
+    // keep detail ONLY for last error (or blank)
+    detail: lastErrorLine ? String(lastErrorLine) : "",
+    done,
+    total,
+    errors: Number(state.totalErrors || 0),
+  });
+}
+
+
+
+/* =========================
+ * Template implementations
+ * ========================= */
+
+
+function bir2316GenerateFromSlidesTemplate_(slidesTemplateId, folder, fileName, tagMap) {
+  const templateFile = DriveApp.getFileById(slidesTemplateId);
+  const copy = templateFile.makeCopy(`${fileName} (BIR2316 source)`, folder);
+  const copyId = copy.getId();
+
+  // Slides: use formatted strings
+  const slidesMap = bir2316MapForSlides_(tagMap);
+  bir2316FillSlidesTags_(copyId, slidesMap);
+
+  Utilities.sleep(600); // small buffer before export
+  const pdfBlob = DriveApp.getFileById(copyId).getAs(MimeType.PDF).setName(fileName + ".pdf");
+  const pdfFile = folder.createFile(pdfBlob);
+
+  // ALWAYS trash the Slides copy (no UI option)
+  try { DriveApp.getFileById(copyId).setTrashed(true); } catch (e) {}
+
+  return pdfFile;
+}
+
+/* =========================
+ * Data sources
+ * ========================= */
+
+function bir2316AnnualizationSheetName_(year) {
+  return `Annualization - ${year}`;
+}
+
+function bir2316ReadAnnualization_(year) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(bir2316AnnualizationSheetName_(year));
+  if (!sh) throw new Error(`Missing sheet "${bir2316AnnualizationSheetName_(year)}". Run Final Annualization first.`);
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) throw new Error(`"${bir2316AnnualizationSheetName_(year)}" is empty.`);
+  const headers = data[0].map(h => String(h || "").trim());
+  const rows = data.slice(1).filter(r => r.some(v => v !== "" && v != null));
+  return { headers, rows };
+}
+
+function bir2316BuildAnnualizationIndex_(year) {
+  const { headers, rows } = bir2316ReadAnnualization_(year);
+  const idxId = headers.findIndex(h => /^EMPLOYEE ID$/i.test(h));
+  if (idxId < 0) throw new Error("Annualization sheet missing EMPLOYEE ID column.");
+
+  const byEmpId = new Map();
+  rows.forEach(r => {
+    const id = String(r[idxId] || "").trim();
+    if (!id) return;
+    const obj = {};
+    headers.forEach((h, i) => { obj[h] = r[i]; });
+    byEmpId.set(id, obj);
+  });
+
+  return { headers, byEmpId };
+}
+
+function bir2316GetSettings_() {
+  if (typeof _readSettings_ === "function") return _readSettings_() || {};
+  return {};
+}
+
+/** Uses SOURCE_SS_ID + MASTER_SHEET_NAME if present (same approach used elsewhere). */
+function bir2316ReadMasterfile_() {
+  const cfg = bir2316GetSettings_();
+  const masterSheetName = cfg.MASTER_SHEET_NAME || "Masterfile";
+  const sourceRaw = cfg.SOURCE_SS_ID || "";
+
+  let ss;
+  if (sourceRaw) {
+    const id = bir2316ParseFileId_(sourceRaw);
+    if (!id) throw new Error("Could not parse SOURCE_SS_ID.");
+    ss = SpreadsheetApp.openById(id);
+  } else {
+    ss = SpreadsheetApp.getActiveSpreadsheet();
+  }
+
+  const sh = ss.getSheetByName(masterSheetName);
+  if (!sh) throw new Error(`Masterfile sheet not found: ${masterSheetName}`);
+
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) throw new Error("Masterfile is empty.");
+
+  const headers = data[0].map(h => String(h || "").trim());
+  const rows = data.slice(1).filter(r => r.some(v => v !== "" && v != null));
+
+  return { headers, rows };
+}
+
+function bir2316TryBuildMasterIndex_() {
+  try {
+    const { headers, rows } = bir2316ReadMasterfile_();
+    const idxId = headers.findIndex(h => /^EMPLOYEE ID$/i.test(h));
+    if (idxId < 0) return null;
+
+    const byEmpId = new Map();
+    rows.forEach(r => {
+      const id = String(r[idxId] || "").trim();
+      if (!id) return;
+      const obj = {};
+      headers.forEach((h, i) => { obj[h] = r[i]; });
+      byEmpId.set(id, obj);
+    });
+
+    return { headers, byEmpId };
+  } catch (e) {
+    return null;
+  }
+}
+
+/* =========================
+ * Tag building
+ * ========================= */
+
+function bir2316BuildTagMap_(year, annHeaders, annRowObj, mfRowObj, cfg) {
+  const tz = Session.getScriptTimeZone();
+  const now = new Date();
+
+  const map = {};
+
+  // Meta
+  map["YEAR"] = year;
+  map["DATE_ISSUED"] = Utilities.formatDate(now, tz, "yyyy-MM-dd");
+  map["DATE_ISSUED_LONG"] = Utilities.formatDate(now, tz, "MMMM d, yyyy");
+
+    // =========================
+  // Section 2: Period covered
+  // Rules:
+  // FROM = max(hireDate, Jan 1 of taxable year)
+  // TO   = separationDate if (sep year == taxable year) AND status != ACTIVE
+  //        else Dec 31 of taxable year
+  // Output as MM/DD split tags
+  // =========================
+  const yearStart = new Date(year, 0, 1);   // Jan 1
+  const yearEnd   = new Date(year, 11, 31); // Dec 31
+
+  // Try common masterfile field names (adjust if your headers differ)
+  const hireRaw =
+    (mfRowObj && (mfRowObj["START DATE"] || mfRowObj["HIRE DATE"] || mfRowObj["DATE HIRED"])) || "";
+  const sepRaw =
+    (mfRowObj && (mfRowObj["SEPARATION DATE"] || mfRowObj["TERMINATION DATE"])) || "";
+  const statusRaw =
+    (mfRowObj && (mfRowObj["STATUS"])) || "";
+
+  const hireDate = bir2316ParseDate_(hireRaw);
+  const sepDate  = bir2316ParseDate_(sepRaw);
+  const status   = String(statusRaw || "").trim().toUpperCase();
+  const isActive = status === "ACTIVE";
+
+  const fromDate = (hireDate && hireDate > yearStart) ? hireDate : yearStart;
+
+  let toDate = yearEnd;
+  if (!isActive && sepDate && sepDate.getFullYear() === year) {
+    toDate = sepDate;
+  }
+
+  map["PERIOD_FROM_MM"] = Utilities.formatDate(fromDate, tz, "MM");
+  map["PERIOD_FROM_DD"] = Utilities.formatDate(fromDate, tz, "dd");
+  map["PERIOD_TO_MM"]   = Utilities.formatDate(toDate, tz, "MM");
+  map["PERIOD_TO_DD"]   = Utilities.formatDate(toDate, tz, "dd");
+
+  // Employee Birthday (from Masterfile) => MM / DD / YYYY
+  const bdayRaw =
+    (mfRowObj && (mfRowObj["BIRTHDAY"] || mfRowObj["BIRTH DATE"] || mfRowObj["DATE OF BIRTH"])) || "";
+
+  const bday = bir2316ParseDate_(bdayRaw);
+
+  map["EMP_BDAY_MM"] = bday ? Utilities.formatDate(bday, tz, "MM") : "";
+  map["EMP_BDAY_DD"] = bday ? Utilities.formatDate(bday, tz, "dd") : "";
+  map["EMP_BDAY_YYYY"] = bday ? Utilities.formatDate(bday, tz, "yyyy") : "";
+
+  // Company settings
+  // Company settings (source of truth = Document Properties)
+const p = PropertiesService.getDocumentProperties();
+
+map["COMPANY_TIN"] = p.getProperty("COMPANY_TIN") || "";
+map["COMPANY_REGISTERED_NAME"] = p.getProperty("COMPANY_REGISTERED_NAME") || "";
+map["COMPANY_REGISTERED_ADDRESS1"] = p.getProperty("COMPANY_REGISTERED_ADDRESS1") || "";
+map["COMPANY_REGISTERED_ADDRESS2"] = p.getProperty("COMPANY_REGISTERED_ADDRESS2") || "";
+map["COMPANY_ZIP_CODE"] = p.getProperty("COMPANY_ZIP_CODE") || "";
+map["COMPANY_AUTHORIZED_REP"] = p.getProperty("COMPANY_AUTHORIZED_REP") || "";
+
+
+    // Company TIN parts (first 9 digits -> 3 chunks)
+  const cTin = bir2316TinParts9_(map["COMPANY_TIN"]);
+  map["COMPANY_TIN_1"] = cTin.p1;
+  map["COMPANY_TIN_2"] = cTin.p2;
+  map["COMPANY_TIN_3"] = cTin.p3;
+
+
+  // Annualization raw headers + slug aliases + SHORT tags (dynamic)
+  const annShortMap = bir2316EnsureAnnShortTags_(annHeaders);
+
+  annHeaders.forEach(h => {
+    if (!h) return;
+    const header = String(h || "").trim();
+    if (!header) return;
+
+    const v = annRowObj[header];
+
+    // ORIGINAL (keep working forever)
+    map[header] = v; // {{BASIC PAY}}
+    map["ANN." + bir2316Slug_(header)] = v; // {{ANN.BASIC_PAY}}
+
+    // NEW SHORT TAG (8-10 chars)
+    const sk = annShortMap[header];
+    if (sk) map[sk] = v; // {{BASPAY}} etc.
+  });
+
+  // =========================
+  // TNTCI (BIR 2316)
+  // Make TNTCI come from Annualization TOTAL NON-TAXABLE COMPENSATION INCOME
+  // =========================
+  map["TNTCI"] = bir2316Num_(bir2316PickField_(annRowObj, [
+    "TOTAL NON-TAXABLE COMPENSATION INCOME",
+    "TOTAL NON-TAXABLE COMPENSATION INCOME – PRESENT EMPLOYER",
+    "TOTAL NON-TAXABLE COMPENSATION INCOME - PRESENT EMPLOYER",
+    "TOTAL NON-TAXABLE COMPENSATION INCOME FROM PRESENT EMPLOYER",
+  ]));
+
+  // =========================
+  // TCIPE (BIR 2316)
+  // Make TCIPE come from Annualization TAXABLE COMPENSATION INCOME – PRESENT EMPLOYER
+  // =========================
+  map["TCIPE"] = bir2316Num_(bir2316PickField_(annRowObj, [
+    "TAXABLE COMPENSATION INCOME – PRESENT EMPLOYER",
+    "TAXABLE COMPENSATION INCOME - PRESENT EMPLOYER",
+    "TAXABLE COMPENSATION INCOME – PRESENT EMPLOYER ",
+    "TAXABLE COMPENSATION INCOME - PRESENT EMPLOYER ",
+    "TAXABLE COMPENSATION INCOME FROM PRESENT EMPLOYER",
+  ]));
+
+
+  // Masterfile raw headers + slug aliases
+  if (mfRowObj) {
+    Object.keys(mfRowObj).forEach(h => {
+      const v = mfRowObj[h];
+      map["MF." + h] = v;
+      map["MF." + bir2316Slug_(h)] = v;
+    });
+  }
+
+  // Previous employer TIN parts
+  // Tries Annualization field names first, then Masterfile field names as fallback.
+  const prevTinRaw =
+    bir2316PickField_(annRowObj, [
+      "PREVIOUS EMPLOYER TIN",
+      "PREVIOUS EMPLOYER TIN NO.",
+      "PREVIOUS EMPLOYER TIN NUMBER",
+      "PREV EMPLOYER TIN",
+      "PREV EMPLOYER TIN NO."
+    ]) ||
+    bir2316PickField_(mfRowObj, [
+      "PREVIOUS EMPLOYER TIN",
+      "PREVIOUS EMPLOYER TIN NO.",
+      "PREVIOUS EMPLOYER TIN NUMBER",
+      "PREV EMPLOYER TIN",
+      "PREV EMPLOYER TIN NO."
+    ]);
+
+  const pTin = bir2316TinParts9_(prevTinRaw);
+  map["PREV_EMP_TIN_1"] = pTin.p1;
+  map["PREV_EMP_TIN_2"] = pTin.p2;
+  map["PREV_EMP_TIN_3"] = pTin.p3;
+
+
+  // Employee TIN parts (from Masterfile)
+  const empTinRaw = bir2316PickField_(mfRowObj, ["TIN", "EMPLOYEE TIN"]);
+  const eTin = bir2316TinParts9_(empTinRaw);
+  map["EMP_TIN_1"] = eTin.p1;
+  map["EMP_TIN_2"] = eTin.p2;
+  map["EMP_TIN_3"] = eTin.p3;
+
+  // =========================
+  // Substituted Filing tags
+  // =========================
+  const isSF = bir2316GetSubstitutedFilingFlag_(annRowObj, mfRowObj);
+
+  // Middle initial (always available as a standalone tag)
+  const mfMiddle = bir2316PickField_(mfRowObj, ["MIDDLE NAME", "MID NAME", "MIDDLENAME"]) || "";
+  map["EMP_MI"] = bir2316MiddleInitial_(mfMiddle);
+
+  // Only fill these IF Substituted Filing is truthy; else blank
+  map["SF_EMP_NAME"] = isSF ? bir2316FullNameWithMI_(mfRowObj) : "";
+  map["SF_AUTH_REP"] = isSF ? (map["COMPANY_AUTHORIZED_REP"] || "") : "";
+
+  // =========================
+  // EE Contributions TOTAL (YTD) + MWE/NMWE net tags
+  // =========================
+  const isMwe = bir2316GetMweFlag_(mfRowObj);
+
+  
+
+
+  // =========================
+// MWE checkbox tag
+// =========================
+map["MWE_X"] = isMwe ? "X" : "";
+
+// =========================
+// Statutory Minimum Wage tags
+// Rules:
+// - If PAY BASIS = DAILY: masterfile basic pay is SMW per day
+//   => compute SMW per month using WORKING DAYS PER YEAR
+// - If PAY BASIS = MONTHLY or blank: masterfile basic pay is SMW per month
+//   => compute SMW per day using WORKING DAYS PER YEAR
+// =========================
+const payBasisRaw = bir2316PickField_(mfRowObj, ["PAY BASIS", "PAYBASIS", "PAY_BASIS"]);
+const payBasis = String(payBasisRaw || "").trim().toUpperCase();
+
+const mfBasicPay = bir2316Num_(bir2316PickField_(mfRowObj, [
+  "BASIC PAY",
+  "BASIC",
+  "SALARY",
+  "MONTHLY RATE",
+  "MONTHLY SALARY",
+  "RATE",
+]));
+
+const wdaysPerYear = bir2316Num_(bir2316PickField_(mfRowObj, [
+  "WORKING DAYS PER YEAR",
+  "WORKDAYS PER YEAR",
+  "WORK DAYS PER YEAR",
+  "WORKING DAYS",
+  "WORK DAYS",
+]));
+
+let smwDay = "";
+let smwMonth = "";
+
+if (payBasis === "DAILY") {
+  smwDay = mfBasicPay;
+  smwMonth = (wdaysPerYear > 0) ? (smwDay * wdaysPerYear / 12) : "";
+} else {
+  // MONTHLY or blank (or anything else treated as monthly per your rule)
+  smwMonth = mfBasicPay;
+  smwDay = (wdaysPerYear > 0) ? (smwMonth * 12 / wdaysPerYear) : "";
+}
+
+map["STAT_MIN_WAGE_DAY"] = smwDay;
+map["STAT_MIN_WAGE_MONTH"] = smwMonth;
+
+// ✅ If NOT MWE, Stat Min Wage tags must be blank (override computed values)
+if (!isMwe) {
+  map["STAT_MIN_WAGE_DAY"] = "";
+  map["STAT_MIN_WAGE_MONTH"] = "";
+}
+
+
+
+  // Pull EE contributions from Annualization (YTD)
+  const sssMc  = bir2316Num_(bir2316PickField_(annRowObj, ["SSS EE MC (YTD)"]));
+  const sssMpf = bir2316Num_(bir2316PickField_(annRowObj, ["SSS EE MPF (YTD)"]));
+  const phEe   = bir2316Num_(bir2316PickField_(annRowObj, ["PHILHEALTH EE (YTD)"]));
+  const pagEe  = bir2316Num_(bir2316PickField_(annRowObj, ["PAG-IBIG EE (YTD)", "PAG-IBIG EE (YTD) "])); // (extra space guard)
+
+  const eeContribTot = sssMc + sssMpf + phEe + pagEe;
+  map["EECONTRIB"] = eeContribTot;
+
+  // Base components
+  const basicPay = bir2316Num_(bir2316PickField_(annRowObj, ["BASIC PAY"]));
+  const overtime = bir2316Num_(bir2316PickField_(annRowObj, ["OVERTIME", "OT"]));
+
+    const basicPayNet = Math.max(0, basicPay - eeContribTot);
+
+  // Output tags
+  // - Basic Pay: NET of EE contributions
+  // - Overtime: AS-IS (no netting)
+  map["MWE_BP"]  = isMwe ? basicPayNet : "";
+  map["MWE_OT"]  = isMwe ? overtime : "";
+  map["NMWE_BP"] = !isMwe ? basicPayNet : "";
+  map["NMWE_OT"] = !isMwe ? overtime : "";
+
+  // =========================
+  // NON-TAX CATEGORY TAGS (based on FinalAnnualization mapping)
+  // =========================
+  let ntdmTotal = 0;
+  let ntoTotal  = 0;
+
+  // Build componentMap ONCE (FinalAnnualization logic)
+const componentMap =
+  (typeof _buildComponentMap_ === "function") ? _buildComponentMap_(cfg) : null;
+
+
+  // If we can't build componentMap, we still won't crash — just no NTDM/NTO tags.
+  if (componentMap) {
+    annHeaders.forEach(h => {
+      const header = String(h || "").trim();
+      if (!header) return;
+            // ✅ EXCLUDE OVERTIME from NTDM_TOTAL and NTO_TOTAL
+      if (bir2316IsOvertimeHeader_(header)) return;
+
+
+      const bucket = bir2316ClassifyAnnualizationHeader_(header, componentMap);
+      if (!bucket) return;
+
+      const v = annRowObj[header];
+      const slug = bir2316Slug_(header);
+
+      if (bucket === "DEMINIMIS") {
+        map["NTDM." + slug] = v;
+        ntdmTotal += bir2316Num_(v);
+      } else if (bucket === "NONTAX_OTHER") {
+        map["NTO." + slug] = v;
+        ntoTotal += bir2316Num_(v);
+      }
+    });
+  }
+
+  map["NTDM_TOTAL"] = ntdmTotal;
+  map["NTO_TOTAL"]  = ntoTotal;
+
+  // =========================
+  // 13TH + OTHER BENEFITS (TAXABLE PORTION)
+  // Taxable = sum(OTHER13 components) - (Non-tax 13th + Other <=90k)
+  // =========================
+  let other13Total = 0;
+
+  // componentMap already built in the NON-TAX block:
+  // let componentMap = _buildComponentMap_(cfg);
+  if (componentMap) {
+    annHeaders.forEach(h => {
+      const header = String(h || "").trim();
+      if (!header) return;
+
+      const bucket = bir2316ClassifyAnnualizationHeader_(header, componentMap);
+      if (bucket !== "OTHER13") return;
+
+      other13Total += bir2316Num_(annRowObj[header]);
+    });
+  }
+
+  // Pull the exempt/non-tax 90k value from the Annualization summary column (preferred source)
+  const other13NonTax90k = bir2316Num_(bir2316PickField_(annRowObj, [
+    "NON-TAX 13TH + OTHER (≤90K)",
+    "NON-TAX 13TH + OTHER (<=90K)",
+    "NON-TAX 13TH + OTHER (90K)",
+    "NON TAX 13TH + OTHER (≤90K)",
+    "NON TAX 13TH + OTHER (<=90K)"
+  ]));
+
+  const other13Taxable = Math.max(0, other13Total - other13NonTax90k);
+
+  map["OTHER13_TOTAL"] = other13Total;
+  map["OTHER13_NONTAX_90K"] = other13NonTax90k;
+  map["OTHER13_TAXABLE"] = other13Taxable;
+
+    // =========================
+  // TOTAL TAXABLE EARNINGS (sum of all components classified as TAXABLE)
+  // NOTE: MUST NOT include OVERTIME
+  // =========================
+  let taxableTotal = 0;
+
+  if (componentMap && typeof bir2316ClassifyAnnualizationHeader_ === "function") {
+    annHeaders.forEach(h => {
+      const header = String(h || "").trim();
+      if (!header) return;
+
+      // ✅ EXCLUDE OVERTIME FROM TAXABLE_TOTAL
+      if (bir2316IsOvertimeHeader_(header)) return;
+
+      const bucket = bir2316ClassifyAnnualizationHeader_(header, componentMap);
+      if (bucket !== "TAXABLE") return;
+
+      taxableTotal += bir2316Num_(annRowObj[header]);
+    });
+  }
+
+  map["TAXABLE_TOTAL"] = taxableTotal;
+  // Show the NORMAL field label only when TAXABLE_TOTAL > 0
+map["TAXABLE_TOTAL_FIELD"] = (bir2316Num_(taxableTotal) > 0) ? "TOTAL TAXABLE EARNINGS" : "";
+
+  // MWE rule: TAXABLE_TOTAL must be 0
+if (isMwe) {
+  map["TAXABLE_TOTAL"] = 0;
+  map["TAXABLE_TOTAL_FIELD"] = "";
+}
+
+// =========================
+// MWE rules (BIR 2316 tags)
+// - TAXABLE_TOTAL must be 0
+// NOTE: TNTCI/TCIPE are NOT shifted anymore.
+// =========================
+if (isMwe) {
+  map["TAXABLE_TOTAL"] = 0;
+  map["TAXABLE_TOTAL_FIELD"] = "";
+}
+
+
+// ✅ TTCI must be TOTAL of TCIPE (present employer) + TCIPE2 (previous employer)
+map["TTCI"] = bir2316Num_(map["TCIPE"]) + bir2316Num_(map["TCIPE2"]);
+
+
+
+  return map;
+}
+
+function bir2316RenderStringTemplate_(s, map) {
+  const norm = {};
+  Object.keys(map || {}).forEach(k => { norm[String(k).trim().toLowerCase()] = map[k]; });
+
+  return String(s || "").replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_, key) => {
+    const k = String(key || "").trim().toLowerCase();
+    const v = norm[k];
+    return bir2316FormatInline_(k, v);
+  });
+}
+
+
+function bir2316Slug_(s) {
+  return String(s || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .replace(/_+/g, "_");
+}
+
+function bir2316SanitizeFilename_(s) {
+  return String(s || "")
+    .replace(/[\\/:*?"<>|#%{}~]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 180);
+}
+
+/* =========================
+ * Sheets tag replacer (smart typing)
+ * ========================= */
+
+
+/* =========================
+ * Slides tag replacer
+ * ========================= */
+
+function bir2316MapForSlides_(map) {
+  const tz = Session.getScriptTimeZone();
+  const out = {};
+
+  Object.keys(map || {}).forEach(k => {
+    const keyLower = String(k || "").trim().toLowerCase();
+    const v = map[k];
+
+    if (v == null) out[k] = "";
+    else if (bir2316IsDate_(v)) out[k] = Utilities.formatDate(v, tz, "MM/dd/yyyy");
+    else if (bir2316IsFiniteNumber_(v)) {
+      out[k] = bir2316IsAmountKey_(keyLower) ? bir2316AccountingString_(v) : String(v);
+    } else {
+      out[k] = bir2316Upper_(v);
+    }
+  });
+
+  return out;
+}
+
+function bir2316FillSlidesTags_(presentationId, map) {
+  const norm = {};
+  Object.keys(map || {}).forEach(k => { norm[String(k).trim().toLowerCase()] = map[k]; });
+
+  const rx = /\{\{\s*([^}]+?)\s*\}\}/g;
+  const pres = SlidesApp.openById(presentationId);
+
+    // ✅ MASTER/LAYOUT-safe replace for the two problem tags
+  // (Your element-walk below can miss master text)
+  try {
+    pres.replaceAllText("{{TNTCI}}", (norm["tntci"] != null ? String(norm["tntci"]) : ""));
+    pres.replaceAllText("{{TCIPE}}", (norm["tcipe"] != null ? String(norm["tcipe"]) : ""));
+  } catch (e) {}
+
+
+  pres.getSlides().forEach(slide => {
+    // main slide content
+    bir2316ReplaceInElements_(slide.getPageElements(), norm, rx);
+
+    // speaker notes (optional but useful)
+    try {
+      const notesShape = slide.getNotesPage().getSpeakerNotesShape();
+      if (notesShape) bir2316ReplaceInTextRange_(notesShape.getText(), norm, rx);
+    } catch (e) {}
+  });
+
+  pres.saveAndClose();
+}
+
+function bir2316ReplaceInElements_(elements, norm, rx) {
+  elements.forEach(el => {
+    try {
+      const t = el.getPageElementType();
+
+      if (t === SlidesApp.PageElementType.GROUP) {
+        bir2316ReplaceInElements_(el.asGroup().getChildren(), norm, rx);
+        return;
+      }
+
+      if (t === SlidesApp.PageElementType.TABLE) {
+        const tbl = el.asTable();
+        for (let r = 0; r < tbl.getNumRows(); r++) {
+          for (let c = 0; c < tbl.getNumColumns(); c++) {
+            bir2316ReplaceInTextRange_(tbl.getCell(r, c).getText(), norm, rx);
+          }
+        }
+        return;
+      }
+
+      if (t === SlidesApp.PageElementType.SHAPE) {
+        const shape = el.asShape();
+        bir2316ReplaceInTextRange_(shape.getText(), norm, rx);
+        return;
+      }
+
+      if (t === SlidesApp.PageElementType.WORD_ART) {
+        const wa = el.asWordArt();
+        bir2316ReplaceInTextRange_(wa.getText(), norm, rx);
+        return;
+      }
+
+    } catch (e) {
+      // ignore individual element errors
+    }
+  });
+}
+
+function bir2316ReplaceInTextRange_(textRange, norm, rx) {
+  if (!textRange) return;
+  const s = textRange.asString();
+  if (!s || s.indexOf("{{") === -1) return;
+
+  rx.lastIndex = 0;
+  const found = [];
+  let m;
+  while ((m = rx.exec(s)) !== null) {
+    found.push({ placeholder: m[0], key: m[1] });
+  }
+
+  found.forEach(f => {
+    const k = String(f.key || "").trim().toLowerCase();
+    const val = (k in norm) ? String(norm[k]) : "";
+    textRange.replaceAllText(f.placeholder, val);
+  });
+}
+
+/* =========================
+ * PDF Export (Sheets)
+ * ========================= */
+
+
+
+function bir2316ExportSlidePng_(presentationId, pageId, scale) {
+  const sc = scale || 2;
+
+  // Works for many setups: exports a single slide page as PNG
+  const url =
+    `https://docs.google.com/presentation/d/${presentationId}/export/png` +
+    `?pageid=${encodeURIComponent(pageId)}` +
+    `&scale=${encodeURIComponent(sc)}`;
+
+  const resp = UrlFetchApp.fetch(url, {
+    headers: { Authorization: `Bearer ${ScriptApp.getOAuthToken()}` },
+    muteHttpExceptions: true,
+  });
+
+  const blob = resp.getBlob();
+  if (blob.getContentType() !== "image/png" || blob.getBytes().length < 1000) {
+    throw new Error("Failed to export slide PNG for preview.");
+  }
+  return blob.setName(`slide-${pageId}.png`);
+}
+
+
+/* =========================
+ * Progress / triggers / persistence
+ * ========================= */
+
+function bir2316DocProps_() {
+  return PropertiesService.getDocumentProperties();
+}
+
+function bir2316SetProgress_(obj) {
+  bir2316DocProps_().setProperty(BIR2316_V1.PROP_PROGRESS, JSON.stringify(obj || {}));
+}
+
+function bir2316EnsureTrigger_() {
+  const fn = BIR2316_V1.TRIGGER_FN;
+
+  // ✅ delete ANY existing triggers for this handler (including expired/missed ones)
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === fn)
+    .forEach(t => { try { ScriptApp.deleteTrigger(t); } catch (e) {} });
+
+  // ✅ schedule a fresh one-shot trigger
+  ScriptApp.newTrigger(fn).timeBased().after(60 * 1000).create();
+}
+
+
+function bir2316ClearTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === BIR2316_V1.TRIGGER_FN)
+    .forEach(t => { try { ScriptApp.deleteTrigger(t); } catch (e) {} });
+}
+
+function bir2316GetLastSettings_() {
+  const raw = bir2316DocProps_().getProperty(BIR2316_V1.PROP_LAST);
+  return raw ? JSON.parse(raw) : null;
+}
+
+function bir2316SetLastSettings_(obj) {
+  bir2316DocProps_().setProperty(BIR2316_V1.PROP_LAST, JSON.stringify(obj || {}));
+}
+
+function bir2316ParseFileId_(s) {
+  const m = String(s || "").match(/[-\w]{25,}/);
+  return m ? m[0] : "";
+}
+
+function bir2316Digits_(v) {
+  return String(v == null ? "" : v).replace(/\D+/g, "");
+}
+
+function bir2316Truthy_(v) {
+  const s = String(v == null ? "" : v).trim().toLowerCase();
+  return s === "y" || s === "yes" || s === "true" || s === "1" || s === "t";
+}
+
+function bir2316MiddleInitial_(middleName) {
+  const s = String(middleName == null ? "" : middleName).trim();
+  if (!s) return "";
+  return s.charAt(0).toUpperCase();
+}
+
+function bir2316FullNameWithMI_(mfRowObj) {
+  // First / Middle / Last from masterfile
+  const first = bir2316PickField_(mfRowObj, ["FIRST NAME", "FIRSTNAME", "GIVEN NAME"]) || "";
+  const middle = bir2316PickField_(mfRowObj, ["MIDDLE NAME", "MID NAME", "MIDDLENAME"]) || "";
+  const last = bir2316PickField_(mfRowObj, ["LAST NAME", "LASTNAME", "SURNAME", "FAMILY NAME"]) || "";
+
+  const mi = bir2316MiddleInitial_(middle);
+
+  // "First M. Last" (no double spaces; MI optional)
+  const parts = [];
+  if (first) parts.push(String(first).trim());
+  if (mi) parts.push(mi + ".");
+  if (last) parts.push(String(last).trim());
+
+  return parts.join(" ").trim();
+}
+
+function bir2316GetSubstitutedFilingFlag_(annRowObj, mfRowObj) {
+  // Prefer annualization column if present, fallback to masterfile if you ever add it there
+  const raw =
+    bir2316PickField_(annRowObj, [
+      "SUBSTITUTED FILING",
+      "SUBSTITUTED_FILING",
+      "SUB FILING",
+      "SUBSTITUTED"
+    ]) ||
+    bir2316PickField_(mfRowObj, [
+      "SUBSTITUTED FILING",
+      "SUBSTITUTED_FILING",
+      "SUB FILING",
+      "SUBSTITUTED"
+    ]);
+
+  return bir2316Truthy_(raw);
+}
+
+function bir2316GetMweFlag_(mfRowObj) {
+  // Masterfile column candidates for MWE flag
+  const raw = bir2316PickField_(mfRowObj, [
+    "MWE",
+    "IS MWE",
+    "MINIMUM WAGE EARNER",
+    "MINIMUM WAGE EARNER (MWE)"
+  ]);
+
+  return bir2316Truthy_(raw);
+}
+
+function bir2316IsAnnNonTaxShadowCol_(header) {
+  // Your Annualization sheet includes a repeated block like "[NON-TAX] <header>"
+  // We DO NOT want to classify these again.
+  return /^\s*\[NON-TAX\]\s*/i.test(String(header || ""));
+}
+
+function bir2316IsOvertimeHeader_(header) {
+  const name = String(header || "").trim().toUpperCase();
+  if (!name) return false;
+
+  // Keep this strict (only obvious OT headers)
+  return (
+    name === "OVERTIME" ||
+    name === "OT" ||
+    name === "OVERTIME PAY" ||
+    name === "OT PAY" ||
+    /\bOVERTIME\b/.test(name)
+  );
+}
+
+
+/**
+ * Classify an Annualization column header into FinalAnnualization buckets
+ * using the SAME mapping logic (componentMap) when available.
+ *
+ * Returns one of: BASIC, TAXABLE, DEMINIMIS, NONTAX_OTHER, OTHER13, or "".
+ */
+function bir2316ClassifyAnnualizationHeader_(header, componentMap) {
+  const name = String(header || "").trim();
+  if (!name) return "";
+
+  // Ignore the repeated non-tax block columns and obvious summary fields
+  if (bir2316IsAnnNonTaxShadowCol_(name)) return "";
+
+  const up = name.toUpperCase();
+
+  // Exclude summary / non-component columns that appear in Annualization
+  // (keep this list tight + safe)
+  if (
+    up === "GROSS COMPENSATION INCOME – PRESENT EMPLOYER" ||
+    up === "GROSS COMPENSATION INCOME - PRESENT EMPLOYER" ||
+    up === "TOTAL NON-TAXABLE COMPENSATION INCOME" ||
+    up === "TAXABLE COMPENSATION INCOME – PRESENT EMPLOYER" ||
+    up === "TAXABLE COMPENSATION INCOME - PRESENT EMPLOYER" ||
+    up === "TAXABLE COMPENSATION INCOME – PREVIOUS EMPLOYER" ||
+    up === "TAXABLE COMPENSATION INCOME - PREVIOUS EMPLOYER" ||
+    up === "TOTAL TAXABLE COMPENSATION INCOME" ||
+    up === "ANNUAL TAX DUE" ||
+        up === "NON-TAX 13TH + OTHER (≤90K)" ||
+    up === "NON-TAX 13TH + OTHER (<=90K)" ||
+    up === "NON-TAX 13TH + OTHER (90K)" ||
+
+    up.indexOf("PREVIOUS EMPLOYER") === 0 ||
+    up.indexOf("VARIANCE") === 0
+  ) return "";
+
+  // Your Annualization explicitly includes these as summary contribution columns;
+  // don't treat them as non-tax earning components.
+  if (/\bSSS EE MC \(YTD\)\b/i.test(name)) return "";
+  if (/\bSSS EE MPF \(YTD\)\b/i.test(name)) return "";
+  if (/\bPHILHEALTH EE \(YTD\)\b/i.test(name)) return "";
+  if (/\bPAG-IBIG EE \(YTD\)\b/i.test(name)) return "";
+  if (/\bTAX WITHHELD\b/i.test(name)) return "";
+  if (/\bWITHHELD\b/i.test(name) && /\bTAX\b/i.test(name)) return "";
+
+  // --- IMPORTANT ---
+  // Use your FinalAnnualization mapping functions if present.
+  // These MUST exist in the project for this to work.
+  if (typeof _classifyComponent_ !== "function") return "";
+  if (typeof _canonicalPayrollCategoryKey_ !== "function") return "";
+  if (typeof _inferCategoryFromHeader_ !== "function") return "";
+
+  const catRaw = _classifyComponent_(name, componentMap) || "";
+  let key = _canonicalPayrollCategoryKey_(catRaw);
+
+  if (!key) key = _inferCategoryFromHeader_(up);
+
+  return String(key || "").trim().toUpperCase();
+}
+
+/**
+ * Splits the first 9 digits into 3 parts (XXX-XXX-XXX) but as separate tags.
+ * If less than 9 digits, missing parts become "".
+ */
+function bir2316TinParts9_(v) {
+  const d = bir2316Digits_(v);
+  const core = d.slice(0, 9); // take first 9 digits only
+  const p1 = core.length >= 3 ? core.slice(0, 3) : "";
+  const p2 = core.length >= 6 ? core.slice(3, 6) : "";
+  const p3 = core.length >= 9 ? core.slice(6, 9) : "";
+  return { p1, p2, p3 };
+}
+
+function bir2316GetAnnShortMap_() {
+  const p = PropertiesService.getDocumentProperties();
+  const raw = p.getProperty(BIR2316_V1.PROP_ANN_SHORT_MAP);
+  if (!raw) return {};
+  try { return JSON.parse(raw) || {}; } catch (e) { return {}; }
+}
+
+function bir2316SaveAnnShortMap_(obj) {
+  PropertiesService.getDocumentProperties().setProperty(
+    BIR2316_V1.PROP_ANN_SHORT_MAP,
+    JSON.stringify(obj || {})
+  );
+}
+
+/**
+ * Build a short key (<= maxLen) from a slug.
+ * - deterministic
+ * - collision-safe via suffix numbers
+ */
+function bir2316MakeShortKey_(slug, used, maxLen) {
+  const s = String(slug || "").toUpperCase();
+
+  // 1) Try acronym from underscore parts (e.g. BASIC_PAY -> BP)
+  const parts = s.split("_").filter(Boolean);
+  let base = parts.map(x => x[0]).join(""); // acronym
+
+  // 2) If too short/unhelpful, take compact from first parts
+  if (base.length < 4) {
+    base = parts.join("").slice(0, maxLen);
+  } else if (base.length > maxLen) {
+    base = base.slice(0, maxLen);
+  }
+
+  // 3) Ensure alnum only
+  base = base.replace(/[^A-Z0-9]/g, "");
+  if (!base) base = "TAG";
+
+  // 4) Deduplicate with numeric suffix (keeping maxLen)
+  let out = base;
+  let i = 2;
+  while (used.has(out)) {
+    const suf = String(i++);
+    const cut = Math.max(1, maxLen - suf.length);
+    out = base.slice(0, cut) + suf;
+  }
+  used.add(out);
+  return out;
+}
+
+/**
+ * Ensures every Annualization header has a persisted short tag.
+ * - Existing mappings are preserved (stable)
+ * - New columns get appended automatically
+ */
+function bir2316EnsureAnnShortTags_(annHeaders) {
+  const map = bir2316GetAnnShortMap_();
+
+  // track used short tags from existing mappings
+  const used = new Set(Object.values(map || {}).map(v => String(v || "").toUpperCase()).filter(Boolean));
+  const maxLen = BIR2316_V1.SHORT_TAG_MAXLEN || 10;
+
+  let changed = false;
+  (annHeaders || []).forEach(h => {
+    const header = String(h || "").trim();
+    if (!header) return;
+
+    // already has mapping
+    if (map[header]) return;
+
+    const slug = bir2316Slug_(header);
+    const shortKey = bir2316MakeShortKey_(slug, used, maxLen);
+
+    map[header] = shortKey;
+    changed = true;
+  });
+
+  if (changed) bir2316SaveAnnShortMap_(map);
+  return map;
+}
+
+
+/**
+ * Finds a value in an object by trying:
+ *  - exact keys (case-sensitive)
+ *  - case-insensitive match
+ */
+function bir2316PickField_(obj, candidates) {
+  if (!obj) return "";
+  for (const k of (candidates || [])) {
+    if (k in obj) return obj[k];
+  }
+  const lowerMap = {};
+  Object.keys(obj).forEach(k => { lowerMap[String(k).toLowerCase()] = k; });
+  for (const k of (candidates || [])) {
+    const hit = lowerMap[String(k).toLowerCase()];
+    if (hit) return obj[hit];
+  }
+  return "";
+}
+
+function bir2316GetEmployeeEmailFromMaster_(mfRowObj, emailColumnName) {
+  if (!mfRowObj) return "";
+  const target = String(emailColumnName || "").trim();
+  if (!target) return "";
+
+  const tNorm = target.toLowerCase().replace(/\s+/g, "");
+  const keys = Object.keys(mfRowObj);
+
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    const kNorm = String(k || "").toLowerCase().replace(/\s+/g, "");
+    if (kNorm === tNorm || kNorm.indexOf(tNorm) !== -1) {
+      return String(mfRowObj[k] || "").trim();
+    }
+  }
+  return "";
+}
+
+function bir2316SendEmailWithAttachment_(to, subject, htmlBody, opts, attachmentBlob) {
+  const o = opts || {};
+  GmailApp.sendEmail(
+    String(to || "").trim(),
+    String(subject || "").trim(),
+    "", // plain body (empty)
+    {
+      htmlBody: String(htmlBody || ""),
+      attachments: attachmentBlob ? [attachmentBlob] : [],
+      cc: String(o.cc || ""),
+      bcc: String(o.bcc || ""),
+      replyTo: String(o.replyTo || ""),
+      name: String(o.senderName || "Payroll Team"),
+    }
+  );
+}
+
+
+function DEBUG_BIR2316_CompanyDetails() {
+  const cfg = bir2316GetSettings_();
+  Logger.log("BIR2316 cfg COMPANY_TIN=" + (cfg.COMPANY_TIN || ""));
+  Logger.log("BIR2316 cfg COMPANY_REGISTERED_NAME=" + (cfg.COMPANY_REGISTERED_NAME || ""));
+  Logger.log("BIR2316 cfg COMPANY_REGISTERED_ADDRESS1=" + (cfg.COMPANY_REGISTERED_ADDRESS1 || ""));
+  Logger.log("BIR2316 cfg COMPANY_REGISTERED_ADDRESS2=" + (cfg.COMPANY_REGISTERED_ADDRESS2 || ""));
+  Logger.log("BIR2316 cfg COMPANY_ZIP_CODE=" + (cfg.COMPANY_ZIP_CODE || ""));
+  Logger.log("BIR2316 cfg COMPANY_AUTHORIZED_REP=" + (cfg.COMPANY_AUTHORIZED_REP || ""));
+
+  const p = PropertiesService.getDocumentProperties();
+  Logger.log("DOC_PROPS COMPANY_TIN=" + (p.getProperty("COMPANY_TIN") || ""));
+  Logger.log("DOC_PROPS COMPANY_REGISTERED_NAME=" + (p.getProperty("COMPANY_REGISTERED_NAME") || ""));
+}
+
+function DEBUG_BIR2316_TagLookup() {
+  const year = Number(SpreadsheetApp.getActiveSpreadsheet().getSheets()
+    .map(s => s.getName()).join("\n").match(/Annualization\s*-\s*(\d{4})/i)?.[1] || new Date().getFullYear());
+
+  const ann = bir2316BuildAnnualizationIndex_(year);
+  const empId = Array.from(ann.byEmpId.keys())[0]; // first employee
+  const annRowObj = ann.byEmpId.get(empId);
+
+  const mf = bir2316TryBuildMasterIndex_();
+  const mfRowObj = mf && mf.byEmpId ? mf.byEmpId.get(empId) : null;
+
+  const tagMap = bir2316BuildTagMap_(year, ann.headers, annRowObj, mfRowObj, bir2316GetSettings_());
+
+  const sample = "ANN.GROSS_COMPENSATION_INCOME_PRESENT_EMPLOYER"; // <-- change to your tag (without braces)
+
+  Logger.log("EMP=" + empId);
+  Logger.log("HAS KEY? " + (sample in tagMap));
+  Logger.log("VALUE=" + (tagMap[sample] == null ? "" : tagMap[sample]));
+  Logger.log("NEAR MATCHES:");
+  Object.keys(tagMap)
+    .filter(k => k.startsWith("ANN.") && k.indexOf("GROSS") >= 0)
+    .slice(0, 30)
+    .forEach(k => Logger.log("  " + k));
+}
+
+function DEBUG_BIR2316_AnnShortTags() {
+  const year = Number(SpreadsheetApp.getActiveSpreadsheet().getSheets()
+    .map(s => s.getName()).join("\n").match(/Annualization\s*-\s*(\d{4})/i)?.[1] || new Date().getFullYear());
+
+  const { headers } = bir2316ReadAnnualization_(year);
+
+  // ensures map exists + includes any new headers
+  const shortMap = bir2316EnsureAnnShortTags_(headers);
+
+  Logger.log("=== Annualization SHORT TAGS ({{TAG}}) ===");
+  headers.forEach(h => {
+    const header = String(h || "").trim();
+    if (!header) return;
+    const t = shortMap[header] || "";
+    Logger.log(`${t}\t<=\t${header}`);
+  });
+
+  Logger.log("DocProps key: " + BIR2316_V1.PROP_ANN_SHORT_MAP);
+}
+
+function DEBUG_BIR2316_MWE_TAGS() {
+  const year = Number(SpreadsheetApp.getActiveSpreadsheet().getSheets()
+    .map(s => s.getName()).join("\n").match(/Annualization\s*-\s*(\d{4})/i)?.[1] || new Date().getFullYear());
+
+  const ann = bir2316BuildAnnualizationIndex_(year);
+  const empId = Array.from(ann.byEmpId.keys())[0];
+  const annRowObj = ann.byEmpId.get(empId);
+
+  const mf = bir2316TryBuildMasterIndex_();
+  const mfRowObj = mf && mf.byEmpId ? mf.byEmpId.get(empId) : null;
+
+  const tagMap = bir2316BuildTagMap_(year, ann.headers, annRowObj, mfRowObj, bir2316GetSettings_());
+
+  Logger.log("EMP=" + empId);
+  Logger.log("EECONTRIB=" + tagMap["EECONTRIB"]);
+  Logger.log("MWE_BP=" + tagMap["MWE_BP"]);
+  Logger.log("MWE_OT=" + tagMap["MWE_OT"]);
+  Logger.log("NMWE_BP=" + tagMap["NMWE_BP"]);
+  Logger.log("NMWE_OT=" + tagMap["NMWE_OT"]);
+}
+
+/** Single-employee: create PDF and return link (no batch, no trigger) */
+function bir2316DownloadOne(form, employeeId) {
+  return bir2316GenerateOne_(form, employeeId, { sendEmail: false });
+}
+
+/** Single-employee: create PDF + email (no batch, no trigger) */
+function bir2316SendOne(form, employeeId) {
+  return bir2316GenerateOne_(form, employeeId, { sendEmail: true });
+}
+
+/** Internal helper for single-employee actions */
+function bir2316GenerateOne_(form, employeeId, opt) {
+  const f = form || {};
+  const year = Number(f.year);
+  if (!year || year < 2000 || year > 2100) throw new Error("Invalid year.");
+
+  const empId = String(employeeId || "").trim();
+  if (!empId) throw new Error("Missing employeeId.");
+
+  const folderId = bir2316ParseFileId_(f.folderId);
+  if (!folderId) throw new Error("Please provide a valid Drive Folder ID/URL.");
+
+  const slidesTemplateId = bir2316ParseFileId_(f.slidesTemplateUrl);
+  if (!slidesTemplateId) throw new Error("Slides template URL/ID is required.");
+
+  const filenamePattern = String(f.filenamePattern || BIR2316_V1.DEFAULT_FILENAME_PATTERN).trim();
+
+  const emailColumn = String(f.emailColumn || BIR2316_V1.DEFAULT_EMAIL_COLUMN).trim();
+  const emailSubject = String(f.emailSubject || BIR2316_V1.DEFAULT_EMAIL_SUBJECT).trim();
+  const emailBodyHtml = String(f.emailBodyHtml || BIR2316_V1.DEFAULT_EMAIL_BODY_HTML);
+  const cc = String(f.cc || "").trim();
+  const bcc = String(f.bcc || "").trim();
+  const replyTo = String(f.replyTo || "").trim();
+  const senderName = String(f.senderName || BIR2316_V1.DEFAULT_EMAIL_SENDER_NAME).trim();
+
+  // data sources
+  const folder = DriveApp.getFolderById(folderId);
+  const ann = bir2316BuildAnnualizationIndex_(year);
+  const mf = bir2316TryBuildMasterIndex_();
+  const cfg = bir2316GetSettings_();
+
+  const annRowObj = ann.byEmpId.get(empId);
+  if (!annRowObj) throw new Error(`Employee ID not found in Annualization: ${empId}`);
+
+  const mfRowObj = mf && mf.byEmpId ? mf.byEmpId.get(empId) : null;
+
+  const tagMap = bir2316BuildTagMap_(year, ann.headers, annRowObj, mfRowObj, cfg);
+
+  const fileName = bir2316SanitizeFilename_(
+    bir2316RenderStringTemplate_(filenamePattern, tagMap) || (`BIR2316-${empId}-${year}`)
+  );
+
+  const pdfFile = bir2316GenerateFromSlidesTemplate_(slidesTemplateId, folder, fileName, tagMap);
+
+  if (opt && opt.sendEmail) {
+    const quota = MailApp.getRemainingDailyQuota();
+    if (quota > 0) {
+      const empEmail = bir2316GetEmployeeEmailFromMaster_(mfRowObj, emailColumn);
+      if (empEmail && empEmail.includes("@")) {
+        const subj = bir2316RenderStringTemplateEmail_(emailSubject, tagMap);
+let bodyHtml = bir2316RenderStringTemplateEmail_(emailBodyHtml, tagMap);
+
+if (f.appendGmailSignature) {
+  const sig = bir2316GetPrimaryGmailSignatureHtml_();
+  if (sig) bodyHtml = bodyHtml + "<br><br>" + sig;
+}
+
+
+
+        bir2316SendEmailWithAttachment_(
+          empEmail,
+          subj,
+          bodyHtml,
+          { cc, bcc, replyTo, senderName },
+          pdfFile.getBlob()
+        );
+      } else {
+        throw new Error(`No employee email found in Masterfile column: ${emailColumn}`);
+      }
+    } else {
+      throw new Error("Email quota exceeded.");
+    }
+  }
+
+  return {
+    fileId: pdfFile.getId(),
+    fileName: pdfFile.getName(),
+    fileUrl: pdfFile.getUrl(),
+  };
+}
+
+/**
+ * Save dialog settings to DocumentProperties (BIR2316_V1.PROP_LAST)
+ * Called by the dialog "Save" button.
+ */
+function saveBir2316Settings(form) {
+  const f = form || {};
+
+  const year = Number(f.year) || null;
+
+  const payload = {
+    year: year,
+
+    // keep raw strings so the UI rehydrates exactly what user typed
+    folderId: String(f.folderId || "").trim(),
+    slidesTemplateUrl: String(f.slidesTemplateUrl || "").trim(),
+    filenamePattern: String(f.filenamePattern || BIR2316_V1.DEFAULT_FILENAME_PATTERN).trim(),
+
+    // email settings
+    sendEmail: !!f.sendEmail,
+    emailColumn: String(f.emailColumn || BIR2316_V1.DEFAULT_EMAIL_COLUMN).trim(),
+    emailSubject: String(f.emailSubject || BIR2316_V1.DEFAULT_EMAIL_SUBJECT).trim(),
+    emailBodyHtml: String(f.emailBodyHtml || BIR2316_V1.DEFAULT_EMAIL_BODY_HTML),
+    cc: String(f.cc || "").trim(),
+    bcc: String(f.bcc || "").trim(),
+    replyTo: String(f.replyTo || "").trim(),
+    senderName: String(f.senderName || BIR2316_V1.DEFAULT_EMAIL_SENDER_NAME).trim(),
+  };
+
+  bir2316SetLastSettings_(payload);
+  return true;
+}
+/**
+ * Review sheet generator for key computed tags + validations.
+ * Creates/overwrites a sheet: "BIR2316 Review - <YEAR>"
+ *
+ * Columns:
+ *  - Raw tags: GCIPE, TNTCI, TCIPE, TCIPE2, TTCI, ANNUALTAXD, TWPEYTWBPE, TTWPP
+ *  - Expected TNTCI = MWE_BP + MWE_OT + NT109 + NTDM_TOTAL + EECONTRIB + NTO_TOTAL
+ *  - Expected TCIPE = NMWE_BP + TAXABLE_TOTAL + OTHER13_TAXABLE + NMWE_OT
+ *  - Diffs
+ */
+function bir2316ReviewTags(form) {
+  const f = form || {};
+  const year = Number(f.year);
+  if (!year || year < 2000 || year > 2100) throw new Error("Invalid year.");
+
+  const employeeIds = Array.isArray(f.employeeIds)
+    ? f.employeeIds.map(String).map(s => s.trim()).filter(Boolean)
+    : [];
+  if (!employeeIds.length) throw new Error("No employees selected.");
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const sheetName = `BIR2316 Review - ${year}`;
+  let sh = ss.getSheetByName(sheetName);
+  if (sh) ss.deleteSheet(sh);
+  sh = ss.insertSheet(sheetName);
+
+  sh.setHiddenGridlines(true);
+
+
+  const ann = bir2316BuildAnnualizationIndex_(year);
+  const mf = bir2316TryBuildMasterIndex_();
+  const cfg = bir2316GetSettings_();
+
+  const headers = [
+  "EMPLOYEE ID",
+  "EMPLOYEE NAME",
+
+  // normalized tag headers (ALL CAPS)
+  "GCIPE - GROSS COMPENSATION INCOME FROM PRESENT EMPLOYER",
+  "TNTCI - TOTAL NON-TAXABLE COMPENSATION INCOME FROM PRESENT EMPLOYER",
+  "TCIPE - TAXABLE COMPENSATION INCOME FROM PRESENT EMPLOYER",
+  "TCIPE2 - TAXABLE COMPENSATION INCOME FROM PREVIOUS EMPLOYER",
+  "TTCI - GROSS TAXABLE COMPENSATION INCOME",
+
+  "ANNUALTAXD - ANNUAL TAX DUE",
+  "TWPEYTWBPE - TAX WITHHELD PRESENT EMPLOYER + TAX WITHHELD BY PREVIOUS EMPLOYER",
+  "TTWPP - TOTAL TAX WITHHELD PRESENT + PREVIOUS",
+
+  // TNTCI components
+  "TNTCI COMPONENT - MWE_BP",
+  "TNTCI COMPONENT - MWE_OT",
+  "TNTCI COMPONENT - NT1O9",
+  "TNTCI COMPONENT - NTDM_TOTAL",
+  "TNTCI COMPONENT - EECONTRIB",
+  "TNTCI COMPONENT - NTO_TOTAL",
+  "TNTCI EXPECTED",
+  "TNTCI DIFF",
+
+  // TCIPE components
+  "TCIPE COMPONENT - NMWE_BP",
+  "TCIPE COMPONENT - TAXABLE_TOTAL",
+  "TCIPE COMPONENT - OTHER13_TAXABLE",
+  "TCIPE COMPONENT - NMWE_OT",
+  "TCIPE EXPECTED",
+  "TCIPE DIFF",
+];
+
+  const out = [headers];
+
+    // ✅ progress init for review run
+  bir2316SetProgress_({
+    running: true,
+    finished: false,
+    cancelled: false,
+    percent: 0,
+    statusText: `Review… (0/${employeeIds.length})`,
+    detail: "Preparing…",
+    done: 0,
+    total: employeeIds.length,
+    errors: 0,
+  });
+
+  let reviewErrors = 0;
+
+  for (let i = 0; i < employeeIds.length; i++) {
+    const empId = employeeIds[i];
+
+    // ✅ update progress (throttle optional; keep simple and accurate)
+    const pct = Math.max(0, Math.min(100, Math.round(((i) / employeeIds.length) * 100)));
+    bir2316SetProgress_({
+      running: true,
+      finished: false,
+      cancelled: false,
+      percent: pct,
+      statusText: `Review… (${i}/${employeeIds.length})`,
+      detail: `Processing: ${empId}`,
+      done: i,
+      total: employeeIds.length,
+      errors: reviewErrors,
+    });
+
+    const annRowObj = ann.byEmpId.get(empId);
+    if (!annRowObj) {
+      reviewErrors++;
+      out.push([empId, "(NOT FOUND IN ANNUALIZATION)"]);
+      continue;
+    }
+
+    const mfRowObj = (mf && mf.byEmpId) ? mf.byEmpId.get(empId) : null;
+    const tagMap = bir2316BuildTagMap_(year, ann.headers, annRowObj, mfRowObj, cfg);
+
+    const empName =
+      String(tagMap["EMPLOYEE NAME"] || tagMap["MF.EMPLOYEE NAME"] || tagMap["MF.EMPLOYEE_NAME"] || "").trim();
+
+    // Pull raw tags (whatever exists in Annualization/tagMap)
+    const GCIPE      = bir2316Num_(tagMap["GCIPE"]);
+    const TNTCI      = bir2316Num_(tagMap["TNTCI"]);
+    const TCIPE      = bir2316Num_(tagMap["TCIPE"]);
+    const TCIPE2     = bir2316Num_(tagMap["TCIPE2"]);
+    const TTCI       = bir2316Num_(tagMap["TTCI"]);
+    const ANNUALTAXD = bir2316Num_(tagMap["ANNUALTAXD"]);
+    const TWPEYTWBPE = bir2316Num_(tagMap["TWPEYTWBPE"]);
+    const TTWPP      = bir2316Num_(tagMap["TTWPP"]);
+
+    // Validation inputs
+    const MWE_BP          = bir2316Num_(tagMap["MWE_BP"]);
+    const MWE_OT          = bir2316Num_(tagMap["MWE_OT"]);
+    const NTDM_TOTAL      = bir2316Num_(tagMap["NTDM_TOTAL"]);
+    const EECONTRIB       = bir2316Num_(tagMap["EECONTRIB"]);
+    const NTO_TOTAL       = bir2316Num_(tagMap["NTO_TOTAL"]);
+
+    const NMWE_BP         = bir2316Num_(tagMap["NMWE_BP"]);
+    const TAXABLE_TOTAL   = bir2316Num_(tagMap["TAXABLE_TOTAL"]);
+    const OTHER13_TAXABLE = bir2316Num_(tagMap["OTHER13_TAXABLE"]);
+    const NMWE_OT         = bir2316Num_(tagMap["NMWE_OT"]);
+
+    // NT109: use tagMap if present; else 0
+    const NT1O9 = bir2316Num_(tagMap["NT1O9"]);
+
+    // Expected computations
+    const TNTCI_EXPECTED = MWE_BP + MWE_OT + NT1O9 + NTDM_TOTAL + EECONTRIB + NTO_TOTAL;
+    const TCIPE_EXPECTED = NMWE_BP + TAXABLE_TOTAL + OTHER13_TAXABLE + NMWE_OT;
+
+    const TNTCI_DIFF = TNTCI - TNTCI_EXPECTED;
+    const TCIPE_DIFF = TCIPE - TCIPE_EXPECTED;
+
+    out.push([
+      empId,
+      empName,
+
+      GCIPE,
+      TNTCI,
+      TCIPE,
+      TCIPE2,
+      TTCI,
+
+      ANNUALTAXD,
+      TWPEYTWBPE,
+      TTWPP,
+
+      // TNTCI components
+      MWE_BP,
+      MWE_OT,
+      NT1O9,
+      NTDM_TOTAL,
+      EECONTRIB,
+      NTO_TOTAL,
+      TNTCI_EXPECTED,
+      TNTCI_DIFF,
+
+      // TCIPE components
+      NMWE_BP,
+      TAXABLE_TOTAL,
+      OTHER13_TAXABLE,
+      NMWE_OT,
+      TCIPE_EXPECTED,
+      TCIPE_DIFF,
+    ]);
+  }
+
+  // ✅ final progress update (hide-able by UI after success)
+  bir2316SetProgress_({
+    running: false,
+    finished: false,
+    cancelled: false,
+    percent: 100,
+    statusText: `Review complete. (${employeeIds.length}/${employeeIds.length})`,
+    detail: `Created: ${sheetName}`,
+    done: employeeIds.length,
+    total: employeeIds.length,
+    errors: reviewErrors,
+  });
+
+// Write values
+sh.getRange(1, 1, out.length, out[0].length).setValues(out);
+
+// ✅ no gridlines
+sh.setHiddenGridlines(true);
+
+// ✅ freeze header row + freeze columns through EMPLOYEE NAME
+sh.setFrozenRows(1);
+sh.setFrozenColumns(2);
+
+// ✅ header format like screenshot (dark blue, white text, centered, bold, wrapped)
+const lastCol = out[0].length;
+const headerRange = sh.getRange(1, 1, 1, lastCol);
+headerRange
+  .setBackground("#0B1B6B")
+  .setFontColor("#FFFFFF")
+  .setFontWeight("bold")
+  .setHorizontalAlignment("center")
+  .setVerticalAlignment("middle")
+  .setWrap(true);
+
+// Slightly taller header row so wrap looks clean
+sh.setRowHeight(1, 44);
+
+// Auto-resize columns (optional; keep if you want)
+sh.autoResizeColumns(1, lastCol);
+
+// ✅ Apply accounting format to numeric columns (from col 3 onward)
+const numColsStart = 3;
+const numColsCount = lastCol - (numColsStart - 1);
+if (out.length > 1 && numColsCount > 0) {
+  sh.getRange(2, numColsStart, out.length - 1, numColsCount)
+    .setNumberFormat(BIR2316_V1.ACCOUNTING_FMT);
+}
+
+// ✅ Highlight TNTCI DIFF + TCIPE DIFF if variance (abs > 0.1)
+function _colToA1_(n) {
+  let s = "";
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+const hdr = out[0] || [];
+const colTntciDiff = hdr.indexOf("TNTCI DIFF") + 1;
+const colTcipeDiff = hdr.indexOf("TCIPE DIFF") + 1;
+
+const rules = sh.getConditionalFormatRules();
+
+function _addDiffRule_(colIndex) {
+  if (!colIndex || colIndex < 1) return;
+  const a1 = _colToA1_(colIndex);
+  const rng = sh.getRange(2, colIndex, Math.max(0, out.length - 1), 1);
+  const rule = SpreadsheetApp.newConditionalFormatRule()
+    .whenFormulaSatisfied(`=ABS(${a1}2)>0.1`)
+    .setBackground("#FFF2CC")   // light highlight
+    .setFontColor("#7F6000")
+    .setRanges([rng])
+    .build();
+  rules.push(rule);
+}
+
+_addDiffRule_(colTntciDiff);
+_addDiffRule_(colTcipeDiff);
+
+sh.setConditionalFormatRules(rules);
+
+// Return a link to the sheet (UI won't auto-open)
+const url = ss.getUrl() + "#gid=" + sh.getSheetId();
+return { ok: true, sheetName, url };
+
+}

@@ -1,0 +1,6 @@
+<? var BRAND = getBranding(); ?>
+<? if (BRAND && BRAND.showBranding && BRAND.logoUrl) { ?>
+  <div class="brandbar">
+    <img class="brandbar__logo" src="<?!= BRAND.logoUrl ?>" alt="Netpay PH">
+  </div>
+<? } ?>

@@ -1,0 +1,1794 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      box-sizing: border-box;
+      font-family: "Segoe UI", Roboto, sans-serif;
+      color: #202124;
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+    body { padding: 16px; }
+
+    .row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+      flex-wrap: wrap;
+    }
+    label { font-size: 13px; font-weight: 500; }
+    select, input {
+      font-size: 13px;
+      padding: 4px 6px;
+      border-radius: 4px;
+      border: 1px solid #ccc;
+      box-sizing: border-box;
+    }
+    button {
+      font-size: 13px;
+      padding: 6px 10px;
+      border-radius: 4px;
+      border: none;
+      cursor: pointer;
+      font-weight: 500;
+    }
+    button.primary { background-color: #1a73e8; color: #fff; }
+    button.secondary { background-color: #f1f3f4; color: #202124; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      table-layout: fixed;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 4px;
+      text-align: left;
+      vertical-align: middle;
+      box-sizing: border-box;
+    }
+    th {
+      background-color: #f4f4f4;
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      white-space: nowrap;
+    }
+
+    /* ---- FORCE consistent column widths (th + td) ---- */
+    th.col-header,  td.col-header  { width: 200px; min-width: 200px; max-width: 200px; }
+    th.col-include, td.col-include { width: 70px;  min-width: 70px;  max-width: 70px;  text-align:center; }
+    th.col-type,    td.col-type    { width: 110px; min-width: 110px; max-width: 110px; text-align:center; }
+
+    /* Employee/Consultant GL columns baseline (your "perfect" width) */
+    th.col-gl,      td.col-gl      { width: 230px; min-width: 230px; max-width: 230px; }
+
+    /* IMPORTANT FIX:
+       Tracking columns must MATCH the GL column width (230px) so the table totals 840px,
+       preventing the browser from creating "extra blank space/ghost column" in Tracking view. */
+    th.col-tracking,td.col-tracking{ width: 230px; min-width: 230px; max-width: 230px; }
+
+    .table-container {
+      margin-top: 8px;
+      height: auto;
+      overflow-x: hidden;
+      overflow-y: visible;
+      border: none;
+      padding: 0;
+    }
+
+    .table-scroll-x { width: 100%; overflow-x: auto; }
+    /* keep a stable table footprint even when columns are hidden */
+    .table-scroll-x > table { min-width: 840px; }
+
+    .card {
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      padding: 10px;
+      margin-bottom: 12px;
+      background: #fff;
+    }
+    .card-title {
+      font-size: 14px;
+      font-weight: 600;
+      margin: 0 0 6px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .card-title .actions { display:flex; gap:8px; flex-wrap: wrap; }
+
+    .mapping-tabs {
+      display: flex;
+      gap: 8px;
+      margin: 8px 0 10px;
+      flex-wrap: wrap;
+    }
+    .mapping-tab {
+      font-size: 12px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid #dadce0;
+      background: #fff;
+      cursor: pointer;
+    }
+    .mapping-tab.active {
+      background: #e8f0fe;
+      border-color: #1a73e8;
+      color: #1a73e8;
+      font-weight: 600;
+    }
+
+    .header-cell {
+      font-weight: 600;
+      white-space: nowrap;
+      overflow:hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* ---- Column show/hide by active view (data-view on #postingCard) ---- */
+    /* Views: emp / con / track */
+    #postingCard[data-view="emp"] .col-con-cost,
+    #postingCard[data-view="emp"] .col-con-opex,
+    #postingCard[data-view="emp"] .col-track1,
+    #postingCard[data-view="emp"] .col-track2 { display: none; }
+
+    #postingCard[data-view="con"] .col-emp-cost,
+    #postingCard[data-view="con"] .col-emp-opex,
+    #postingCard[data-view="con"] .col-track1,
+    #postingCard[data-view="con"] .col-track2 { display: none; }
+
+    #postingCard[data-view="track"] .col-emp-cost,
+    #postingCard[data-view="track"] .col-emp-opex,
+    #postingCard[data-view="track"] .col-con-cost,
+    #postingCard[data-view="track"] .col-con-opex { display: none; }
+
+    .footer {
+      margin-top: 10px;
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+    #status {
+      font-size: 12px;
+      color: #444;
+      white-space: pre-line;
+    }
+
+    /* Combo (type-to-search + dropdown) */
+    .combo-wrapper { position: relative; width: 100%; }
+    .combo-input { width: 100%; }
+    .combo-list {
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      max-height: 220px;
+      border: 1px solid #ccc;
+      background: #fff;
+      overflow-y: auto;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.15);
+      z-index: 1000;
+      display: none;
+    }
+    .combo-item {
+      padding: 3px 6px;
+      cursor: pointer;
+      font-size: 12px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .combo-item:hover { background-color: #e8f0fe; }
+/* When combo list is portaled to body */
+.combo-list.portal {
+  position: fixed;
+  z-index: 999999;
+}
+
+    .text-muted { font-size: 11px; color: #555; }
+    .include-all-label {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      font-size: 11px;
+      gap: 2px;
+    }
+
+    .export-panel { font-size: 12px; display: block; }
+    .export-panel .row { margin-bottom: 6px; }
+    .export-panel label { font-size: 12px; }
+
+    /* ===== Pretty confirm modal (replaces ugly browser confirm) ===== */
+.pc-backdrop{
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.35);
+  z-index: 999991;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 14px;
+  box-sizing: border-box;
+}
+.pc-modal{
+  width: min(720px, 100%);
+  background: #fff;
+  border-radius: 12px;
+  border: 1px solid #ddd;
+  box-shadow: 0 12px 34px rgba(0,0,0,0.25);
+  overflow: hidden;
+}
+.pc-header{
+  padding: 12px 14px;
+  border-bottom: 1px solid #eee;
+  font-weight: 700;
+  display:flex; align-items:center; justify-content:space-between; gap:10px;
+}
+.pc-close{
+  font-size: 12px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color:#444;
+}
+.pc-body{ padding: 12px 14px; }
+.pc-body .pc-sub{ margin: 0 0 10px; font-size: 12px; color:#444; line-height: 1.35; }
+.pc-list{
+  border: 1px solid #eee;
+  border-radius: 10px;
+  overflow: hidden;
+}
+.pc-row{
+  display: grid;
+  grid-template-columns: 90px 1fr 110px 90px 90px;
+  gap: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  align-items: center;
+}
+.pc-row.head{
+  background:#f6f7f8;
+  font-weight: 700;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+}
+.pc-row:not(.head){ border-top: 1px solid #f0f0f0; }
+.pc-mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+.pc-ellipsis{ white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pc-footer{
+  padding: 12px 14px;
+  border-top: 1px solid #eee;
+  display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap;
+}
+.pc-btn{
+  font-size: 13px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: none;
+  cursor: pointer;
+  font-weight: 700;
+}
+.pc-btn.primary{ background:#1a73e8; color:#fff; }
+.pc-btn.secondary{ background:#f1f3f4; color:#202124; }
+
+/* ✅ Brand logo INSIDE modal (sticky bottom, does not overlay scrollbar) */
+.brand-sticky-bottom{
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;  /* lower-right */
+  padding: 8px 0 2px;
+  background: #fff;
+}
+
+
+  </style>
+
+  <?!= include_('UiTheme'); ?>
+</head>
+
+<body class="ui-page">
+  <h1>Payroll Post Mapping</h1>
+
+  <div class="table-container" id="mainScroll">
+
+    <!-- COA -->
+    <div class="card" id="coaCard">
+      <div class="card-title">
+        <span>Chart of Accounts</span>
+        <div class="actions">
+  <button class="secondary" id="coaImportBtn">Import / Edit COA</button>
+    <button class="secondary" id="coaReloadBtn">Reload COA</button>
+</div>
+
+      </div>
+      <div class="text-muted">
+        Use <b>Import / Edit COA</b> to update your Chart of Accounts. Then click <b>Reload COA</b> to refresh dropdowns in this screen.
+      </div>
+
+      
+    </div>
+
+    <!-- SOURCE SHEET -->
+    <div class="card" id="sourceCard">
+      <div class="card-title">Source (posted) payroll</div>
+      <div class="row">
+        <label for="sheetSelect">Sheet:</label>
+        <select id="sheetSelect"></select>
+        <button class="secondary" id="reloadBtn">Reload headers</button>
+      </div>
+      <div class="text-muted">
+        Only numeric headers from row 1 are listed (excluding NET PAY, TAXABLE INCOME, and GROSS PAY, which are summary-only and/or handled via bank mapping).
+      </div>
+    </div>
+
+    <!-- PAYROLL POSTING MAPPING -->
+    <div class="card" id="postingCard" data-view="emp">
+      <div class="card-title">Payroll Posting Mapping</div>
+
+      <div class="mapping-tabs">
+        <button type="button" class="mapping-tab active" data-view="emp">Employee (Cost / OPEX)</button>
+        <button type="button" class="mapping-tab" data-view="con">Consultant/Freelance (Cost / OPEX)</button>
+        <button type="button" class="mapping-tab" data-view="track">Tracking</button>
+      </div>
+
+      <div class="table-scroll-x">
+        <table class="posting-table">
+          <thead>
+            <tr>
+              <th class="col-header">Payroll Item</th>
+              <th class="col-include">
+                <span class="include-all-label">
+                  Include in<br>Posting
+                  <input type="checkbox" id="includeAll">
+                </span>
+              </th>
+              <th class="col-type">Posting Type</th>
+
+              <th class="col-gl col-emp-cost">Employee COST GL</th>
+              <th class="col-gl col-emp-opex">Employee OPEX GL</th>
+
+              <th class="col-gl col-con-cost">Consultant COST GL</th>
+              <th class="col-gl col-con-opex">Consultant OPEX GL</th>
+
+              <th class="col-tracking col-track1">Tracking Category 1</th>
+              <th class="col-tracking col-track2">Tracking Category 2</th>
+            </tr>
+          </thead>
+          <tbody id="mapBody"></tbody>
+        </table>
+      </div>
+
+      <div class="text-muted" style="margin-top:6px;">
+        Notes:
+        <ul style="margin:6px 0 0 18px; padding:0;">
+          <li><b>ALLOCATION blank</b> in Masterfile defaults to <b>OPEX</b>.</li>
+          <li>CONTRACT TYPE = <b>Consultant</b> or <b>Freelance</b> uses the Consultant/Freelance mapping.</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- BANK MAPPING -->
+    <div class="card" id="bankCard">
+      <div class="card-title">Bank Mapping (Net Pay → Bank GL)</div>
+      <div class="text-muted">
+        Map <b>DISBURSING BANK</b> values (from Masterfile) to GL Bank Accounts (from COA).
+        These are used for NET PAY credits.
+      </div>
+
+      <div class="table-scroll-x">
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 40%;">Disbursing Bank</th>
+              <th style="width: 60%;">Bank GL Account</th>
+            </tr>
+          </thead>
+          <tbody id="bankBody"></tbody>
+        </table>
+      </div>
+
+      <div class="row" style="margin-top: 8px;">
+        <button class="secondary" id="generateBankBtn">Generate Bank File(s)</button>
+        <span class="text-muted">
+          Creates one CSV per DISBURSING BANK with columns:
+          <b>BANK ACCOUNT NAME</b>, <b>BANK NAME</b>, <b>BANK ACCOUNT NUMBER</b>, <b>NET PAY</b>.
+        </span>
+      </div>
+    </div>
+
+    <!-- EXPORT SETTINGS -->
+    <div id="exportPanel" class="card export-panel">
+      <div class="card-title">Export Journal</div>
+
+      <div class="row">
+        <label for="systemSelect">Target system:</label>
+        <select id="systemSelect">
+          <option value="XERO">Xero</option>
+          <option value="ODOO">Odoo</option>
+          <option value="QBO">QuickBooks Online</option>
+        </select>
+
+        <label for="modeSelect">Export as:</label>
+        <select id="modeSelect">
+          <option value="MANUAL">Manual Journal</option>
+          <option value="BILL">Bill / AP Invoice</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <label for="journalDate">Date:</label>
+        <input id="journalDate" type="date">
+
+        <label for="refNo">Journal / Bill No:</label>
+        <input id="refNo" type="text">
+
+        <label for="supplierSelect" id="supplierLabel">Supplier:</label>
+
+<!-- Odoo configured: dropdown -->
+<select id="supplierSelect" style="display:none;"></select>
+
+<!-- Odoo NOT configured (or non-Odoo systems): blank input -->
+<input id="supplierInput" type="text" style="display:none;" placeholder="Type supplier…">
+
+
+
+      </div>
+
+      <div class="row" id="xeroTrackingRow" style="display:none;">
+        <label for="xeroTracking1">Xero Tracking 1 name:</label>
+        <input id="xeroTracking1" type="text" placeholder="e.g. Region">
+        <label for="xeroTracking2">Xero Tracking 2 name:</label>
+        <input id="xeroTracking2" type="text" placeholder="e.g. Department">
+      </div>
+    </div>
+
+  </div>
+
+  <!-- FOOTER BUTTONS -->
+  <div class="footer">
+    <div>
+      <button class="secondary" id="markHeuristicBtn">Mark (Positive/Negative)</button>
+      <button class="secondary" id="saveBtn">Save Mapping</button>
+    </div>
+    <div><span id="status"></span></div>
+    <div>
+  <button class="primary" id="generateBtn">⚙ Generate Journal</button>
+  <button class="secondary" id="pushBtn">🚀 Push to Accounting</button>
+</div>
+
+  </div>
+
+  <!-- Pretty confirm modal -->
+<div class="pc-backdrop" id="pcBackdrop">
+  <div class="pc-modal" role="dialog" aria-modal="true">
+    <div class="pc-header">
+      <span id="pcTitle">Confirm</span>
+      <button class="pc-close" id="pcCloseBtn" title="Close">✕</button>
+    </div>
+    <div class="pc-body">
+      <p class="pc-sub" id="pcSummary"></p>
+
+      <div class="pc-list" id="pcList"></div>
+
+      <p class="pc-sub" id="pcQuestion" style="margin-top:10px;"></p>
+    </div>
+    <div class="pc-footer">
+      <button class="pc-btn secondary" id="pcCancelBtn">Cancel</button>
+      <button class="pc-btn primary" id="pcOkBtn">Continue</button>
+    </div>
+  </div>
+</div>
+
+<div class="brand-sticky-bottom">
+  <?!= include_('BrandWatermarkInline'); ?>
+</div>
+
+
+  <script>
+    let COA = [];
+    let DIM_OPTIONS = ['NONE'];
+    let BANKS = [];
+    let BANK_MAP = [];
+    let HEADER_ROWS = [];
+
+    const lineTypeOptions = ['POSITIVE', 'NEGATIVE'];
+
+    function init() {
+      const status = document.getElementById('status');
+      status.textContent = 'Loading options…';
+
+            // ✅ set default target system from Settings Center provider
+      google.script.run
+        .withSuccessHandler(cfg => {
+          try {
+            const provider = (cfg && cfg.provider) ? String(cfg.provider).toUpperCase() : '';
+            if (provider) {
+              const systemSelect = document.getElementById('systemSelect');
+              if (systemSelect) systemSelect.value = provider;
+              onSystemChange();
+            }
+          } catch (e) {}
+        })
+        .getPayrollPostingDialogInit();
+
+
+      google.script.run
+        .withSuccessHandler(dimList => {
+          DIM_OPTIONS = (Array.isArray(dimList) && dimList.length) ? dimList : ['NONE'];
+
+          loadCoaAndRender_(false);
+
+          google.script.run
+  .withSuccessHandler(populateSheetDropdown)
+  .withFailureHandler(err => {
+    status.textContent = '❌ Error loading posted sheets: ' + (err.message || err);
+  })
+  .getPostedPayrollSheets();
+
+
+          google.script.run
+            .withSuccessHandler(data => {
+              BANKS = Array.isArray(data.banks) ? data.banks : [];
+              BANK_MAP = Array.isArray(data.bankMap) ? data.bankMap : [];
+
+              if (!BANKS.includes('__DEFAULT__')) BANKS.unshift('__DEFAULT__');
+              renderBankTable();
+              status.textContent = '';
+            })
+            .withFailureHandler(err => {
+              status.textContent = '❌ Error loading bank mapping data: ' + (err.message || err);
+            })
+            .getBankMappingInitData();
+        })
+        .withFailureHandler(err => {
+  status.textContent = '❌ Error loading dimensions: ' + (err.message || err);
+
+  // ✅ STILL load posted sheets so the dialog is usable
+  google.script.run
+    .withSuccessHandler(populateSheetDropdown)
+    .withFailureHandler(err2 => {
+      status.textContent += '\n❌ Error loading posted sheets: ' + (err2.message || err2);
+    })
+    .getPostedPayrollSheets();
+
+  // ✅ Still load COA + bank table even if dimensions fail
+  loadCoaAndRender_(false);
+
+  google.script.run
+    .withSuccessHandler(data => {
+      BANKS = Array.isArray(data.banks) ? data.banks : [];
+      BANK_MAP = Array.isArray(data.bankMap) ? data.bankMap : [];
+      if (!BANKS.includes('__DEFAULT__')) BANKS.unshift('__DEFAULT__');
+      renderBankTable();
+    })
+    .withFailureHandler(err3 => {
+      status.textContent += '\n❌ Error loading bank mapping data: ' + (err3.message || err3);
+    })
+    .getBankMappingInitData();
+})
+.getDimensionOptions();
+
+
+      // close combo lists on outside click
+      document.addEventListener('click', evt => {
+  document.querySelectorAll('.combo-list.portal').forEach(list => {
+    // if click is not on a combo input or inside the list, close it
+    const isComboInput = evt.target && evt.target.classList && evt.target.classList.contains('combo-input');
+    const insideList = list.contains(evt.target);
+    if (!isComboInput && !insideList) list.style.display = 'none';
+  });
+});
+
+      const modeSelect = document.getElementById('modeSelect');
+      if (modeSelect) {
+        modeSelect.addEventListener('change', onModeChange);
+        onModeChange();
+      }
+
+      const systemSelect = document.getElementById('systemSelect');
+      if (systemSelect) {
+        systemSelect.addEventListener('change', onSystemChange);
+        onSystemChange();
+      }
+    }
+
+    function loadCoaAndRender_(reRenderTables) {
+      const status = document.getElementById('status');
+      if (status) status.textContent = 'Loading COA…';
+
+      google.script.run
+        .withSuccessHandler(coaList => {
+          COA = Array.isArray(coaList) ? coaList : [];
+          if (reRenderTables) {
+            if (HEADER_ROWS && HEADER_ROWS.length) renderHeaderMap(HEADER_ROWS);
+            renderBankTable();
+          }
+          if (status) status.textContent = '';
+        })
+        .withFailureHandler(err => {
+          if (status) status.textContent = '❌ Error loading COA: ' + (err.message || err);
+        })
+        .getCoaAccounts();
+    }
+
+    function populateSheetDropdown(sheetNames) {
+      const sel = document.getElementById('sheetSelect');
+      sel.innerHTML = '';
+
+      if (!sheetNames || !sheetNames.length) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.textContent = 'No (posted) sheets found';
+        sel.appendChild(opt);
+        return;
+      }
+
+      sheetNames.forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+      });
+
+      sel.addEventListener('change', () => loadHeaderMap());
+      loadHeaderMap();
+    }
+
+    function loadHeaderMap() {
+      const sheetName = document.getElementById('sheetSelect').value;
+      if (!sheetName) return;
+
+      document.getElementById('status').textContent = 'Loading headers…';
+
+      google.script.run
+        .withSuccessHandler(rows => {
+          HEADER_ROWS = Array.isArray(rows) ? rows : [];
+          renderHeaderMap(HEADER_ROWS);
+          document.getElementById('status').textContent = '';
+        })
+        .withFailureHandler(err => {
+          document.getElementById('status').textContent =
+            '❌ Error loading headers: ' + (err.message || err);
+        })
+        .getHeaderMapForSheet(sheetName);
+    }
+
+    function createCombo(container, options, initialCode, initialName) {
+  const wrap = document.createElement('div');
+  wrap.className = 'combo-wrapper';
+
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'combo-input';
+
+  // Build the dropdown list
+  const list = document.createElement('div');
+  list.className = 'combo-list portal'; // ✅ portal class
+
+  options.forEach(optData => {
+    const item = document.createElement('div');
+    item.className = 'combo-item';
+    item.textContent = optData.label;
+    item.dataset.code = optData.code;
+    item.dataset.name = optData.name || '';
+    list.appendChild(item);
+  });
+
+  // ✅ Portal list to body so it won't be clipped by overflow containers
+  document.body.appendChild(list);
+
+  function positionList() {
+    const r = input.getBoundingClientRect();
+    list.style.left = `${r.left}px`;
+    list.style.top = `${r.bottom}px`;
+    list.style.width = `${r.width}px`;
+  }
+
+  function showList() {
+    positionList();
+    list.style.display = 'block';
+  }
+
+  function hideList() {
+    list.style.display = 'none';
+  }
+
+  function applySelection(item) {
+    input.value = item.textContent;
+    input.dataset.code = item.dataset.code || '';
+    input.dataset.name = item.dataset.name || '';
+    hideList();
+  }
+
+  function resolveTypedValue() {
+    const typed = (input.value || '').trim();
+    if (!typed) { input.dataset.code = ''; input.dataset.name = ''; return; }
+
+    const codeGuess = typed.split('—')[0].trim();
+    let found = Array.from(list.children).find(el => el.dataset.code === codeGuess);
+
+    if (!found) found = Array.from(list.children).find(el => (el.textContent || '').trim() === typed);
+    if (!found) found = Array.from(list.children).find(el => (el.dataset.name || '').trim() === typed);
+
+    if (found) applySelection(found);
+  }
+
+  function showAllComboItems() {
+    Array.from(list.children).forEach(item => item.style.display = 'block');
+  }
+
+  function filterComboList() {
+    const q = (input.value || '').toLowerCase();
+    Array.from(list.children).forEach(item => {
+      const label = (item.textContent || '').toLowerCase();
+      item.style.display = label.includes(q) ? 'block' : 'none';
+    });
+  }
+
+  input.addEventListener('focus', () => {
+    showAllComboItems();
+    showList();
+    input.select();
+  });
+
+  input.addEventListener('input', () => {
+    filterComboList();
+    showList();
+  });
+
+  input.addEventListener('blur', () => {
+  if (picking) return; // <-- critical
+  setTimeout(() => {
+    resolveTypedValue();
+    hideList();
+  }, 120);
+});
+
+
+  let picking = false;
+
+list.addEventListener('pointerdown', evt => {
+  const item = evt.target.closest('.combo-item');
+  if (!item) return;
+
+  evt.preventDefault();
+  evt.stopPropagation();
+
+  picking = true;
+  applySelection(item);
+
+  // keep focus on input so it doesn't fight blur timing
+  input.focus({ preventScroll: true });
+
+  // release on next tick
+  setTimeout(() => { picking = false; }, 0);
+});
+
+
+  // Keep list positioned if user scrolls
+  window.addEventListener('scroll', () => {
+    if (list.style.display === 'block') positionList();
+  }, true);
+  window.addEventListener('resize', () => {
+    if (list.style.display === 'block') positionList();
+  });
+
+  // Initial selection
+  if (initialCode) {
+    const found = Array.from(list.children).find(el => el.dataset.code === String(initialCode));
+    if (found) applySelection(found);
+  } else if (initialName) {
+    const found = Array.from(list.children).find(el => el.dataset.name === String(initialName));
+    if (found) applySelection(found);
+  }
+
+  wrap.appendChild(input);
+  container.appendChild(wrap);
+
+  return input;
+}
+
+    function filterComboList(input, list) {
+      const query = (input.value || '').toLowerCase();
+      Array.from(list.children).forEach(item => {
+        const label = (item.textContent || '').toLowerCase();
+        item.style.display = label.includes(query) ? 'block' : 'none';
+      });
+    }
+
+    function renderHeaderMap(rows) {
+      const tbody = document.getElementById('mapBody');
+      tbody.innerHTML = '';
+      if (!Array.isArray(rows)) return;
+
+      const coaOptions = COA.map(a => ({
+        code: a.code,
+        label: a.label || (a.code + (a.name ? ' — ' + a.name : '')),
+        name: a.name || ''
+      }));
+
+      const dimOptions = DIM_OPTIONS.map(d => ({ code: d, label: d, name: d }));
+
+      rows.forEach(row => {
+        const tr = document.createElement('tr');
+
+        const tdHeader = document.createElement('td');
+        tdHeader.textContent = row.header || '';
+        tdHeader.className = 'header-cell col-header';
+        tr.appendChild(tdHeader);
+
+        const tdInc = document.createElement('td');
+        tdInc.className = 'col-include';
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = !!row.include;
+        tdInc.appendChild(cb);
+        tr.appendChild(tdInc);
+
+        const tdType = document.createElement('td');
+        tdType.className = 'col-type';
+        const selType = document.createElement('select');
+        lineTypeOptions.forEach(v => {
+          const opt = document.createElement('option');
+          opt.value = v;
+          opt.textContent = v;
+          if ((row.lineType || 'POSITIVE').toUpperCase() === v) opt.selected = true;
+          selType.appendChild(opt);
+        });
+        tdType.appendChild(selType);
+        tr.appendChild(tdType);
+
+        const empCostCode = row.empCostAccountCode || row.costAccountCode || '';
+        const empCostName = row.empCostAccountName || row.costAccountName || '';
+        const empOpexCode = row.empOpexAccountCode || row.opexAccountCode || row.accountCode || '';
+        const empOpexName = row.empOpexAccountName || row.opexAccountName || row.accountName || '';
+
+        const conCostCode = row.conCostAccountCode || '';
+        const conCostName = row.conCostAccountName || '';
+        const conOpexCode = row.conOpexAccountCode || row.freelanceAccountCode || '';
+        const conOpexName = row.conOpexAccountName || row.freelanceAccountName || '';
+
+        const tdEmpCost = document.createElement('td');
+        tdEmpCost.className = 'col-gl col-emp-cost';
+        const empCostInput = createCombo(tdEmpCost, coaOptions, empCostCode, empCostName);
+        empCostInput.dataset.role = 'empCostGl';
+        tr.appendChild(tdEmpCost);
+
+        const tdEmpOpex = document.createElement('td');
+        tdEmpOpex.className = 'col-gl col-emp-opex';
+        const empOpexInput = createCombo(tdEmpOpex, coaOptions, empOpexCode, empOpexName);
+        empOpexInput.dataset.role = 'empOpexGl';
+        tr.appendChild(tdEmpOpex);
+
+        const tdConCost = document.createElement('td');
+        tdConCost.className = 'col-gl col-con-cost';
+        const conCostInput = createCombo(tdConCost, coaOptions, conCostCode, conCostName);
+        conCostInput.dataset.role = 'conCostGl';
+        tr.appendChild(tdConCost);
+
+        const tdConOpex = document.createElement('td');
+        tdConOpex.className = 'col-gl col-con-opex';
+        const conOpexInput = createCombo(tdConOpex, coaOptions, conOpexCode, conOpexName);
+        conOpexInput.dataset.role = 'conOpexGl';
+        tr.appendChild(tdConOpex);
+
+        const tdDim1 = document.createElement('td');
+        tdDim1.className = 'col-tracking col-track1';
+        const dim1Input = createCombo(tdDim1, dimOptions, (row.dimension1 || 'NONE'), null);
+        dim1Input.dataset.role = 'dim1';
+        tr.appendChild(tdDim1);
+
+        const tdDim2 = document.createElement('td');
+        tdDim2.className = 'col-tracking col-track2';
+        const dim2Input = createCombo(tdDim2, dimOptions, (row.dimension2 || 'NONE'), null);
+        dim2Input.dataset.role = 'dim2';
+        tr.appendChild(tdDim2);
+
+        tbody.appendChild(tr);
+      });
+
+      const masterCb = document.getElementById('includeAll');
+      masterCb.checked = Array.from(tbody.rows).every(
+        tr => tr.cells[1].querySelector('input[type="checkbox"]').checked
+      );
+    }
+
+    function findAccountCodeForBank(bankKey) {
+      const row = BANK_MAP.find(r => (r.bankKey || '') === bankKey);
+      return row ? (row.accountCode || '') : '';
+    }
+
+    function renderBankTable() {
+      const tbody = document.getElementById('bankBody');
+      if (!tbody) return;
+
+      tbody.innerHTML = '';
+      if (!BANKS || !BANKS.length) return;
+
+      const coaOptions = COA.map(a => ({
+        code: a.code,
+        label: a.label || (a.code + (a.name ? ' — ' + a.name : '')),
+        name: a.name || ''
+      }));
+
+      BANKS.forEach(bankKey => {
+        const tr = document.createElement('tr');
+
+        const tdBank = document.createElement('td');
+        tdBank.dataset.bankKey = bankKey;
+        tdBank.textContent = (bankKey === '__DEFAULT__')
+          ? '(Default for blank / missing DISBURSING BANK)'
+          : bankKey;
+        tr.appendChild(tdBank);
+
+        const tdAcc = document.createElement('td');
+        const existingCode = findAccountCodeForBank(bankKey);
+        const accInput = createCombo(tdAcc, coaOptions, existingCode || '', null);
+        accInput.dataset.role = 'bankGl';
+        tr.appendChild(tdAcc);
+
+        tbody.appendChild(tr);
+      });
+    }
+
+    function collectBankMap() {
+      const rows = [];
+      const tbody = document.getElementById('bankBody');
+      if (!tbody) return rows;
+
+      Array.from(tbody.rows).forEach(tr => {
+        const bankKey = tr.cells[0].dataset.bankKey || '';
+        const input = tr.cells[1].querySelector('.combo-input');
+        const accountCode = input ? (input.dataset.code || '') : '';
+        if (!bankKey || !accountCode) return;
+        rows.push({ bankKey, accountCode });
+      });
+
+      return rows;
+    }
+
+function getComboCode_(inputEl) {
+  if (!inputEl) return '';
+  const code = (inputEl.dataset.code || '').trim();
+  if (code) return code;
+
+  // fallback: allow "CODE — NAME" or "CODE"
+  const typed = (inputEl.value || '').trim();
+  if (!typed) return '';
+  return typed.split('—')[0].trim();
+}
+
+
+    function collectMap() {
+      const rows = [];
+      const tbody = document.getElementById('mapBody');
+
+      Array.from(tbody.rows).forEach(tr => {
+        const header  = tr.cells[0].textContent || '';
+        const include = tr.cells[1].querySelector('input[type="checkbox"]').checked;
+        const lineType = tr.cells[2].querySelector('select').value;
+
+        const empCostInput = tr.querySelector('.combo-input[data-role="empCostGl"]');
+        const empOpexInput = tr.querySelector('.combo-input[data-role="empOpexGl"]');
+        const conCostInput = tr.querySelector('.combo-input[data-role="conCostGl"]');
+        const conOpexInput = tr.querySelector('.combo-input[data-role="conOpexGl"]');
+
+        const dim1Input = tr.querySelector('.combo-input[data-role="dim1"]');
+        const dim2Input = tr.querySelector('.combo-input[data-role="dim2"]');
+
+        const dim1 = dim1Input ? (dim1Input.dataset.code || dim1Input.value || '') : '';
+        const dim2 = dim2Input ? (dim2Input.dataset.code || dim2Input.value || '') : '';
+
+        rows.push({
+          header,
+          include,
+          lineType,
+
+          
+          empCostAccountName: empCostInput ? (empCostInput.dataset.name || '') : '',
+
+          
+          empOpexAccountName: empOpexInput ? (empOpexInput.dataset.name || '') : '',
+
+          
+          conCostAccountName: conCostInput ? (conCostInput.dataset.name || '') : '',
+
+          
+          conOpexAccountName: conOpexInput ? (conOpexInput.dataset.name || '') : '',
+
+empCostAccountCode: getComboCode_(empCostInput),
+empOpexAccountCode: getComboCode_(empOpexInput),
+conCostAccountCode: getComboCode_(conCostInput),
+conOpexAccountCode: getComboCode_(conOpexInput),
+
+
+
+          dimension1: dim1,
+          dimension2: dim2
+        });
+      });
+
+      return rows;
+    }
+
+    function saveMapping() {
+      const headerMap = collectMap();
+      const bankData  = collectBankMap();
+      const statusEl = document.getElementById('status');
+
+      statusEl.textContent = '🕒 Saving header & bank mappings…';
+
+      google.script.run
+        .withSuccessHandler(res1 => {
+          google.script.run
+            .withSuccessHandler(res2 => {
+              statusEl.textContent =
+                `✅ Saved ${res1.count || 0} header mappings & ${res2.count || 0} bank mappings.`;
+            })
+            .withFailureHandler(err2 => {
+              statusEl.textContent =
+                `⚠ Header mapping saved (${res1.count || 0}), but bank mapping failed: ` +
+                (err2.message || err2);
+            })
+            .saveBankMap(bankData);
+        })
+        .withFailureHandler(err1 => {
+          statusEl.textContent = '❌ Error saving header mapping: ' + (err1.message || err1);
+        })
+        .saveHeaderMap(headerMap);
+    }
+
+    function generateJournal() {
+      const sheetName = document.getElementById('sheetSelect').value;
+      if (!sheetName) { alert('Select a source posted payroll sheet.'); return; }
+
+      const headerMap = collectMap();
+      const bankData  = collectBankMap();
+      const statusEl = document.getElementById('status');
+
+      statusEl.textContent = '🕒 Saving mappings…';
+
+      google.script.run
+        .withSuccessHandler(res1 => {
+          google.script.run
+            .withSuccessHandler(res2 => {
+              statusEl.textContent =
+                `✅ Mappings saved (Headers: ${res1.count || 0}, Banks: ${res2.count || 0}). Generating CSV…`;
+              downloadJournalCsv();
+            })
+            .withFailureHandler(err2 => {
+              statusEl.textContent = '❌ Error saving bank mapping: ' + (err2.message || err2);
+            })
+            .saveBankMap(bankData);
+        })
+        .withFailureHandler(err1 => {
+          statusEl.textContent = '❌ Error saving header mapping: ' + (err1.message || err1);
+        })
+        .saveHeaderMap(headerMap);
+    }
+
+    function downloadJournalCsv() {
+      const sheetName = document.getElementById('sheetSelect').value;
+      if (!sheetName) { alert('Select a source posted payroll sheet.'); return; }
+
+      const system = document.getElementById('systemSelect').value;
+      const mode   = document.getElementById('modeSelect').value;
+      const date   = document.getElementById('journalDate').value;
+      const refNo  = document.getElementById('refNo').value || '';
+      const supplierName = getSupplierName_();
+
+
+
+      if (!date) { alert('Enter a journal / bill date.'); return; }
+      if (mode === 'BILL' && !supplierName) {
+  alert((system === 'ODOO') ? 'Enter partner name for Odoo Bill export.' : 'Enter supplier name for Bill export.');
+  return;
+}
+
+
+      const statusEl = document.getElementById('status');
+      statusEl.textContent = '🕒 Generating journal & preparing CSV…';
+
+      const opts = { sheetName, system, mode, date, refNo, supplierName };
+
+      if (system === 'XERO') {
+        const x1El = document.getElementById('xeroTracking1');
+        const x2El = document.getElementById('xeroTracking2');
+        opts.trackingName1 = x1El ? x1El.value : '';
+        opts.trackingName2 = x2El ? x2El.value : '';
+      }
+
+      google.script.run
+        .withSuccessHandler(res => {
+          try {
+            const csv = res.csv || '';
+            const fileName = res.fileName || 'payroll-journal.csv';
+
+            const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+            const url = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = fileName;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+
+            statusEl.textContent = `✅ CSV downloaded: ${fileName}`;
+          } catch (e) {
+            console.error(e);
+            statusEl.textContent = '❌ Error preparing download: ' + (e.message || e);
+          }
+        })
+        .withFailureHandler(err => {
+          statusEl.textContent = '❌ Error generating journal for export: ' + (err.message || err);
+        })
+        .buildPayrollExportCsv(opts);
+    }
+
+    function pushToAccounting() {
+  const sheetName = document.getElementById('sheetSelect').value;
+  if (!sheetName) { alert('Select a source posted payroll sheet.'); return; }
+
+  const system = document.getElementById('systemSelect').value;
+  const mode   = document.getElementById('modeSelect').value;
+  const date   = document.getElementById('journalDate').value;
+  const refNo  = document.getElementById('refNo').value || '';
+  const supplierName = getSupplierName_();
+
+  if (!date) { alert('Enter a journal / bill date.'); return; }
+  if (mode === 'BILL' && !supplierName) {
+    alert((system === 'ODOO') ? 'Enter partner name for Odoo Bill export.' : 'Enter supplier name for Bill export.');
+    return;
+  }
+
+  const statusEl = document.getElementById('status');
+
+  const opts = { sheetName, system, mode, date, refNo, supplierName };
+  if (system === 'XERO') {
+    opts.trackingName1 = (document.getElementById('xeroTracking1').value || '');
+    opts.trackingName2 = (document.getElementById('xeroTracking2').value || '');
+  }
+
+  function doPush_() {
+    statusEl.textContent = '🕒 Pushing to accounting…';
+
+    google.script.run
+      .withSuccessHandler(res => {
+        // If backend says "choose journal first"
+        if (res && res.needsJournalSelection) {
+          _showJournalPickerAndSaveHint_(res, () => doPush_());
+          return;
+        }
+        statusEl.textContent = `✅ Pushed: ${(res && res.provider) || system} / ${(res && res.kind) || mode}`;
+      })
+      .withFailureHandler(err => {
+        statusEl.textContent = '❌ Push failed: ' + (err.message || err);
+      })
+      .postPayrollExportToApi(opts);
+  }
+
+  function runDupCheckThenPush_() {
+    // Only check dupes for Odoo when refNo exists
+    if (system !== 'ODOO' || !String(refNo || '').trim()) {
+      doPush_();
+      return;
+    }
+
+    statusEl.textContent = '🔎 Checking for posted duplicates in Odoo…';
+
+    google.script.run
+      .withSuccessHandler(res => {
+        // If duplicate-check endpoint also says journal selection needed
+        if (res && (res.reason === 'NEED_JOURNAL_SELECTION' || res.needsJournalSelection)) {
+          _showJournalPickerAndSaveHint_(res, () => runDupCheckThenPush_());
+          return;
+        }
+
+        const dups = (res && res.duplicates) ? res.duplicates : [];
+        if (dups.length) {
+          _showOdooDupesModal_(
+            res,
+            () => { doPush_(); },
+            () => { statusEl.textContent = '⛔ Cancelled (posted duplicate found).'; }
+          );
+          return;
+        }
+
+        doPush_();
+      })
+      .withFailureHandler(err => {
+        statusEl.textContent = '❌ Duplicate check failed: ' + (err.message || err);
+      })
+      .checkOdooPostedDuplicatesForPush(opts);
+  }
+
+  runDupCheckThenPush_();
+}
+
+    function generateBankFiles() {
+      const sheetName = document.getElementById('sheetSelect').value;
+      if (!sheetName) { alert('Select a source posted payroll sheet.'); return; }
+
+      const statusEl = document.getElementById('status');
+      statusEl.textContent = '🕒 Generating bank CSV file(s)…';
+
+      google.script.run
+        .withSuccessHandler(res => {
+          try {
+            const files = (res && res.files) || [];
+            if (!files.length) {
+              statusEl.textContent = '⚠ No bank records found to export.';
+              return;
+            }
+
+            files.forEach(file => {
+              const csv = file.csv || '';
+              const name = file.fileName || ('bank-' + (file.bankKey || 'bank') + '.csv');
+
+              const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+              const url  = URL.createObjectURL(blob);
+              const link = document.createElement('a');
+              link.href = url;
+              link.download = name;
+              document.body.appendChild(link);
+              link.click();
+              document.body.removeChild(link);
+              URL.revokeObjectURL(url);
+            });
+
+            statusEl.textContent = `✅ Bank CSV file(s) downloaded: ${files.length} file(s).`;
+          } catch (e) {
+            console.error(e);
+            statusEl.textContent = '❌ Error preparing bank CSV download: ' + (e.message || e);
+          }
+        })
+        .withFailureHandler(err => {
+          statusEl.textContent = '❌ Error generating bank file(s): ' + (err.message || err);
+        })
+        .generateBankFilesFromPayroll({ sheetName });
+    }
+
+    function onSystemChange() {
+  const system = document.getElementById('systemSelect').value;
+  const row = document.getElementById('xeroTrackingRow');
+  if (row) row.style.display = (system === 'XERO') ? '' : 'none';
+
+  refreshSupplierControl_();
+}
+
+
+    function onModeChange() {
+  refreshSupplierControl_();
+}
+
+
+    function getSupplierName_() {
+  const sel = document.getElementById('supplierSelect');
+  const inp = document.getElementById('supplierInput');
+
+  // If dropdown is visible, use it; else use input
+  const selVisible = sel && sel.style.display !== 'none';
+  const v = selVisible ? (sel.value || '') : (inp ? (inp.value || '') : '');
+  return String(v).trim();
+}
+
+function refreshSupplierControl_() {
+  const system = document.getElementById('systemSelect').value;
+  const mode   = document.getElementById('modeSelect').value;
+
+  const supplierLabel = document.getElementById('supplierLabel');
+  const sel = document.getElementById('supplierSelect');
+  const inp = document.getElementById('supplierInput');
+  const statusEl = document.getElementById('status');
+
+  if (!supplierLabel || !sel || !inp) return;
+
+    // ✅ ODOO BILL uses "Partner" terminology
+  const isOdooBill = (system === 'ODOO' && mode === 'BILL');
+  supplierLabel.textContent = isOdooBill ? 'Partner:' : 'Supplier:';
+  inp.placeholder = isOdooBill ? 'Type partner…' : 'Type supplier…';
+
+  // Only show supplier controls when BILL is selected
+  if (mode !== 'BILL') {
+    supplierLabel.style.display = 'none';
+    sel.style.display = 'none';
+    inp.style.display = 'none';
+    return;
+  }
+
+  supplierLabel.style.display = '';
+
+  // Non-Odoo systems => blank input
+  if (system !== 'ODOO') {
+    sel.innerHTML = '';
+    sel.style.display = 'none';
+    inp.style.display = '';
+    return;
+  }
+
+  // ODOO + BILL => dropdown ONLY if configured; otherwise blank input
+  if (statusEl) statusEl.textContent = 'Checking Odoo configuration…';
+
+  google.script.run
+    .withSuccessHandler(isCfg => {
+      const configured = !!isCfg;
+
+      if (configured) {
+        // Show dropdown
+        inp.style.display = 'none';
+        sel.style.display = '';
+
+        // Populate dropdown from Odoo
+        loadOdooSuppliersToSelect_();
+      } else {
+        // Not configured => blank input
+        sel.innerHTML = '';
+        sel.style.display = 'none';
+        inp.style.display = '';
+        if (statusEl) statusEl.textContent = '';
+      }
+    })
+    .withFailureHandler(err => {
+      // If check fails, be safe: blank input
+      sel.innerHTML = '';
+      sel.style.display = 'none';
+      inp.style.display = '';
+      if (statusEl) statusEl.textContent = '';
+    })
+    .isOdooConfigured();
+}
+
+function loadOdooSuppliersToSelect_() {
+  const sel = document.getElementById('supplierSelect');
+  const inp = document.getElementById('supplierInput');
+  const statusEl = document.getElementById('status');
+  if (!sel) return;
+
+  // Keep any currently-selected value if possible
+  const prev = String(sel.value || '').trim();
+
+  if (statusEl) statusEl.textContent = 'Loading Odoo partners…';
+
+  google.script.run
+    .withSuccessHandler(list => {
+      const arr = Array.isArray(list) ? list : [];
+
+      sel.innerHTML = '';
+
+      const ph = document.createElement('option');
+      ph.value = '';
+      ph.textContent = 'Select partner…';
+      sel.appendChild(ph);
+
+      arr.forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = String(name || '').trim();
+        opt.textContent = String(name || '').trim();
+        sel.appendChild(opt);
+      });
+
+      if (prev && arr.includes(prev)) sel.value = prev;
+
+      if (statusEl) statusEl.textContent = '';
+    })
+    .withFailureHandler(err => {
+      // If supplier sync fails while configured, fall back to blank input
+      sel.innerHTML = '';
+      sel.style.display = 'none';
+      if (inp) inp.style.display = '';
+      if (statusEl) statusEl.textContent =
+        '⚠ Partner sync failed (blank partner field shown): ...' + (err.message || err);
+    })
+    .listOdooSuppliers(); // call without params (matches your GS signature)
+}
+
+function _formatOdooDupesMsg_(res) {
+  const dups = (res && res.duplicates) ? res.duplicates : [];
+  if (!dups.length) return '';
+
+  const kindLabel = (res.kind === 'BILL') ? 'Vendor Bill' : 'Journal Entry';
+  const matchField = res.matchField || (res.kind === 'BILL' ? 'ref' : 'name');
+
+  const lines = dups.slice(0, 6).map(m => {
+    const jid = Array.isArray(m.journal_id) ? m.journal_id[0] : m.journal_id;
+    const pid = Array.isArray(m.partner_id) ? m.partner_id[0] : m.partner_id;
+    return `• ID ${m.id} | name="${m.name || ''}" | ref="${m.ref || ''}" | date=${m.date || ''} | journal=${jid || ''} | partner=${pid || ''}`;
+  }).join('\n');
+
+  const more = (dups.length > 6) ? `\n…plus ${dups.length - 6} more.` : '';
+  return `${kindLabel} is already POSTED with the same ${matchField} "${res.refNo}".\n\nMatches:\n${lines}${more}\n\nContinue pushing anyway?`;
+}
+
+    function markHeuristic() {
+      const tbody = document.getElementById('mapBody');
+      Array.from(tbody.rows).forEach(tr => {
+        const header = (tr.cells[0].textContent || '').toUpperCase();
+        const cb = tr.cells[1].querySelector('input[type="checkbox"]');
+        const selType = tr.cells[2].querySelector('select');
+
+        cb.checked = true;
+
+        if (header.match(/SSS|PHILHEALTH|PAG-IBIG|WITHHOLDING|LOAN|DEDUCTION|CASH ADVANCE|LESS/)) {
+          selType.value = 'NEGATIVE';
+        } else {
+          selType.value = 'POSITIVE';
+        }
+      });
+      document.getElementById('status').textContent =
+        '⚡ Heuristic applied. Please review posting types before saving.';
+    }
+
+    document.getElementById('reloadBtn').addEventListener('click', loadHeaderMap);
+    document.getElementById('saveBtn').addEventListener('click', saveMapping);
+    document.getElementById('generateBtn').addEventListener('click', generateJournal);
+    document.getElementById('pushBtn').addEventListener('click', pushToAccounting);
+
+    document.getElementById('markHeuristicBtn').addEventListener('click', markHeuristic);
+    document.getElementById('generateBankBtn').addEventListener('click', generateBankFiles);
+
+    document.getElementById('includeAll').addEventListener('change', (e) => {
+      const checked = e.target.checked;
+      const tbody = document.getElementById('mapBody');
+      Array.from(tbody.rows).forEach(tr => {
+        const cb = tr.cells[1].querySelector('input[type="checkbox"]');
+        cb.checked = checked;
+      });
+    });
+
+    document.querySelectorAll('.mapping-tab').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const view = btn.dataset.view;
+        const card = document.getElementById('postingCard');
+        card.dataset.view = view;
+
+        document.querySelectorAll('.mapping-tab').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+      });
+    });
+
+    document.getElementById('coaImportBtn').addEventListener('click', () => {
+      const status = document.getElementById('status');
+      status.textContent = 'Opening COA…';
+      google.script.run
+        .withSuccessHandler(() => { status.textContent = 'COA opened. After saving there, click “Reload COA”.'; })
+        .withFailureHandler(err => { status.textContent = '❌ Error opening COA: ' + (err.message || err); })
+        .showCoaDialog();
+    });
+
+    document.getElementById('coaReloadBtn').addEventListener('click', () => {
+  const status = document.getElementById('status');
+  if (status) status.textContent = 'Syncing account names from COA…';
+
+  google.script.run
+    .withSuccessHandler(() => {
+      if (status) status.textContent = 'Reloading COA…';
+      loadCoaAndRender_(true);
+    })
+    .withFailureHandler(err => {
+      if (status) status.textContent = '❌ Name sync failed: ' + (err.message || err);
+    })
+    .syncHeaderMapNamesFromCoa();
+});
+
+
+
+function loadOdooSuppliersIfNeeded_() {
+  const system = document.getElementById('systemSelect').value;
+  const mode   = document.getElementById('modeSelect').value;
+
+  const sel = document.getElementById('supplierSelect');
+  if (!sel) return;
+
+  // Only load for ODOO + BILL
+  if (system !== 'ODOO' || mode !== 'BILL') {
+    sel.innerHTML = '';
+    return;
+  }
+
+  const statusEl = document.getElementById('status');
+  if (statusEl) statusEl.textContent = 'Loading Odoo partners…';
+
+  // Keep current selection if possible
+  const prev = (sel.value || '').trim();
+
+  google.script.run
+    .withSuccessHandler(list => {
+      const arr = Array.isArray(list) ? list : [];
+
+      sel.innerHTML = '';
+
+      // Placeholder option
+      const ph = document.createElement('option');
+      ph.value = '';
+      ph.textContent = 'Select partner…';
+      sel.appendChild(ph);
+
+      arr.forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        sel.appendChild(opt);
+      });
+
+      // Restore selection if still exists
+      if (prev && arr.includes(prev)) sel.value = prev;
+
+      if (statusEl) statusEl.textContent = '';
+    })
+    .withFailureHandler(err => {
+      sel.innerHTML = '';
+      const ph = document.createElement('option');
+      ph.value = '';
+      ph.textContent = 'Partner sync failed';
+      sel.appendChild(ph);
+
+      if (statusEl) statusEl.textContent = '⚠ Partner sync failed: ...' + (err.message || err);
+    })
+    .listOdooSuppliers(300); // (optional) if you implemented the limit version
+}
+
+// ==============================
+// Odoo Journal Picker (UI + Save hint + Retry)
+// ==============================
+let __journalPickerMounted = false;
+
+function _mountJournalPickerOnce_() {
+  if (__journalPickerMounted) return;
+  __journalPickerMounted = true;
+
+  const style = document.createElement('style');
+  style.textContent = `
+    .jp-backdrop{
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0.35);
+      z-index: 999990;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 14px;
+      box-sizing: border-box;
+    }
+    .jp-modal{
+      width: min(520px, 100%);
+      background: #fff;
+      border-radius: 10px;
+      border: 1px solid #ddd;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+      overflow: hidden;
+    }
+    .jp-header{
+      padding: 12px 14px;
+      border-bottom: 1px solid #eee;
+      font-weight: 600;
+      display:flex; align-items:center; justify-content:space-between; gap:10px;
+    }
+    .jp-body{ padding: 12px 14px; }
+    .jp-body p{ margin: 0 0 8px; font-size: 12px; color:#444; }
+    .jp-select{
+      width: 100%;
+      font-size: 13px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: 1px solid #ccc;
+      box-sizing: border-box;
+      background: #fff;
+    }
+    .jp-footer{
+      padding: 12px 14px;
+      border-top: 1px solid #eee;
+      display:flex; justify-content:flex-end; gap:8px; flex-wrap:wrap;
+    }
+    .jp-btn{
+      font-size: 13px;
+      padding: 8px 10px;
+      border-radius: 6px;
+      border: none;
+      cursor: pointer;
+      font-weight: 600;
+    }
+    .jp-btn.primary{ background:#1a73e8; color:#fff; }
+    .jp-btn.secondary{ background:#f1f3f4; color:#202124; }
+    .jp-close{
+      font-size: 12px;
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      color:#444;
+    }
+  `;
+  document.head.appendChild(style);
+
+  const backdrop = document.createElement('div');
+  backdrop.className = 'jp-backdrop';
+  backdrop.id = 'jpBackdrop';
+  backdrop.innerHTML = `
+    <div class="jp-modal" role="dialog" aria-modal="true">
+      <div class="jp-header">
+        <span id="jpTitle">Select Odoo Journal</span>
+        <button class="jp-close" id="jpCloseBtn" title="Close">✕</button>
+      </div>
+      <div class="jp-body">
+        <p id="jpHint">Multiple matching journals found. Choose which journal to use.</p>
+        <select class="jp-select" id="jpSelect"></select>
+      </div>
+      <div class="jp-footer">
+        <button class="jp-btn secondary" id="jpCancelBtn">Cancel</button>
+        <button class="jp-btn primary" id="jpSaveBtn">Save & Retry</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(backdrop);
+
+  // close handlers
+  const hide = () => { backdrop.style.display = 'none'; };
+  backdrop.addEventListener('click', (e) => { if (e.target === backdrop) hide(); });
+  document.getElementById('jpCloseBtn').addEventListener('click', hide);
+  document.getElementById('jpCancelBtn').addEventListener('click', hide);
+}
+
+function _showJournalPickerAndSaveHint_(payload, onSaved) {
+  _mountJournalPickerOnce_();
+
+  const journals = (payload && payload.journals) ? payload.journals : [];
+  const journalType = (payload && payload.journalType) ? String(payload.journalType) : ''; // 'general' or 'purchase'
+  const journalKind = (payload && payload.journalKind) ? String(payload.journalKind) : ''; // 'JOURNAL' or 'BILL'
+
+  const titleEl = document.getElementById('jpTitle');
+  const hintEl  = document.getElementById('jpHint');
+  const selEl   = document.getElementById('jpSelect');
+  const backdrop = document.getElementById('jpBackdrop');
+
+  const isPurchase = (journalType === 'purchase') || (journalKind === 'BILL');
+  titleEl.textContent = isPurchase ? 'Select Odoo Purchase Journal' : 'Select Odoo General Journal';
+  hintEl.textContent  = `Multiple ${isPurchase ? 'purchase' : 'general'} journals found in Odoo. Pick one to use going forward.`;
+
+  selEl.innerHTML = '';
+  const ph = document.createElement('option');
+  ph.value = '';
+  ph.textContent = 'Select journal…';
+  selEl.appendChild(ph);
+
+  journals.forEach(j => {
+    const id = (j && j.id != null) ? String(j.id) : '';
+    const code = (j && j.code) ? String(j.code) : '';
+    const name = (j && j.name) ? String(j.name) : '';
+    const opt = document.createElement('option');
+    opt.value = id;
+    opt.textContent = (code ? `${code} — ` : '') + (name || `Journal ${id}`);
+    selEl.appendChild(opt);
+  });
+
+  // wire save
+  const saveBtn = document.getElementById('jpSaveBtn');
+  saveBtn.onclick = () => {
+    const chosenId = String(selEl.value || '').trim();
+    if (!chosenId) { alert('Select a journal.'); return; }
+
+    // Build hints payload expected by server
+    const hints = isPurchase
+      ? { purchaseJournalId: Number(chosenId) }
+      : { generalJournalId: Number(chosenId) };
+
+    const statusEl = document.getElementById('status');
+    if (statusEl) statusEl.textContent = '🕒 Saving Odoo journal selection…';
+
+    // IMPORTANT: this server function must exist & be exposed to HTML
+    // (wrapper around saveOdooJournalHints_ / Properties JSON)
+    google.script.run
+      .withSuccessHandler(() => {
+        backdrop.style.display = 'none';
+        if (statusEl) statusEl.textContent = '✅ Journal saved. Retrying…';
+        if (typeof onSaved === 'function') onSaved();
+      })
+      .withFailureHandler(err => {
+        if (statusEl) statusEl.textContent = '❌ Failed saving journal: ' + (err.message || err);
+      })
+      .saveOdooJournalHints(hints);
+  };
+
+  // show
+  backdrop.style.display = 'flex';
+}
+
+function _hidePrettyConfirm_() {
+  const back = document.getElementById('pcBackdrop');
+  if (back) back.style.display = 'none';
+}
+
+function _showOdooDupesModal_(res, onOk, onCancel) {
+  const back = document.getElementById('pcBackdrop');
+  const titleEl = document.getElementById('pcTitle');
+  const summaryEl = document.getElementById('pcSummary');
+  const listEl = document.getElementById('pcList');
+  const qEl = document.getElementById('pcQuestion');
+  const okBtn = document.getElementById('pcOkBtn');
+  const cancelBtn = document.getElementById('pcCancelBtn');
+  const closeBtn = document.getElementById('pcCloseBtn');
+
+  const dups = (res && res.duplicates) ? res.duplicates : [];
+  const kindLabel = (res && res.kind === 'BILL') ? 'Vendor Bill' : 'Journal Entry';
+  const matchField = (res && res.matchField) || ((res && res.kind === 'BILL') ? 'ref' : 'name');
+  const refNo = (res && res.refNo) ? String(res.refNo) : '';
+
+  titleEl.textContent = `Posted Duplicate Found`;
+  summaryEl.textContent = `${kindLabel} is already POSTED with the same ${matchField}: "${refNo}".`;
+
+  // Build nice list
+  listEl.innerHTML = '';
+  const head = document.createElement('div');
+  head.className = 'pc-row head';
+  head.innerHTML = `
+    <div>ID</div>
+    <div>Name / Ref</div>
+    <div>Date</div>
+    <div>Journal</div>
+    <div>Partner</div>
+  `;
+  listEl.appendChild(head);
+
+  const max = 8;
+  dups.slice(0, max).forEach(m => {
+    const jid = Array.isArray(m.journal_id) ? m.journal_id[0] : (m.journal_id || '');
+    const pid = Array.isArray(m.partner_id) ? m.partner_id[0] : (m.partner_id || '');
+    const name = (m.name || '');
+    const ref  = (m.ref || '');
+    const date = (m.date || '');
+
+    const row = document.createElement('div');
+    row.className = 'pc-row';
+    row.innerHTML = `
+      <div class="pc-mono">${m.id}</div>
+      <div class="pc-ellipsis" title="${(name || ref)}">${(ref ? `${ref} — ` : '') + name}</div>
+      <div class="pc-mono">${date}</div>
+      <div class="pc-mono">${jid}</div>
+      <div class="pc-mono">${pid}</div>
+    `;
+    listEl.appendChild(row);
+  });
+
+  if (dups.length > max) {
+    const more = document.createElement('div');
+    more.style.padding = '8px 10px';
+    more.style.fontSize = '12px';
+    more.style.color = '#555';
+    more.textContent = `…plus ${dups.length - max} more matches.`;
+    listEl.appendChild(more);
+  }
+
+  qEl.textContent = 'Continue pushing anyway?';
+
+  // wire buttons (reset handlers each show)
+  okBtn.onclick = () => { _hidePrettyConfirm_(); if (typeof onOk === 'function') onOk(); };
+  const cancel = () => { _hidePrettyConfirm_(); if (typeof onCancel === 'function') onCancel(); };
+  cancelBtn.onclick = cancel;
+  closeBtn.onclick = cancel;
+
+  // backdrop click closes
+  back.onclick = (e) => { if (e.target === back) cancel(); };
+
+  back.style.display = 'flex';
+}
+
+
+    window.onload = init;
+  </script>
+
+
+</body>
+</html>

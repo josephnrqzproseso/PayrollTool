@@ -1,0 +1,30 @@
+<? var BRAND = getBranding(); ?>
+<? if (BRAND && BRAND.showBranding && BRAND.logoUrl) { ?>
+  <style>
+    /* Discreet corner logo (non-interactive) */
+    .brand-watermark{
+      position: fixed;
+      right: 10px;
+      bottom: 10px;
+      z-index: 999999;
+      pointer-events: none;
+      opacity: 0.55;
+      filter: grayscale(100%);
+    }
+    .brand-watermark img{
+      height: 18px;          /* discreet size */
+      width: auto;
+      display: block;
+    }
+
+    /* Optional: switch to lower-left by adding class "brand-watermark--left" */
+    .brand-watermark--left{
+      right: auto;
+      left: 10px;
+    }
+  </style>
+
+  <div class="brand-watermark">
+    <img src="<?!= BRAND.logoUrl ?>" alt="Netpay PH">
+  </div>
+<? } ?>

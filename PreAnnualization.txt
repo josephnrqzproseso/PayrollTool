@@ -1,0 +1,1018 @@
+/**************************************************
+ * PRE-ANNUALIZATION MODULE
+ **************************************************/
+
+function showPreAnnualizationDialog() {
+  const html = HtmlService.createTemplateFromFile('PreAnnualizationDialog')
+  .evaluate()
+    .setWidth(1000)
+    .setHeight(620);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Pre-Annualization');
+}
+
+// Parse YYYY-MM from form.payrollMonth
+function _parseYearMonthFromForm_(form) {
+  const now = new Date();
+  const raw = String(form && form.payrollMonth || '').trim();
+
+  let year = now.getFullYear();
+  let monthIndex = now.getMonth() + 1; // 1–12
+
+  if (raw) {
+    const m = raw.match(/(\d{4})-(\d{1,2})/);
+    if (m) {
+      const yy = Number(m[1]);
+      const mm = Number(m[2]);
+      if (!isNaN(yy)) year = yy;
+      if (!isNaN(mm) && mm >= 1 && mm <= 12) monthIndex = mm;
+    }
+  }
+  return { year, monthIndex };
+}
+
+// Derive year + month from PAYROLL_HISTORY row
+function _deriveYearMonthFromRow_(r, idxMonth, idxPeriod) {
+  let rowYear = null;
+  let rowMonthIndex = null;
+
+  if (idxMonth > -1 && r[idxMonth]) {
+    const v = r[idxMonth];
+    if (v instanceof Date) {
+      rowYear = v.getFullYear();
+      rowMonthIndex = v.getMonth() + 1;
+    } else {
+      const s = String(v);
+      const dt = new Date(s);
+      if (!isNaN(dt.getTime())) {
+        rowYear = dt.getFullYear();
+        rowMonthIndex = dt.getMonth() + 1;
+      }
+    }
+  }
+
+  if ((rowYear == null || rowMonthIndex == null) && idxPeriod > -1 && r[idxPeriod]) {
+    const s = String(r[idxPeriod]);
+    const m = s.match(/(\d{4})-(\d{1,2})/);
+    if (m) {
+      rowYear = Number(m[1]);
+      rowMonthIndex = Number(m[2]);
+    } else {
+      const dt = new Date(s);
+      if (!isNaN(dt.getTime())) {
+        rowYear = dt.getFullYear();
+        rowMonthIndex = dt.getMonth() + 1;
+      }
+    }
+  }
+
+  return { rowYear, rowMonthIndex };
+}
+
+// Build YTD facts per employee up to the selected payroll month
+function _buildPreAnnFacts_(year, monthIndex, cfg) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const hist = ss.getSheetByName('PAYROLL_HISTORY');
+  const facts = new Map();
+  if (!hist || hist.getLastRow() < 2) return facts;
+
+  const data = hist.getDataRange().getValues();
+  const headers = data[0].map(h => String(h || '').trim());
+  const rows = data.slice(1);
+
+  const idxEmpId   = headers.findIndex(h => /^Employee ID$/i.test(h));
+  const idxEmpName = headers.findIndex(h => /^Employee Name$/i.test(h));
+  const idxPeriod  = headers.findIndex(h => /^Period$/i.test(h));
+  const idxPart    = headers.findIndex(h => /^Part$/i.test(h));
+  const idxMonth   = headers.findIndex(h => /^Payroll Month$/i.test(h));
+  const idxRunType = headers.findIndex(h => /^Run Type$/i.test(h));
+
+  if (idxEmpId === -1) return facts;
+
+  const componentMap = _buildComponentMap_(cfg);
+  const colType = headers.map(name => {
+    const up = String(name || '').toUpperCase();
+
+    if (/^SSS EE( MC)?$/i.test(name))          return 'SSS_EE_MC';
+    if (/^SSS EE MPF$/i.test(name))            return 'SSS_EE_MPF';
+    if (/^PHILHEALTH EE$/i.test(name))         return 'PH_EE';
+    if (/^(PAG-IBIG|HDMF) EE$/i.test(up))      return 'PI_EE';
+    if (/^(WITHHOLDING TAX|WTAX)/i.test(name)) return 'WTAX';
+
+    const cat = (_classifyComponent_(name, componentMap) || '')
+      .toLowerCase().trim();
+
+    if (cat === 'basic pay related')                  return 'BASIC';
+    if (cat === 'taxable earning')                    return 'TAXABLE';
+    if (cat === '13th month pay and other benefits')  return 'OTHER13';
+    if (cat === 'non-taxable earning - de minimis')   return 'DEMINIMIS';
+    if (cat === 'non-taxable earning - other')        return 'NONTAX_OTHER';
+
+    return null;
+  });
+
+  rows.forEach(r => {
+    const { rowYear, rowMonthIndex } =
+      _deriveYearMonthFromRow_(r, idxMonth, idxPeriod);
+
+    if (rowYear !== year) return;
+    if (rowMonthIndex == null || rowMonthIndex > monthIndex) return;
+
+    const empId = String(r[idxEmpId] || '').trim();
+    if (!empId) return;
+
+    const empName = idxEmpName > -1 ? String(r[idxEmpName] || '').trim() : '';
+    const part    = idxPart > -1 ? String(r[idxPart] || '').trim().toUpperCase() : '';
+    const runType = idxRunType > -1 ? String(r[idxRunType] || '').trim().toUpperCase() : '';
+    const isSpecial = (runType === 'SPECIAL');
+
+    let rec = facts.get(empId);
+    if (!rec) {
+      rec = {
+        empId,
+        empName,
+        ytdBasic: 0,
+        ytdTaxable: 0,
+        ytd13thOther: 0,
+        ytdDeminimis: 0,
+        ytdNonTaxOther: 0,
+        ytdSssEeMc: 0,
+        ytdSssEeMpf: 0,
+        ytdPhEe: 0,
+        ytdPiEe: 0,
+        ytdWtax: 0,
+        wtaxThisMonth: 0,
+        monthsEmployedSet: Object.create(null),
+
+        // for per-employee frequency
+        hasA: false,
+        hasB: false,
+        hasM: false,
+        normalCutoffsCount: 0,
+        cutoffsThisMonth: 0,
+        countA: 0,
+        countB: 0,
+        countM: 0
+      };
+      facts.set(empId, rec);
+    }
+
+    rec.monthsEmployedSet[rowMonthIndex] = true;
+
+    // Track pattern for THIS payroll month (for remaining-cutoffs logic)
+    if (!isSpecial && rowMonthIndex === monthIndex) {
+      if (part === 'A') rec.hasA = true;
+      if (part === 'B') rec.hasB = true;
+      if (part === 'M') rec.hasM = true;
+      rec.cutoffsThisMonth++;
+    }
+
+    // Track pattern ACROSS THE YEAR (for per-employee frequency)
+    if (!isSpecial) {
+      if (part === 'A') rec.countA++;
+      else if (part === 'B') rec.countB++;
+      else if (part === 'M') rec.countM++;
+
+      // Count this as one normal cutoff for YTD scaling
+      rec.normalCutoffsCount++;
+    }
+
+    // Accumulate amounts
+    for (let c = 0; c < r.length; c++) {
+      const t = colType[c];
+      if (!t) continue;
+      const vRaw = r[c];
+      if (typeof vRaw !== 'number') continue;
+      const v = Number(vRaw) || 0;
+      if (!v) continue;
+
+      switch (t) {
+        case 'BASIC':        rec.ytdBasic      += v;           break;
+        case 'TAXABLE':      rec.ytdTaxable    += v;           break;
+        case 'OTHER13':      rec.ytd13thOther  += v;           break;
+        case 'DEMINIMIS':    rec.ytdDeminimis  += v;           break;
+        case 'NONTAX_OTHER': rec.ytdNonTaxOther+= v;           break;
+        case 'SSS_EE_MC':    rec.ytdSssEeMc    += Math.abs(v); break;
+        case 'SSS_EE_MPF':   rec.ytdSssEeMpf   += Math.abs(v); break;
+        case 'PH_EE':        rec.ytdPhEe       += Math.abs(v); break;
+        case 'PI_EE':        rec.ytdPiEe       += Math.abs(v); break;
+        case 'WTAX': {
+          const w = Math.abs(v);
+          rec.ytdWtax += w;
+          if (!isSpecial && rowMonthIndex === monthIndex) {
+            rec.wtaxThisMonth += w;
+          }
+          break;
+        }
+      }
+    }
+  });
+
+  return facts;
+}
+
+// Previous employer inputs
+function _loadPreAnnPreviousEmployerMap_() {
+  const store = _readPrevEmployerStore_(); // helper lives in Final Annualization .gs
+  const map = new Map();
+
+  Object.keys(store).forEach(empId => {
+    const rec = store[empId] || {};
+    map.set(String(empId).trim(), {
+      taxable: Number(rec.taxable || 0) || 0,
+      wtax: Number(rec.wtax || 0) || 0
+    });
+  });
+
+  return map;
+}
+
+// Annual / monthly tax from BIR table (uses existing _loadBirTable_ shape)
+function _computeAnnualTaxFromBir_(annualTaxable, birRows) {
+  const val = Number(annualTaxable) || 0;
+  if (val <= 0 || !birRows || !birRows.length) return 0;
+
+  for (let i = 0; i < birRows.length; i++) {
+    const r = birRows[i];
+    const min = Number(r.exAnnual || 0);
+    const max = (r.maxAnnual === Infinity || r.maxAnnual == null)
+      ? Infinity
+      : Number(r.maxAnnual || 0);
+    if (val >= min && val <= max) {
+      const fixed = Number(r.fixedAnnual || 0);
+      const rate  = Number(r.rateAnnual || 0);
+      return _r2_(fixed + (val - min) * rate);
+    }
+  }
+  return 0;
+}
+
+function _computeMonthlyTaxFromBir_(monthlyTaxable, birRows) {
+  const val = Number(monthlyTaxable) || 0;
+  if (val <= 0 || !birRows || !birRows.length) return 0;
+
+  for (let i = 0; i < birRows.length; i++) {
+    const r = birRows[i];
+    const min = Number(r.exMonth || 0);
+    const max = (r.maxMonth === Infinity || r.maxMonth == null)
+      ? Infinity
+      : Number(r.maxMonth || 0);
+    if (val >= min && val <= max) {
+      const fixed = Number(r.fixedMonth || 0);
+      const rate  = Number(r.rateMonth || 0);
+      return _r2_(fixed + (val - min) * rate);
+    }
+  }
+  return 0;
+}
+
+// Main preview (used by HTML)
+function getPreAnnualizationPreview(form) {
+  try {
+    const { year, monthIndex } = _parseYearMonthFromForm_(form);
+    const ss  = SpreadsheetApp.getActiveSpreadsheet();
+    const cfg = _readSettings_();
+
+        const factsMap  = _buildPreAnnFacts_(year, monthIndex, cfg);
+    const prevMap   = _loadPreAnnPreviousEmployerMap_();
+    const birTable  = _loadBirTable_(_mustGetSheet_(ss, 'BIR_TABLE'));
+
+    const baseRemainingMonths = Math.max(0, 12 - monthIndex);
+
+    // NEW: annual recurring amounts per employee (from Recurring Adjustments sheet)
+    const recurringAnnual = _buildRecurringAnnualMap_(year, cfg);
+
+    // Masterfile metadata
+
+    const { sourceSS } = _openLinkedFiles_(cfg, ss);
+    const master    = _mustGetSheet_(sourceSS, cfg.MASTER_SHEET_NAME);
+    const mVals     = master.getDataRange().getValues();
+    const mHdrs     = mVals[0].map(h => String(h || '').trim());
+    const mRows     = mVals.slice(1);
+
+    const idxEmp      = mHdrs.findIndex(h => /^Employee ID$/i.test(h));
+    const idxName     = mHdrs.findIndex(h => /^Employee Name$/i.test(h));
+    const idxGrp      = mHdrs.findIndex(h => /^Payroll Group$/i.test(h));
+    const idxTc1      = 3; // column D
+    const idxTc2      = 4; // column E
+    const tc1Label    = mHdrs[3] || 'Tracking Category 1';
+    const tc2Label    = mHdrs[4] || 'Tracking Category 2';
+    const idxContract = mHdrs.findIndex(h => /^Contract Type$/i.test(h));
+    const idxStatus   = mHdrs.findIndex(h =>
+      /^Status$/i.test(h) || /Employment Status/i.test(h)
+    );
+
+    const metaById = new Map();
+    mRows.forEach(r => {
+      const id = String(r[idxEmp] || '').trim();
+      if (!id) return;
+      metaById.set(id, {
+        name:         idxName     > -1 ? String(r[idxName]     || '').trim() : '',
+        group:        idxGrp      > -1 ? String(r[idxGrp]      || '').trim() : '',
+        trackingCat1: idxTc1      > -1 ? String(r[idxTc1]      || '').trim() : '',
+        trackingCat2: idxTc2      > -1 ? String(r[idxTc2]      || '').trim() : '',
+        contractType: idxContract > -1 ? String(r[idxContract] || '').trim() : '',
+        status:       idxStatus   > -1 ? String(r[idxStatus]   || '').trim() : ''
+      });
+    });
+
+    const rowsForUi = [];
+    const globalFreq = String(cfg.PAY_FREQUENCY || '').toUpperCase();
+
+    factsMap.forEach((rec, empId) => {
+      const meta = metaById.get(empId) || {};
+
+      // include only employees (contract type = "EMPLOYEE")
+      const contractUpper = String(meta.contractType || '').trim().toUpperCase();
+      if (!contractUpper || contractUpper !== 'EMPLOYEE') return;
+
+      // determine if resigned / separated / inactive
+      const statusUpper = String(meta.status || '').toUpperCase();
+      const isResigned = /RESIGN|SEPARAT|TERMINAT|INACTIVE/.test(statusUpper);
+
+      // ==== PER-EMPLOYEE FREQUENCY (based on history) ====
+      let empFreq = 'UNKNOWN';
+      if ((rec.countA || 0) > 0 || (rec.countB || 0) > 0) {
+        empFreq = 'SEMI';
+      } else if ((rec.countM || 0) > 0) {
+        empFreq = 'MONTH';
+      } else {
+        // fallback to global if we really can't infer
+        if (globalFreq.indexOf('SEMI') !== -1) empFreq = 'SEMI';
+        else if (globalFreq.indexOf('MONTH') !== -1) empFreq = 'MONTH';
+      }
+      const isSemi   = (empFreq === 'SEMI');
+      const isMonth  = (empFreq === 'MONTH');
+
+      // employee-specific remaining months:
+      const remainingMonths = isResigned ? 0 : baseRemainingMonths;
+
+      const monthsSeen  = Object.keys(rec.monthsEmployedSet || {}).length || monthIndex;
+      const denomMonths = monthsSeen || monthIndex || 1;
+
+      // ==== FUTURE RECURRING ADJUSTMENTS (ANNUAL FROM SHEET − YTD FROM HISTORY) ====
+      const annRec = recurringAnnual.get(empId) || {
+        BASIC: 0,
+        TAXABLE: 0,
+        DEMINIMIS: 0,
+        NONTAX_OTHER: 0,
+        OTHER13: 0
+      };
+
+      const annualTaxableFromSheet     = Number(annRec.TAXABLE      || 0);
+      const annualDemFromSheet         = Number(annRec.DEMINIMIS    || 0);
+      const annualNonTaxOtherFromSheet = Number(annRec.NONTAX_OTHER || 0);
+      const annualOther13FromSheet     = Number(annRec.OTHER13      || 0);
+
+      // Only project the part of recurring items that has NOT yet appeared in PAYROLL_HISTORY.
+      // This automatically handles half-month runs: whatever is already in YTD is deducted.
+      const extraTaxable     = isResigned ? 0 : Math.max(0, annualTaxableFromSheet     - (rec.ytdTaxable     || 0));
+      const extraNonTaxDem   = isResigned ? 0 : Math.max(0, annualDemFromSheet         - (rec.ytdDeminimis   || 0));
+      const extraNonTaxOther = isResigned ? 0 : Math.max(0, annualNonTaxOtherFromSheet - (rec.ytdNonTaxOther || 0));
+      const extraOther13     = isResigned ? 0 : Math.max(0, annualOther13FromSheet     - (rec.ytd13thOther   || 0));
+
+
+      // ==== YTD SCALING (only for ACTIVE semi-monthly, and ONLY for Basic/contributions) ====
+      let ytdScale = 1;
+      if (!isResigned && isSemi) {
+        const cutoffs = rec.normalCutoffsCount || 0;
+        if (cutoffs > 0) {
+          const expectedCutoffs = monthsSeen * 2; // 2 cutoffs per month
+          if (expectedCutoffs > cutoffs) {
+            ytdScale = expectedCutoffs / cutoffs;
+          }
+        }
+        if (ytdScale < 1) ytdScale = 1;
+      }
+
+      // Basic & contributions can be scaled; EVERYTHING ELSE stays pure YTD + recurring sheet.
+      const ytdBasicAdj       = rec.ytdBasic       * ytdScale;
+      const ytdTaxableAdj     = rec.ytdTaxable;     // no projection from history
+      const ytdDeminimisAdj   = rec.ytdDeminimis;   // no projection from history
+      const ytdNonTaxOtherAdj = rec.ytdNonTaxOther; // no projection from history
+
+      const ytdSssEeMcAdj     = rec.ytdSssEeMc     * ytdScale;
+      const ytdSssEeMpfAdj    = rec.ytdSssEeMpf    * ytdScale;
+      const ytdPhEeAdj        = rec.ytdPhEe        * ytdScale;
+      const ytdPiEeAdj        = rec.ytdPiEe        * ytdScale;
+
+      let basicAnnual, taxableAnnual, nonTaxDemAnnual, nonTaxOtherAnnual;
+      let sssEeMcAnnual, sssEeMpfAnnual, phEeAnnual, piEeAnnual;
+      let ytd13thOther, projected13thMonth, total13thOtherAnnual;
+      let grossCompPresent, nonTax13thOtherAnnual;
+
+      if (isResigned) {
+        // ====== RESIGNED: NO PROJECTION, USE YTD ONLY ======
+        basicAnnual       = rec.ytdBasic;
+        taxableAnnual     = rec.ytdTaxable;
+        nonTaxDemAnnual   = rec.ytdDeminimis;
+        nonTaxOtherAnnual = rec.ytdNonTaxOther;
+
+        ytd13thOther         = rec.ytd13thOther;
+        projected13thMonth   = 0;
+        total13thOtherAnnual = ytd13thOther;
+
+        grossCompPresent =
+          basicAnnual +
+          taxableAnnual +
+          nonTaxDemAnnual +
+          nonTaxOtherAnnual +
+          total13thOtherAnnual;
+
+        sssEeMcAnnual  = rec.ytdSssEeMc;
+        sssEeMpfAnnual = rec.ytdSssEeMpf;
+        phEeAnnual     = rec.ytdPhEe;
+        piEeAnnual     = rec.ytdPiEe;
+
+        nonTax13thOtherAnnual =
+          Math.min(OTHER_BENEFITS_EXEMPT_YTD, Math.max(0, total13thOtherAnnual));
+      } else {
+        // ====== ACTIVE ======
+        // Basic from adjusted YTD (salary is recurring)
+        basicAnnual = ytdBasicAdj + (ytdBasicAdj / denomMonths) * remainingMonths;
+
+        // Taxable / Non-tax De Minimis / Non-tax Other
+        // = YTD from PAYROLL_HISTORY + future from Recurring Adjustments sheet
+        taxableAnnual     = ytdTaxableAdj     + extraTaxable;
+        nonTaxDemAnnual   = ytdDeminimisAdj   + extraNonTaxDem;
+        nonTaxOtherAnnual = ytdNonTaxOtherAdj + extraNonTaxOther;
+
+        // 13th & other benefits:
+        // - YTD 13th+other from history
+        // - projected 13th month from BASIC
+        // - PLUS recurring 13th/other from Recurring Adjustments
+        ytd13thOther         = rec.ytd13thOther;
+        projected13thMonth   = basicAnnual / 12;
+        total13thOtherAnnual = ytd13thOther + projected13thMonth + extraOther13;
+
+        grossCompPresent =
+          basicAnnual +
+          taxableAnnual +
+          nonTaxDemAnnual +
+          nonTaxOtherAnnual +
+          total13thOtherAnnual;
+
+        nonTax13thOtherAnnual =
+          Math.min(OTHER_BENEFITS_EXEMPT_YTD, Math.max(0, total13thOtherAnnual));
+
+        // EE contributions projected (tied to recurring salary)
+        sssEeMcAnnual  = ytdSssEeMcAdj  + (ytdSssEeMcAdj  / denomMonths) * remainingMonths;
+        sssEeMpfAnnual = ytdSssEeMpfAdj + (ytdSssEeMpfAdj / denomMonths) * remainingMonths;
+        phEeAnnual     = ytdPhEeAdj     + (ytdPhEeAdj     / denomMonths) * remainingMonths;
+        piEeAnnual     = ytdPiEeAdj     + (ytdPiEeAdj     / denomMonths) * remainingMonths;
+      }
+
+      const taxableCompPresent =
+        grossCompPresent
+        - nonTaxDemAnnual
+        - nonTaxOtherAnnual
+        - nonTax13thOtherAnnual
+        - sssEeMcAnnual
+        - sssEeMpfAnnual
+        - phEeAnnual
+        - piEeAnnual;
+
+      const prev = prevMap.get(empId) || { taxable: 0, wtax: 0 };
+      const taxablePrev = Number(prev.taxable || 0);
+      const wtaxPrev    = Number(prev.wtax || 0);
+
+      const totalTaxableComp = taxableCompPresent + taxablePrev;
+      const taxDueAnnual = _computeAnnualTaxFromBir_(totalTaxableComp, birTable);
+
+      // Regular taxable base for monthly withholding:
+//   (Basic Pay Related + Taxable Earnings) - (SSS EE + SSS EE MPF + PhilHealth EE + Pag-IBIG EE)
+const regularTaxableAnnualPresent = Math.max(
+  0,
+  (basicAnnual + taxableAnnual) -
+  (sssEeMcAnnual + sssEeMpfAnnual + phEeAnnual + piEeAnnual)
+);
+
+// Assumed taxable per month based on that regular annual amount
+const taxableMonthlyProjected = regularTaxableAnnualPresent / 12;
+
+// Simulated monthly WHT using the BIR MONTHLY table
+const monthlyWtaxProjected = _computeMonthlyTaxFromBir_(taxableMonthlyProjected, birTable);
+
+      // Actual withholding from PAYROLL_HISTORY (present employer only)
+      const ytdWtaxPresent = rec.ytdWtax || 0;
+      // We will compute the "assumed" part later, once remainingCutoffs is known.
+
+            // Remaining cutoffs per-employee
+      let remainingCutoffs;
+      const cutoffsThisMonth = rec.cutoffsThisMonth || 0;
+
+      if (isResigned) {
+        remainingCutoffs = 0;
+      } else if (isSemi) {
+        const usedCurrent = Math.min(cutoffsThisMonth, 2);
+        const remainingCurrent = Math.max(0, 2 - usedCurrent);  // 0,1,2
+        // 2 cutoffs per future month + remaining cutoffs in current month
+        remainingCutoffs = (remainingMonths * 2) + remainingCurrent;
+      } else {
+        // monthly (or fallback)
+        const monthAlreadyRun = cutoffsThisMonth > 0 || rec.hasM;
+        const remainingCurrent = monthAlreadyRun ? 0 : 1;
+        // 1 cutoff per future month + possibly this month if not yet run
+        remainingCutoffs = remainingMonths + remainingCurrent;
+      }
+
+      if (remainingCutoffs < 0) remainingCutoffs = 0;
+
+      // ===== BASE WHT SIMULATION FOR REMAINING CUTOFFS =====
+      // monthlyWtaxProjected is tax for a FULL MONTH at the assumed taxable base.
+      // For semi-monthly, we assume it is split evenly across 2 cutoffs.
+      const cutoffsPerMonth = isSemi ? 2 : 1;
+      const whtPerCutoff = (cutoffsPerMonth > 0)
+        ? (monthlyWtaxProjected / cutoffsPerMonth)
+        : 0;
+
+      const taxWithheldPresentYtd = ytdWtaxPresent;
+      const taxWithheldPresentAssumed =
+        remainingCutoffs > 0 ? whtPerCutoff * remainingCutoffs : 0;
+
+      const totalWtaxPresent = taxWithheldPresentYtd + taxWithheldPresentAssumed;
+      const totalWtaxBase    = totalWtaxPresent + wtaxPrev;
+      const totalAdjustment  = taxDueAnnual - totalWtaxBase;
+
+      const perCutoffAdj = remainingCutoffs > 0
+        ? _r2_(totalAdjustment / remainingCutoffs)
+        : 0;
+
+
+            rowsForUi.push({
+        empId,
+        empName: meta.name || rec.empName || '',
+        group: meta.group || '',
+        trackingCat1: meta.trackingCat1 || '',
+        trackingCat2: meta.trackingCat2 || '',
+        trackingCat1Label: tc1Label,
+        trackingCat2Label: tc2Label,
+        basicAnnual,
+        taxableAnnual,
+        nonTaxDemAnnual,
+        nonTaxOtherAnnual,
+        ytd13thOther,
+        projected13thMonth,
+        total13thOtherAnnual,
+        grossCompPresent,
+        nonTax13thOtherAnnual,
+        sssEeMcAnnual,
+        sssEeMpfAnnual,
+        phEeAnnual,
+        piEeAnnual,
+        taxableCompPresent,
+        taxablePrev,
+        totalTaxableComp,
+        taxDueAnnual,
+
+        // NEW split + totals
+        taxWithheldPresentYtd,
+        taxWithheldPresentAssumed,
+        totalWtaxPresent,
+
+        wtaxPrev,
+        totalWtaxBase,
+        totalAdjustment,
+        remainingCutoffs,
+        perCutoffAdj
+      });
+    });
+
+    return rowsForUi;
+  } catch (e) {
+    Logger.log('PreAnnualization ERROR: ' + (e.stack || e));
+    throw new Error('PreAnnualization ERROR: ' + e.message);
+  }
+}
+
+function createPreAnnualizationSheet(form) {
+  try {
+    const rows = getPreAnnualizationPreview(form) || [];
+    const { year } = _parseYearMonthFromForm_(form);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const cfg = _readSettings_();
+
+    // Build map of overrides from preview (if any)
+    const overridesArr = form && form.overrides;
+    const overrideMap = new Map();
+    if (Array.isArray(overridesArr)) {
+      overridesArr.forEach(o => {
+        const id = String(o.empId || '').trim();
+        if (!id) return;
+        overrideMap.set(id, o);
+      });
+    }
+
+    const { sourceSS } = _openLinkedFiles_(cfg, ss);
+    const master    = _mustGetSheet_(sourceSS, cfg.MASTER_SHEET_NAME);
+    const mHdrs     = master.getRange(1, 1, 1, master.getLastColumn()).getValues()[0]
+      .map(h => String(h || '').trim());
+    const tc1Label  = mHdrs[3] || 'Tracking Category 1';
+    const tc2Label  = mHdrs[4] || 'Tracking Category 2';
+
+    const sheetName = `PreAnnualization_${year}`;
+    let sh = ss.getSheetByName(sheetName);
+    if (!sh) sh = ss.insertSheet(sheetName);
+    sh.clear();
+
+    // ==== HEADERS (with extra projection columns) ====
+        const headers = [
+      'Employee ID',                                  // 1
+      'Employee Name',                                // 2
+      'Payroll Group',                                // 3
+      tc1Label,                                       // 4
+      tc2Label,                                       // 5
+
+      'Basic (Annual)',                               // 6
+      'Basic – Extra Projection',                     // 7
+
+      'Taxable Earnings – Other (Annual)',            // 8
+      'Taxable – Extra Projection',                   // 9
+
+      'Non-tax De Minimis (Annual)',                  // 10
+      'Non-tax De Minimis – Extra Projection',        // 11
+
+      'Non-tax Other (Annual)',                       // 12
+      'Non-tax Other – Extra Projection',             // 13
+
+      '13th Month & Other Benefits – YTD',            // 14
+      '13th Month & Other – YTD Extra Projection',    // 15
+
+      'Projected 13th Month Pay',                     // 16
+      'Projected 13th – Extra Projection',            // 17
+
+      'Total 13th Month & Other Benefits (Annual)',   // 18 (formula)
+      'Gross Compensation Income – Present Employer', // 19 (formula)
+
+      'Non-tax De Minimis',                           // 20 (formula)
+      'Non-tax Other',                                // 21 (formula)
+      'Non-tax 13th+Other (≤90k)',                    // 22 (formula)
+
+      'SSS EE MC (Annual)',                           // 23
+      'SSS EE MPF (Annual)',                          // 24
+      'PhilHealth EE (Annual)',                       // 25
+      'Pag-IBIG EE (Annual)',                         // 26
+
+      'Taxable Compensation Income – Present Employer',   // 27 (formula)
+      'Taxable Compensation Income – Previous Employer',  // 28 (editable)
+      'Total Taxable Compensation Income',                // 29 (formula)
+
+      'Annual Tax Due',                               // 30
+
+      // NEW SPLIT PRESENT W/TAX
+      'Tax Withheld – Present Employer (YTD)',        // 31
+      'Tax Withheld – Present Employer (Assumed)',    // 32
+      'Total Tax Withheld – Present Employer',        // 33 (formula)
+
+      'Tax Withheld – Previous Employer',             // 34 (editable)
+      'Total Tax Withheld (Base)',                    // 35 (formula)
+
+      'Total WTax Adjustment (Tax Due – Total WTax)', // 36 (formula)
+      'Remaining Cutoffs',                            // 37
+      'Recommended WTax Adjustment per Cutoff'        // 38
+    ];
+
+    sh.appendRow(headers);
+
+    // ==== DATA ROWS (use overrides where supplied) ====
+    const outRows = rows.map(r => {
+      const empId = String(r.empId || '').trim();
+      const ov = overrideMap.get(empId) || {};
+
+      const basicExtra       = (ov.basicExtra       != null ? ov.basicExtra       : '');
+      const taxableExtra     = (ov.taxableExtra     != null ? ov.taxableExtra     : '');
+      const nonTaxDemExtra   = (ov.nonTaxDemExtra   != null ? ov.nonTaxDemExtra   : '');
+      const nonTaxOtherExtra = (ov.nonTaxOtherExtra != null ? ov.nonTaxOtherExtra : '');
+      const ytd13thExtra     = (ov.ytd13thExtra     != null ? ov.ytd13thExtra     : '');
+      const proj13thExtra    = (ov.proj13thExtra    != null ? ov.proj13thExtra    : '');
+
+      const taxablePrev      = (ov.taxablePrev      != null ? ov.taxablePrev      : r.taxablePrev);
+      const wtaxPrev         = (ov.wtaxPrev         != null ? ov.wtaxPrev         : r.wtaxPrev);
+
+            return [
+        r.empId,                // 1
+        r.empName,              // 2
+        r.group,                // 3
+        r.trackingCat1,         // 4
+        r.trackingCat2,         // 5
+
+        r.basicAnnual,          // 6  base
+        basicExtra,             // 7  extra proj
+
+        r.taxableAnnual,        // 8  base
+        taxableExtra,           // 9  extra proj
+
+        r.nonTaxDemAnnual,      // 10 base
+        nonTaxDemExtra,         // 11 extra proj
+
+        r.nonTaxOtherAnnual,    // 12 base
+        nonTaxOtherExtra,       // 13 extra proj
+
+        r.ytd13thOther,         // 14 base
+        ytd13thExtra,           // 15 extra proj
+
+        r.projected13thMonth,   // 16 base
+        proj13thExtra,          // 17 extra proj
+
+        r.total13thOtherAnnual, // 18 (formula overwrite)
+        r.grossCompPresent,     // 19 (formula overwrite)
+
+        r.nonTaxDemAnnual,      // 20 (formula overwrite)
+        r.nonTaxOtherAnnual,    // 21 (formula overwrite)
+        r.nonTax13thOtherAnnual,// 22 (formula overwrite)
+
+        r.sssEeMcAnnual,        // 23
+        r.sssEeMpfAnnual,       // 24
+        r.phEeAnnual,           // 25
+        r.piEeAnnual,           // 26
+
+        r.taxableCompPresent,   // 27 (formula overwrite)
+        taxablePrev,            // 28 editable
+        r.totalTaxableComp,     // 29 (formula overwrite)
+
+        r.taxDueAnnual,         // 30
+
+        r.taxWithheldPresentYtd,      // 31
+        r.taxWithheldPresentAssumed,  // 32
+        r.totalWtaxPresent,           // 33 (formula overwrite)
+
+        wtaxPrev,                // 34 editable
+        r.totalWtaxBase,         // 35 (formula overwrite)
+
+        r.totalAdjustment,       // 36 (formula overwrite)
+        r.remainingCutoffs,      // 37
+        r.perCutoffAdj           // 38
+      ];
+
+    });
+
+    if (outRows.length) {
+      sh.getRange(2, 1, outRows.length, outRows[0].length).setValues(outRows);
+    }
+
+    // ==== FORMULAS ====
+    const dataRows = outRows.length;
+    if (dataRows > 0) {
+      const startRow = 2;
+
+      // 18: Total 13th = YTD + YTD extra + projected + projected extra
+      sh.getRange(startRow, 18, dataRows, 1)
+        .setFormulaR1C1("=R[0]C[-4]+R[0]C[-3]+R[0]C[-2]+R[0]C[-1]");
+
+      // 19: Gross Compensation = basic + extra + taxable + extra
+      //                           + non-tax dem + extra + non-tax other + extra
+      //                           + total 13th (includes its extras)
+      sh.getRange(startRow, 19, dataRows, 1)
+        .setFormulaR1C1(
+          "=R[0]C[-13]+R[0]C[-12]+" +  // 6 + 7
+          "R[0]C[-11]+R[0]C[-10]+" +  // 8 + 9
+          "R[0]C[-9]+R[0]C[-8]+"   +  // 10 + 11
+          "R[0]C[-7]+R[0]C[-6]+"   +  // 12 + 13
+          "R[0]C[-1]"                 // 18
+        );
+
+      // 20: Non-tax De Minimis = annual + extra
+      sh.getRange(startRow, 20, dataRows, 1)
+        .setFormulaR1C1("=R[0]C[-10]+R[0]C[-9]");
+
+      // 21: Non-tax Other = annual + extra
+      sh.getRange(startRow, 21, dataRows, 1)
+        .setFormulaR1C1("=R[0]C[-9]+R[0]C[-8]");
+
+      // 22: Non-tax 13th+Other (≤ 90k) based on Total 13th (col 18)
+      sh.getRange(startRow, 22, dataRows, 1)
+        .setFormulaR1C1("=MIN(90000,MAX(0,R[0]C[-4]))");
+
+      // 27: Taxable Comp Present =
+      //      Gross Comp (19)
+      //    - Non-tax dem (20)
+      //    - Non-tax other (21)
+      //    - Non-tax 13th (22)
+      //    - SSS MC (23)
+      //    - SSS MPF (24)
+      //    - PhilHealth (25)
+      //    - Pag-IBIG (26)
+      sh.getRange(startRow, 27, dataRows, 1)
+        .setFormulaR1C1(
+          "=R[0]C[-8]" +        // 19
+          "-R[0]C[-7]" +        // 20
+          "-R[0]C[-6]" +        // 21
+          "-R[0]C[-5]" +        // 22
+          "-R[0]C[-4]" +        // 23
+          "-R[0]C[-3]" +        // 24
+          "-R[0]C[-2]" +        // 25
+          "-R[0]C[-1]"          // 26
+        );
+
+      // 29: Total Taxable = Present + Previous
+      sh.getRange(startRow, 29, dataRows, 1)
+        .setFormulaR1C1("=R[0]C[-2]+R[0]C[-1]");
+
+      // 33: Total WTax – Present = YTD + Assumed
+      sh.getRange(startRow, 33, dataRows, 1)
+        .setFormulaR1C1("=R[0]C[-2]+R[0]C[-1]");
+
+      // 35: Total WTax (Base) = Present + Previous
+      sh.getRange(startRow, 35, dataRows, 1)
+        .setFormulaR1C1("=R[0]C[-2]+R[0]C[-1]");
+
+      // 36: Total WTax Adjustment = Tax Due – Total WTax (Base)
+      //  (col 30 - col 35)
+      sh.getRange(startRow, 36, dataRows, 1)
+        .setFormulaR1C1("=R[0]C[-6]-R[0]C[-1]");
+
+    }
+
+    // ===== FORMATTING / LAYOUT =====
+
+    // Freeze header row and up to Employee Name (columns A–B)
+    sh.setFrozenRows(1);
+    sh.setFrozenColumns(2);
+
+    // Wrap + center header row
+    const headerRange = sh.getRange(1, 1, 1, headers.length);
+    headerRange
+      .setWrap(true)
+      .setHorizontalAlignment('center')
+      .setVerticalAlignment('middle');
+
+    // Amount columns: 6..36 – same width based on longest numeric text
+    if (dataRows > 0) {
+      const firstDataRow = 2;
+            const amountColStart = 6;
+      const amountColEnd   = 38;
+
+      const numCols = amountColEnd - amountColStart + 1;
+
+      const amountRange = sh.getRange(firstDataRow, amountColStart, dataRows, numCols);
+      const values = amountRange.getValues();
+
+      let maxLen = 0;
+      for (let r = 0; r < values.length; r++) {
+        for (let c = 0; c < values[r].length; c++) {
+          const v = values[r][c];
+          if (v === '' || v == null) continue;
+          // raw numeric-ish string (strip commas)
+          const s = String(v).replace(/,/g, '');
+          const len = s.length;
+          if (len > maxLen) maxLen = len;
+        }
+      }
+
+      // crude approx: ~7 px per char + padding, minimum width 70
+      const basePerChar = 7;
+      const padding = 18;
+      const colWidth = Math.max(70, maxLen * basePerChar + padding);
+
+      for (let col = amountColStart; col <= amountColEnd; col++) {
+        sh.setColumnWidth(col, colWidth);
+      }
+
+      // Right-align amount columns, 2-decimal number format
+      amountRange
+        .setHorizontalAlignment('right')
+        .setNumberFormat('#,##0.00;[Red]-#,##0.00;""');
+
+        // Accounting format overrides for Previous Employer fields
+const acctFmt = '#,##0.00;(#,##0.00);""';
+
+// Col 28: Taxable Compensation Income – Previous Employer
+sh.getRange(2, 28, dataRows, 1).setNumberFormat(acctFmt);
+
+// Col 34: Tax Withheld – Previous Employer
+sh.getRange(2, 34, dataRows, 1).setNumberFormat(acctFmt);
+
+    }
+
+    // Text columns (ID, Name, Group, TC1, TC2) left-aligned
+    sh.getRange(2, 1, Math.max(1, dataRows), 5)
+      .setHorizontalAlignment('left');
+
+    return { sheetName };
+  } catch (e) {
+    Logger.log('PreAnnualizationSheet ERROR: ' + (e.stack || e));
+    throw new Error('PreAnnualizationSheet ERROR: ' + e.message);
+  }
+}
+
+// Annual recurring adjustments per employee (by category) from Recurring Adjustments
+function _buildRecurringAnnualMap_(year, cfg) {
+  // Active file (usually Payroll Generator)
+  const activeSS = SpreadsheetApp.getActiveSpreadsheet();
+
+  // Try to read Recurring Adjustments from the same file that holds the Masterfile
+  let srcSS = activeSS;
+  try {
+    if (typeof _openLinkedFiles_ === 'function') {
+      const files = _openLinkedFiles_(cfg, activeSS);
+      if (files && files.sourceSS) {
+        srcSS = files.sourceSS;
+      }
+    }
+  } catch (err) {
+    // fall back to activeSS
+  }
+
+  // Sheet name for Recurring Adjustments
+  let sheetName = 'Recurring Adjustments';
+  try {
+    if (typeof CONFIG !== 'undefined' &&
+        CONFIG && CONFIG.SHEETS && CONFIG.SHEETS.ADJUST_SCHEDULE) {
+      sheetName = CONFIG.SHEETS.ADJUST_SCHEDULE;
+    }
+  } catch (err) {}
+
+  const sh = srcSS.getSheetByName(sheetName);
+  const map = new Map();
+  if (!sh || sh.getLastRow() < 2) return map;
+
+  const values = sh.getDataRange().getValues();
+  const hdr = values[0];
+
+  // Case-insensitive header index map
+  let idx = {};
+  if (typeof indexByHeader_ === 'function') {
+    idx = indexByHeader_(hdr);
+  } else {
+    hdr.forEach((h, i) => {
+      const key = String(h || '').trim().toLowerCase();
+      if (key) idx[key] = i;
+    });
+  }
+
+  const idxEmp   = idx['employee id'];
+  const idxCat   = idx['payroll category'];
+  const idxAmt   = idx['amount per payroll'];
+  const idxStart = idx['start date'];
+  const idxEnd   = idx['end date'];
+
+  if (idxEmp == null || idxCat == null || idxAmt == null) return map;
+
+  const yearStart = new Date(year, 0, 1);
+  const yearEnd   = new Date(year, 11, 31);
+
+  const rows = values.slice(1);
+  rows.forEach(r => {
+    const empId = String(r[idxEmp] || '').trim();
+    if (!empId) return;
+
+    const perPayroll = Number(r[idxAmt] || 0);
+    if (!perPayroll) return;
+
+    const catRaw = String(r[idxCat] || '').toUpperCase().trim();
+    let key;
+    if (catRaw === 'BASIC PAY RELATED')                        key = 'BASIC';
+    else if (catRaw === 'TAXABLE EARNING')                     key = 'TAXABLE';
+    else if (catRaw === 'NON-TAXABLE EARNING - DE MINIMIS')    key = 'DEMINIMIS';
+    else if (catRaw === 'NON-TAXABLE EARNING - OTHER')         key = 'NONTAX_OTHER';
+    else if (catRaw === '13TH MONTH PAY AND OTHER BENEFITS')   key = 'OTHER13';
+    else return; // ignore ADDITION / DEDUCTION etc.
+
+    let startVal = (idxStart != null ? r[idxStart] : null);
+    let endVal   = (idxEnd   != null ? r[idxEnd]   : null);
+
+    let start = null;
+    let end   = null;
+
+    if (startVal instanceof Date) {
+      start = startVal;
+    } else if (startVal) {
+      const dt = new Date(startVal);
+      if (!isNaN(dt.getTime())) start = dt;
+    }
+
+    if (endVal instanceof Date) {
+      end = endVal;
+    } else if (endVal) {
+      const dt = new Date(endVal);
+      if (!isNaN(dt.getTime())) end = dt;
+    }
+
+    if (!start) start = yearStart;
+    if (!end)   end   = yearEnd;
+
+    // No overlap with this calendar year
+    if (start > yearEnd || end < yearStart) return;
+
+    // Clamp to this year
+    if (start < yearStart) start = yearStart;
+    if (end   > yearEnd)   end   = yearEnd;
+
+    const activeMonths =
+      (end.getFullYear() - start.getFullYear()) * 12 +
+      (end.getMonth() - start.getMonth()) + 1;
+
+    if (activeMonths <= 0) return;
+
+    const annual = perPayroll * activeMonths;
+
+    let rec = map.get(empId);
+    if (!rec) {
+      rec = { BASIC: 0, TAXABLE: 0, DEMINIMIS: 0, NONTAX_OTHER: 0, OTHER13: 0 };
+      map.set(empId, rec);
+    }
+    rec[key] += annual;
+  });
+
+  return map;
+}
+

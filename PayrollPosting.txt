@@ -1,0 +1,3373 @@
+/************************************************************
+ * PAYROLL POSTING MODULE (NO CONFIG SHEETS)
+ * ----------------------------------------------------------
+ * - Uses posted payroll sheets (names ending in "(posted)")
+ * - Uses Masterfile sheet from Settings Center (_readSettings_)
+ * - Stores:
+ *      - Chart of Accounts (COA)
+ *      - Header→Account mapping
+ *      - Bank→Account mapping
+ *   in Document Properties as JSON (no extra config sheets).
+ *
+ * DIMENSIONS USED CONCURRENTLY:
+ *   1) Worker type dimension (from Masterfile CONTRACT TYPE):
+ *        - Employee (default)
+ *        - Consultant/Freelance  (CONTRACT TYPE = "Consultant" or "Freelance")
+ *   2) Allocation dimension (from Masterfile ALLOCATION):
+ *        - COST
+ *        - OPEX
+ *        - BLANK defaults to OPEX
+ *
+ * PER-HEADER MAPPING FIELDS (2×2):
+ *   - Employee COST:      empCostAccountCode / empCostAccountName
+ *   - Employee OPEX:      empOpexAccountCode / empOpexAccountName
+ *   - Consultant COST:    conCostAccountCode / conCostAccountName
+ *   - Consultant OPEX:    conOpexAccountCode / conOpexAccountName
+ *
+ * Dimensions (Tracking):
+ *   - dimension1 = Tracking Category 1 (header name or NONE)
+ *   - dimension2 = Tracking Category 2 (header name or NONE)
+ *
+ * IMPORTANT FIX (Tracking values):
+ *   - Dimension OPTIONS come from Masterfile headers.
+ *   - Dimension VALUES resolve from:
+ *        (a) Posted payroll row (if that column exists), else
+ *        (b) Masterfile row (matched by EMPLOYEE ID)
+ *
+ * HOW TO HOOK MENU:
+ *   In your existing onOpen(), call:
+ *       addAccountingMenu_();
+ ************************************************************/
+
+// ==== PROPERTY KEYS ====
+const KEY_COA_JSON        = 'PAYROLL_COA_JSON_V1';
+const KEY_HEADER_MAP_JSON = 'PAYROLL_HEADER_MAP_JSON_V1';
+const KEY_BANK_MAP_JSON   = 'PAYROLL_BANK_MAP_JSON_V1';
+
+// ==== ODOO CONNECTION + ID CACHE (stored here, NOT Settings Center) ====
+const KEY_ODOO_CONN_JSON         = 'PAYROLL_ODOO_CONN_JSON_V1';          // { baseUrl, db, username, apiKey }
+const KEY_ODOO_ID_CACHE_JSON     = 'PAYROLL_ODOO_ID_CACHE_JSON_V1';      // { accounts:{code:id}, partners:{name:id}, journals:{general:id,purchase:id} }
+const KEY_ODOO_JOURNAL_HINT_JSON = 'PAYROLL_ODOO_JOURNAL_HINT_JSON_V1';  // optional disambiguation if multiple journals exist
+
+// ==== ACCOUNTING INTEGRATION SETTINGS (Doc Properties) ====
+// (We store these here because Settings Center saveSettings() may be whitelist-based.)
+const KEY_ACC_SETTINGS_JSON = 'PAYROLL_ACC_SETTINGS_V1';
+
+function loadAccountingSettings_() {
+  const raw = PropertiesService.getDocumentProperties().getProperty(KEY_ACC_SETTINGS_JSON);
+  if (!raw) return {};
+  try { return JSON.parse(raw) || {}; } catch (e) { return {}; }
+}
+
+function saveAccountingSettings_(payload) {
+  payload = payload || {};
+  const cleaned = {
+        ODOO_COMPANY_ID: payload.ODOO_COMPANY_ID ? Number(payload.ODOO_COMPANY_ID) : null,
+
+    ACC_PROVIDER: String(payload.ACC_PROVIDER || '').trim().toUpperCase(),
+
+    XERO_TENANT_ID: String(payload.XERO_TENANT_ID || '').trim(),
+    XERO_ACCESS_TOKEN: String(payload.XERO_ACCESS_TOKEN || '').trim(),
+
+    ODOO_BASE_URL: String(payload.ODOO_BASE_URL || '').trim(),
+    ODOO_DB: String(payload.ODOO_DB || '').trim(),
+    ODOO_USERNAME: String(payload.ODOO_USERNAME || '').trim(),
+    ODOO_API_KEY: String(payload.ODOO_API_KEY || '').trim()
+  };
+
+  PropertiesService.getDocumentProperties().setProperty(KEY_ACC_SETTINGS_JSON, JSON.stringify(cleaned));
+    // --- KEEP ODOO "connection" key in sync for API push ---
+  // postPayrollToOdooApi() -> _odooOpen_() reads KEY_ODOO_CONN_JSON (NOT KEY_ACC_SETTINGS_JSON)
+  if (cleaned.ACC_PROVIDER === 'ODOO') {
+    const conn = {
+      baseUrl: String(cleaned.ODOO_BASE_URL || '').replace(/\/+$/, ''),
+      db: String(cleaned.ODOO_DB || '').trim(),
+      username: String(cleaned.ODOO_USERNAME || '').trim(),
+      apiKey: String(cleaned.ODOO_API_KEY || '').trim()
+    };
+
+    // If all fields present, persist in the key that _odooOpen_ expects
+    if (conn.baseUrl && conn.db && conn.username && conn.apiKey) {
+      PropertiesService.getDocumentProperties()
+        .setProperty(KEY_ODOO_CONN_JSON, JSON.stringify(conn));
+    } else {
+      // If incomplete, clear to avoid stale creds
+      PropertiesService.getDocumentProperties().deleteProperty(KEY_ODOO_CONN_JSON);
+    }
+  } else {
+    // Not Odoo provider → clear Odoo conn key (optional but prevents stale usage)
+    PropertiesService.getDocumentProperties().deleteProperty(KEY_ODOO_CONN_JSON);
+  }
+
+  return { success: true };
+}
+
+// ===== Public (no-underscore) endpoints for container/UI =====
+function loadAccountingSettings() {
+  return loadAccountingSettings_();
+}
+
+function saveAccountingSettings(payload) {
+  return saveAccountingSettings_(payload);
+}
+
+function testOdooConnection(payload) {
+  payload = payload || {};
+
+  const baseUrl  = String(payload.ODOO_BASE_URL || payload.baseUrl || '').replace(/\/+$/, '');
+  const db       = String(payload.ODOO_DB || payload.db || '').trim();
+  const username = String(payload.ODOO_USERNAME || payload.username || '').trim();
+  const apiKey   = String(payload.ODOO_API_KEY || payload.apiKey || '').trim();
+
+  if (!baseUrl || !db || !username || !apiKey) {
+    throw new Error('Missing ODOO_BASE_URL / ODOO_DB / ODOO_USERNAME / ODOO_API_KEY.');
+  }
+
+  // Persist connection so later calls (_odooOpen_) work even if user forgets to Save first
+  saveOdooConnection_({ baseUrl: baseUrl, db: db, username: username, apiKey: apiKey });
+
+  const url = baseUrl + '/jsonrpc';
+
+  const uid = _odooJsonRpc_(url, {
+    service: 'common',
+    method: 'authenticate',
+    args: [db, username, apiKey, {}]
+  });
+
+  if (!uid) throw new Error('Odoo authenticate failed. Check DB/username/API key.');
+
+  const rows = _odooJsonRpc_(url, {
+    service: 'object',
+    method: 'execute_kw',
+    args: [
+      db, uid, apiKey,
+      'res.company',
+      'search_read',
+      [[]],
+      { fields: ['name'], limit: 200, order: 'name' }
+    ]
+  });
+
+  const list = Array.isArray(rows) ? rows : [];
+  list.sort((a, b) => String(a.name || '').localeCompare(String(b.name || '')));
+
+  const wanted = payload.ODOO_COMPANY_ID ? Number(payload.ODOO_COMPANY_ID) : null;
+  const hasWanted = wanted && list.some(c => Number(c.id) === wanted);
+
+  const selectedCompanyId = hasWanted
+    ? wanted
+    : (list[0] ? Number(list[0].id) : null);
+
+  return {
+    success: true,
+    uid: uid,
+    selectedCompanyId: selectedCompanyId,
+    companies: list.map(c => ({ id: Number(c.id), name: String(c.name || '') }))
+  };
+}
+
+
+// =====================
+// Small utilities
+// =====================
+
+function _norm_(s) {
+  return String(s == null ? '' : s).trim().toUpperCase();
+}
+
+function _round2_(v) {
+  v = (typeof v === 'number' && !isNaN(v)) ? v : 0;
+  return Math.round(v * 100) / 100;
+}
+
+function _formatOdooAnalyticDistCsvFromDims_(dim1, dim2, odooOrNull) {
+  const splitNames = (s) => {
+    return String(s || '')
+      .split(/[\n|,;]+/g)          // allow newline, | , ;
+      .map(x => String(x || '').trim())
+      .filter(Boolean);
+  };
+
+  const names = [...new Set([ ...splitNames(dim1), ...splitNames(dim2) ])];
+  if (!names.length) return '';
+
+  // If we can resolve IDs, output JSON map (best for Odoo analytic_distribution import)
+  if (odooOrNull) {
+    const dist = _odooBuildAnalyticDistributionFromDims_(odooOrNull, dim1, dim2);
+    return dist ? JSON.stringify(dist) : '';
+  }
+
+  // Fallback (no Odoo config): output NAME-based distribution
+  // (Format support depends on your Odoo import mapping / version.)
+  const n = names.length;
+  if (n === 1) return names[0] + ': 100';
+
+  const base = Math.floor((100 / n) * 100) / 100; // 2-decimal floor
+  let used = 0;
+
+  const parts = names.map((nm, i) => {
+    const pct = (i === n - 1) ? _round2_(100 - used) : base;
+    used = _round2_(used + pct);
+    return nm + ': ' + pct;
+  });
+
+  return parts.join(', ');
+}
+
+
+
+function _safeStr_(v) {
+  if (v == null) return '';
+  // Dates -> readable string
+  if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime())) {
+    return Utilities.formatDate(v, Session.getScriptTimeZone(), 'yyyy-MM-dd');
+  }
+  return String(v);
+}
+
+/**
+ * Returns true if the row looks like a TOTAL / TOTALS row
+ * based on EMPLOYEE ID / EMPLOYEE NAME.
+ */
+function _rowIsTotal_(empId, empName) {
+  const id = _norm_(empId);
+  const nm = _norm_(empName);
+  if (!id && !nm) return false;
+  return (id === 'TOTAL' || id === 'TOTALS' || nm === 'TOTAL' || nm === 'TOTALS');
+}
+
+// =====================
+// Menu (optional helper)
+// =====================
+
+function addAccountingMenu_() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Accounting')
+    .addItem('Generate Payroll Entries (Hub)', 'showAccountingCenterDialog')
+    .addSeparator()
+    .addItem('Chart of Accounts', 'showCoaDialog')
+    .addItem('Payroll Posting Mapping', 'showPayrollPostingDialog')
+    .addItem('Bank Mapping', 'showPayrollBankMappingDialog')
+    .addSeparator()
+    .addItem('Migrate Header Map Schema (V2)', 'migrateHeaderMapSchemaV2_')
+    .addToUi();
+}
+
+// =====================
+// Dialog openers
+// =====================
+
+function showAccountingCenterDialog() {
+  const html = HtmlService.createTemplateFromFile('AccountingCenter')
+    .evaluate()
+    .setWidth(420)
+    .setHeight(260);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Generate Payroll Entries');
+}
+
+function showCoaDialog() {
+  const html = HtmlService.createTemplateFromFile('CoaDialog')
+    .evaluate()
+    .setWidth(520)
+    .setHeight(480);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Chart of Accounts');
+}
+
+function showPayrollPostingDialog() {
+  const html = HtmlService.createTemplateFromFile('PayrollPostingDialog')
+    .evaluate()
+    .setWidth(2000)
+    .setHeight(650);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Payroll Posting Configuration');
+}
+
+function showPayrollBankMappingDialog() {
+  const html = HtmlService.createTemplateFromFile('PayrollBankMappingDialog')
+    .evaluate()
+    .setWidth(640)
+    .setHeight(520);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Bank Mapping (Disbursing Bank → GL)');
+}
+
+// =====================
+// SETTINGS HELPERS (uses your existing Settings Center)
+// =====================
+
+/**
+ * Reads global settings from your existing Settings Center.
+ * Assumes you already have _readSettings_().
+ */
+let __GETSETTINGS_GUARD__ = false;
+
+function _getSettings_() {
+  // pick the correct base settings reader
+  const baseFn =
+    (typeof _readSettingsBase_ === 'function') ? _readSettingsBase_ :
+    (typeof _readSettings_ === 'function')     ? _readSettings_ :
+    (typeof loadSettings === 'function')       ? loadSettings :
+    null;
+
+  // If some indirect path re-enters _getSettings_(), return BASE immediately
+  if (__GETSETTINGS_GUARD__) {
+    return baseFn ? (baseFn() || {}) : {};
+  }
+
+  __GETSETTINGS_GUARD__ = true;
+  try {
+    const base = baseFn ? (baseFn() || {}) : {};
+    const acc  = (typeof loadAccountingSettings === 'function') ? (loadAccountingSettings() || {}) : {};
+
+    const merged = Object.assign({}, base);
+    Object.keys(acc).forEach(k => {
+      const v = acc[k];
+      const s = String(v == null ? '' : v).trim();
+      if (s !== '') merged[k] = v;
+    });
+
+    return merged;
+  } finally {
+    __GETSETTINGS_GUARD__ = false;
+  }
+}
+
+// =====================
+// ODOO: Connection + ID Cache (Doc Properties)
+// =====================
+
+function loadOdooConnection_() {
+  const raw = PropertiesService.getDocumentProperties().getProperty(KEY_ODOO_CONN_JSON);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch (e) { return null; }
+}
+
+function saveOdooConnection_(conn) {
+  if (!conn) throw new Error('Missing Odoo connection payload.');
+  const cleaned = {
+    baseUrl: String(conn.baseUrl || '').replace(/\/+$/, ''),
+    db: String(conn.db || '').trim(),
+    username: String(conn.username || '').trim(),
+    apiKey: String(conn.apiKey || '').trim()
+  };
+  if (!cleaned.baseUrl || !cleaned.db || !cleaned.username || !cleaned.apiKey) {
+    throw new Error('Odoo connection requires baseUrl, db, username, apiKey.');
+  }
+  PropertiesService.getDocumentProperties().setProperty(KEY_ODOO_CONN_JSON, JSON.stringify(cleaned));
+  return { success: true };
+}
+
+// Optional: if multiple journals exist, you can pin which to use without Settings Center UI
+// payload example: { generalJournalId: 12, purchaseJournalId: 8 }
+function saveOdooJournalHints_(payload) {
+  payload = payload || {};
+  const hints = {
+    generalJournalId: payload.generalJournalId ? Number(payload.generalJournalId) : null,
+    purchaseJournalId: payload.purchaseJournalId ? Number(payload.purchaseJournalId) : null
+  };
+  PropertiesService.getDocumentProperties().setProperty(KEY_ODOO_JOURNAL_HINT_JSON, JSON.stringify(hints));
+  return { success: true };
+}
+
+function loadOdooJournalHints_() {
+  const raw = PropertiesService.getDocumentProperties().getProperty(KEY_ODOO_JOURNAL_HINT_JSON);
+  if (!raw) return {};
+  try { return JSON.parse(raw) || {}; } catch (e) { return {}; }
+}
+
+function loadOdooIdCache_() {
+  const raw = PropertiesService.getDocumentProperties().getProperty(KEY_ODOO_ID_CACHE_JSON);
+  if (!raw) return { accounts: {}, partners: {}, journals: {}, analytics: {} };
+
+  try {
+    const obj = JSON.parse(raw) || {};
+    if (!obj.accounts) obj.accounts = {};
+    if (!obj.partners) obj.partners = {};
+    if (!obj.journals) obj.journals = {};
+    if (!obj.analytics) obj.analytics = {};
+    return obj;
+  } catch (e) {
+  return { accounts: {}, partners: {}, journals: {}, analytics: {} };
+}
+
+}
+
+function saveOdooIdCache_(cache) {
+  cache = cache || {};
+  if (!cache.accounts) cache.accounts = {};
+  if (!cache.partners) cache.partners = {};
+  if (!cache.journals) cache.journals = {};
+  if (!cache.analytics) cache.analytics = {};
+  PropertiesService.getDocumentProperties().setProperty(KEY_ODOO_ID_CACHE_JSON, JSON.stringify(cache));
+  return { success: true };
+}
+
+function clearOdooIdCache_() {
+  PropertiesService.getDocumentProperties().deleteProperty(KEY_ODOO_ID_CACHE_JSON);
+  return { success: true };
+}
+
+// =====================
+// ODOO: JSON-RPC + resolvers
+// =====================
+
+function _odooJsonRpc_(url, callObj) {
+  // --- FIX: ensure params is an OBJECT, not a JSON string / array ---
+  if (typeof callObj === 'string') {
+    try { callObj = JSON.parse(callObj); }
+    catch (e) {
+      throw new Error('Odoo JSON-RPC params must be an object, got STRING that is not JSON.');
+    }
+  }
+  if (!callObj || typeof callObj !== 'object' || Array.isArray(callObj)) {
+    throw new Error('Odoo JSON-RPC params must be an object {service,method,args}. Got: ' + Object.prototype.toString.call(callObj));
+  }
+
+  const payloadObj = {
+    jsonrpc: '2.0',
+    method: 'call',
+    params: callObj,
+    id: String(new Date().getTime())
+  };
+
+  const payloadText = JSON.stringify(payloadObj);
+
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    muteHttpExceptions: true,
+    payload: payloadText
+  });
+
+  const code = resp.getResponseCode();
+  const body = resp.getContentText();
+  let json;
+  try { json = JSON.parse(body || '{}'); } catch (e) { json = null; }
+
+  if (code < 200 || code >= 300) {
+    throw new Error('Odoo JSON-RPC HTTP ' + code + ': ' + body);
+  }
+  if (!json) throw new Error('Odoo JSON-RPC invalid JSON: ' + body);
+  if (json.error) throw new Error('Odoo JSON-RPC error: ' + JSON.stringify(json.error));
+  return json.result;
+}
+
+
+function _odooOpen_() {
+  let conn = loadOdooConnection_();
+
+  // --- FIX: fallback to Accounting Settings (KEY_ACC_SETTINGS_JSON / _getSettings_) ---
+  // If KEY_ODOO_CONN_JSON is missing, but user saved ODOO_* settings via saveAccountingSettings(),
+  // rebuild the conn and persist it to the key that _odooOpen_ expects.
+  if (!conn) {
+    const cfg = (typeof _getSettings_ === 'function') ? (_getSettings_() || {}) : (loadAccountingSettings_() || {});
+
+    const baseUrl  = String(cfg.ODOO_BASE_URL || '').replace(/\/+$/, '');
+    const db       = String(cfg.ODOO_DB || '').trim();
+    const username = String(cfg.ODOO_USERNAME || '').trim();
+    const apiKey   = String(cfg.ODOO_API_KEY || '').trim();
+
+    if (baseUrl && db && username && apiKey) {
+      conn = { baseUrl, db, username, apiKey };
+      PropertiesService.getDocumentProperties()
+        .setProperty(KEY_ODOO_CONN_JSON, JSON.stringify(conn));
+    }
+  }
+
+  if (!conn) {
+    throw new Error('Odoo connection not set. Save ODOO_BASE_URL/ODOO_DB/ODOO_USERNAME/ODOO_API_KEY first.');
+  }
+
+  const url = conn.baseUrl.replace(/\/+$/, '') + '/jsonrpc';
+
+  const uid = _odooJsonRpc_(url, {
+    service: 'common',
+    method: 'authenticate',
+    args: [conn.db, conn.username, conn.apiKey, {}]
+  });
+
+    if (!uid) throw new Error('Odoo authenticate failed. Check db/username/apiKey.');
+
+  // ✅ company context (multi-company safe)
+  const cfg = (typeof _getSettings_ === 'function') ? (_getSettings_() || {}) : (loadAccountingSettings_() || {});
+  let companyId = cfg.ODOO_COMPANY_ID ? Number(cfg.ODOO_COMPANY_ID) : null;
+
+  const odoo = { url: url, db: conn.db, uid: uid, apiKey: conn.apiKey };
+
+  if (!companyId) {
+    companyId = _odooReadUserCompany_(odoo);
+  }
+
+  odoo.companyId = companyId || null;
+  odoo.context = _odooBuildContext_(odoo.companyId);
+
+  return odoo;
+}
+
+
+function _odooBuildContext_(companyId) {
+  companyId = companyId ? Number(companyId) : null;
+  if (!companyId) return {};
+  return {
+    allowed_company_ids: [companyId],
+    force_company: companyId
+  };
+}
+
+function _odooReadUserCompany_(odoo) {
+  // res.users.read([uid], ['company_id','company_ids'])
+  const rows = _odooJsonRpc_(odoo.url, {
+    service: 'object',
+    method: 'execute_kw',
+    args: [
+      odoo.db, odoo.uid, odoo.apiKey,
+      'res.users',
+      'read',
+      [[odoo.uid]],
+      { fields: ['company_id', 'company_ids'] }
+    ]
+  });
+
+  const u = (rows && rows[0]) ? rows[0] : null;
+  // company_id is usually [id, name]
+  if (u && Array.isArray(u.company_id) && u.company_id.length) return Number(u.company_id[0]);
+  // fallback: first of company_ids if present
+  if (u && Array.isArray(u.company_ids) && u.company_ids.length) return Number(u.company_ids[0]);
+  return null;
+}
+
+
+function _odooSearchRead_(odoo, model, domain, fields, limit) {
+  const opts = { fields: fields || ['id'], limit: (limit == null ? 0 : Number(limit)) };
+
+  // ✅ apply multi-company context
+  if (odoo && odoo.context && Object.keys(odoo.context).length) {
+    opts.context = odoo.context;
+  }
+
+  const args = [
+    odoo.db, odoo.uid, odoo.apiKey,
+    model,
+    'search_read',
+    [domain || []],
+    opts
+  ];
+  return _odooJsonRpc_(odoo.url, { service: 'object', method: 'execute_kw', args: args });
+}
+
+
+function _odooSearchCount_(odoo, model, domain) {
+  const opts = {};
+  if (odoo && odoo.context && Object.keys(odoo.context).length) {
+    opts.context = odoo.context;
+  }
+
+  return _odooJsonRpc_(odoo.url, {
+    service: 'object',
+    method: 'execute_kw',
+    args: [
+      odoo.db, odoo.uid, odoo.apiKey,
+      model,
+      'search_count',
+      [domain || []],
+      opts
+    ]
+  });
+}
+
+/**
+ * Append x2many commands in batches using write()
+ * fieldName: "line_ids" or "invoice_line_ids"
+ * commands: [ [0,0,vals], [0,0,vals], ... ]
+ */
+/**
+ * Append x2many commands to an existing record in VERIFIED chunks.
+ * Fixes silent truncation (common around 40 commands) on account.move.write().
+ *
+ * model: 'account.move'
+ * fieldName: 'line_ids' or 'invoice_line_ids'
+ * commands: [ [0,0,vals], ... ]
+ */
+function _odooAppendX2ManyInChunks_(odoo, model, recordId, fieldName, commands, chunkSize) {
+  recordId = Number(recordId);
+  if (!Array.isArray(commands) || !commands.length) return;
+
+  // Safer default: 10 (NOT 40)
+  chunkSize = Number(chunkSize || 10);
+  if (!chunkSize || chunkSize < 1) chunkSize = 1;
+
+  const ctx = Object.assign({}, (odoo && odoo.context) ? odoo.context : {}, {
+    check_move_validity: false
+  });
+
+    function readLen() {
+    const rb = _odooJsonRpc_(odoo.url, {
+      service: 'object',
+      method: 'execute_kw',
+      args: [
+        odoo.db, odoo.uid, odoo.apiKey,
+        model,
+        'read',
+        [[recordId]],
+        { fields: [fieldName], context: ctx }
+      ]
+    });
+
+    const ids = (rb && rb[0] && Array.isArray(rb[0][fieldName])) ? rb[0][fieldName] : [];
+    return ids.length;
+  }
+
+
+  // If Odoo silently refuses big chunks, split until it works (down to 1 line per write).
+  function appendChunk(chunk) {
+    if (!chunk.length) return;
+
+    const before = readLen();
+    Logger.log(`### ODOO APPEND ${fieldName}: trying chunk=${chunk.length}, before=${before}`);
+
+    _odooJsonRpc_(odoo.url, {
+      service: 'object',
+      method: 'execute_kw',
+      args: [
+        odoo.db, odoo.uid, odoo.apiKey,
+        model,
+        'write',
+        [[recordId], { [fieldName]: chunk }],
+        { context: ctx }
+      ]
+    });
+
+    const after = readLen();
+    Logger.log(`### ODOO APPEND ${fieldName}: after=${after} (added=${after - before})`);
+
+    // ✅ If nothing was added, Odoo silently ignored the chunk -> split smaller and retry
+    if (after <= before) {
+      if (chunk.length === 1) {
+        throw new Error(`Odoo refused to append even 1 ${fieldName} line (silent ignore).`);
+      }
+      const mid = Math.ceil(chunk.length / 2);
+      appendChunk(chunk.slice(0, mid));
+      appendChunk(chunk.slice(mid));
+    }
+  }
+
+  for (let i = 0; i < commands.length; i += chunkSize) {
+    const chunk = commands.slice(i, i + chunkSize);
+    appendChunk(chunk);
+  }
+
+  // Final verify
+  const finalLen = readLen();
+  Logger.log(`### ODOO APPEND ${fieldName}: FINAL=${finalLen}, expected>=${commands.length}`);
+}
+
+
+// Resolve account_id from account code
+function _odooGetAccountIdByCode_(odoo, accountCode) {
+  const code = String(accountCode || '').trim();
+  if (!code) throw new Error('Missing account code for Odoo account lookup.');
+
+  const cache = loadOdooIdCache_();
+  if (cache.accounts && cache.accounts[code]) return Number(cache.accounts[code]);
+
+  const rows = _odooSearchRead_(odoo, 'account.account', [['code', '=', code]], ['id', 'code', 'name'], 2);
+  if (!rows || !rows.length) throw new Error('Odoo account not found for code: ' + code);
+  if (rows.length > 1) throw new Error('Odoo account code not unique: ' + code);
+
+  const id = Number(rows[0].id);
+  cache.accounts[code] = id;
+  saveOdooIdCache_(cache);
+  return id;
+}
+
+// Resolve partner_id from exact partner name (NO auto-create, no guessing)
+function _odooGetPartnerIdByName_(odoo, partnerName) {
+  const name = String(partnerName || '').trim();
+  if (!name) throw new Error('Missing supplier/partner name for Odoo partner lookup.');
+
+  const cache = loadOdooIdCache_();
+  if (cache.partners && cache.partners[name]) return Number(cache.partners[name]);
+
+  const rows = _odooSearchRead_(odoo, 'res.partner', [['name', '=', name]], ['id', 'name'], 2);
+  if (!rows || !rows.length) throw new Error('Odoo partner not found (exact name match): ' + name);
+  if (rows.length > 1) throw new Error('Odoo partner name not unique (exact match returns multiple): ' + name);
+
+  const id = Number(rows[0].id);
+  cache.partners[name] = id;
+  saveOdooIdCache_(cache);
+  return id;
+}
+
+/**
+ * Preflight: check if a POSTED Odoo document already exists for the same reference/number.
+ * - JOURNAL: posted account.move where move_type='entry' and name == refNo (your "Number")
+ * - BILL: posted vendor bill where move_type='in_invoice' and ref == refNo (your "Reference")
+ *
+ * Returns:
+ * {
+ *   checked: true/false,
+ *   system: 'ODOO',
+ *   kind: 'JOURNAL'|'BILL',
+ *   refNo: '...',
+ *   matchField: 'name'|'ref',
+ *   duplicates: [{id,name,ref,date,state,journal_id,partner_id}]
+ * }
+ */
+function checkOdooPostedDuplicatesForPush(options) {
+  if (typeof options === 'string') options = JSON.parse(options);
+  options = options || {};
+
+  const system = String(options.system || options.targetSystem || '').toUpperCase();
+  if (system !== 'ODOO') return { checked: false, system, reason: 'Not ODOO' };
+
+  const mode = String(options.mode || options.exportType || '').toUpperCase();
+  const kind = (mode === 'BILL') ? 'BILL' : 'JOURNAL';
+
+  const refNo = String(options.refNo || options.docNumber || '').trim();
+  if (!refNo) return { checked: false, system: 'ODOO', kind, reason: 'No refNo' };
+
+  const odoo = _odooOpen_();
+
+  // Company-safe (you already use multi-company context)
+  const fields = ['id', 'name', 'ref', 'date', 'state', 'journal_id', 'partner_id', 'move_type', 'company_id'];
+
+  if (kind === 'JOURNAL') {
+    const journalId = _odooGetJournalId_(odoo, 'JOURNAL');
+if (!journalId) {
+  return {
+    checked: false,
+    system: 'ODOO',
+    kind: 'JOURNAL',
+    refNo,
+    reason: 'NEED_JOURNAL_SELECTION',
+    journalKind: 'JOURNAL',
+    journalType: 'general',
+    journals: debugOdooJournals('JOURNAL') // list for UI
+  };
+}
+
+
+    const dom = [
+      ['move_type', '=', 'entry'],
+      ['state', '=', 'posted'],
+      ['name', '=', refNo],
+      ['journal_id', '=', Number(journalId)]
+    ];
+    if (odoo.companyId) dom.push(['company_id', '=', Number(odoo.companyId)]);
+
+    const rows = _odooSearchRead_(odoo, 'account.move', dom, fields, 20) || [];
+    return {
+      checked: true,
+      system: 'ODOO',
+      kind,
+      refNo,
+      matchField: 'name',
+      duplicates: rows
+    };
+  }
+
+  // BILL
+  const supplierName = String(options.supplierName || '').trim();
+  if (!supplierName) throw new Error('Missing supplierName for duplicate BILL check.');
+
+  const journalId = _odooGetJournalId_(odoo, 'BILL');
+if (!journalId) {
+  return {
+    checked: false,
+    system: 'ODOO',
+    kind: 'BILL',
+    refNo,
+    reason: 'NEED_JOURNAL_SELECTION',
+    journalKind: 'BILL',
+    journalType: 'purchase',
+    journals: debugOdooJournals('BILL') // list for UI
+  };
+}
+
+  const partnerId = _odooGetPartnerIdByName_(odoo, supplierName);
+
+  const dom = [
+    ['move_type', '=', 'in_invoice'],
+    ['state', '=', 'posted'],
+    ['ref', '=', refNo],
+    ['journal_id', '=', Number(journalId)],
+    ['partner_id', '=', Number(partnerId)]
+  ];
+  if (odoo.companyId) dom.push(['company_id', '=', Number(odoo.companyId)]);
+
+  const rows = _odooSearchRead_(odoo, 'account.move', dom, fields, 20) || [];
+  return {
+    checked: true,
+    system: 'ODOO',
+    kind,
+    refNo,
+    matchField: 'ref',
+    partnerId: Number(partnerId),
+    duplicates: rows
+  };
+}
+
+
+// Read partner payable account (property_account_payable_id)
+function _odooGetPartnerPayableAccountId_(odoo, partnerId) {
+  const rows = _odooJsonRpc_(odoo.url, {
+    service: 'object',
+    method: 'execute_kw',
+    args: [
+      odoo.db, odoo.uid, odoo.apiKey,
+      'res.partner',
+      'read',
+      [[Number(partnerId)]],
+      { fields: ['property_account_payable_id'] }
+    ]
+  });
+
+  const p = (rows && rows[0]) ? rows[0] : null;
+  const pa = p && p.property_account_payable_id;
+
+  // property_account_payable_id is usually [id, name]
+  if (Array.isArray(pa) && pa.length) return Number(pa[0]);
+
+  throw new Error('Partner has no property_account_payable_id (payable account). PartnerId=' + partnerId);
+}
+
+// Resolve analytic account_id from exact analytic account name (NO auto-create, no guessing)
+function _odooGetAnalyticAccountIdByName_(odoo, analyticName) {
+  const name = String(analyticName || '').trim();
+  if (!name) throw new Error('Missing analytic account name for Odoo analytic lookup.');
+
+  const cache = loadOdooIdCache_();
+  if (cache.analytics && cache.analytics[name]) return Number(cache.analytics[name]);
+
+  // account.analytic.account name must match EXACTLY (strict)
+  const rows = _odooSearchRead_(
+    odoo,
+    'account.analytic.account',
+    [['name', '=', name]],
+    ['id', 'name'],
+    2
+  );
+
+  if (!rows || !rows.length) throw new Error('Odoo analytic account not found (exact name match): ' + name);
+  if (rows.length > 1) throw new Error('Odoo analytic account name not unique (exact match returns multiple): ' + name);
+
+  const id = Number(rows[0].id);
+  cache.analytics[name] = id;
+  saveOdooIdCache_(cache);
+  return id;
+}
+
+/**
+ * Build analytic_distribution payload from DIM1/DIM2.
+ * STRICT rule (no guessing):
+ * - If both are present => throw (you must choose one tracking column for analytic account)
+ * - If one is present => 100% to that analytic account
+ * - If neither => null
+ */
+function _odooBuildAnalyticDistributionFromDims_(odoo, dim1, dim2) {
+  const splitNames = (s) => {
+    return String(s || '')
+      .split(/[\n|,;]+/g)          // allow newline, | , ;
+      .map(x => String(x || '').trim())
+      .filter(Boolean);
+  };
+
+  const names = [...new Set([ ...splitNames(dim1), ...splitNames(dim2) ])];
+  if (!names.length) return null;
+
+  // Resolve IDs (strict exact match), then de-dupe IDs too
+  const ids = [];
+  const seenIds = new Set();
+
+  names.forEach(name => {
+    const id = _odooGetAnalyticAccountIdByName_(odoo, name); // strict exact name match
+    const k = String(Number(id));
+    if (!seenIds.has(k)) {
+      seenIds.add(k);
+      ids.push(Number(id));
+    }
+  });
+
+  const n = ids.length;
+  if (!n) return null;
+
+  // Even split across N, keep total exactly 100 by adjusting last
+  const base = Math.floor((100 / n) * 100) / 100; // 2-decimal floor (prevents >100 total)
+  let used = 0;
+
+  const dist = {};
+  ids.forEach((id, i) => {
+    const pct = (i === n - 1) ? _round2_(100 - used) : base;
+    dist[String(id)] = pct;
+    used = _round2_(used + pct);
+  });
+
+  return dist;
+}
+
+
+
+
+// Resolve journal_id by type (general for journal entry, purchase for vendor bill)
+// If multiple journals exist for that type, require a hint saved via saveOdooJournalHints_()
+function _odooGetJournalId_(odoo, kind) {
+  const k = String(kind || '').toUpperCase(); // 'JOURNAL' or 'BILL'
+  const journalType = (k === 'BILL') ? 'purchase' : 'general';
+
+  // cache
+  const cache = loadOdooIdCache_();
+  if (cache.journals && cache.journals[journalType]) return Number(cache.journals[journalType]);
+
+  // hints
+  const hints = loadOdooJournalHints_();
+  const hintedId = (journalType === 'purchase') ? hints.purchaseJournalId : hints.generalJournalId;
+  if (hintedId) {
+    cache.journals[journalType] = Number(hintedId);
+    saveOdooIdCache_(cache);
+    return Number(hintedId);
+  }
+
+  // search journals (company-safe)
+  const dom = [['type', '=', journalType]];
+  if (odoo.companyId) dom.push(['company_id', '=', Number(odoo.companyId)]);
+
+  const rows = _odooSearchRead_(
+    odoo,
+    'account.journal',
+    dom,
+    ['id', 'code', 'name', 'type', 'company_id'],
+    200
+  ) || [];
+
+  if (!rows.length) return null;
+
+  // ✅ If exactly one, use it (and cache)
+  if (rows.length === 1) {
+    const id = Number(rows[0].id);
+    cache.journals[journalType] = id;
+    saveOdooIdCache_(cache);
+    return id;
+  }
+
+  // ✅ Multiple journals: DO NOT THROW, force UI choice
+  return null;
+}
+
+/**
+ * Central helper: open the Masterfile sheet using settings.
+ * - Uses SOURCE_SS_ID (ID or full link) if provided
+ * - Falls back to active spreadsheet if not
+ * Returns { cfg, ss, sheet }.
+ */
+function _openMasterfile_() {
+  const cfg = _getSettings_();
+  const masterSheetName = cfg.MASTER_SHEET_NAME || 'Masterfile Import';
+  const sourceRaw = cfg.SOURCE_SS_ID || '';
+
+  let ss;
+  if (sourceRaw) {
+    const m = String(sourceRaw).match(/[-\w]{25,}/);
+    if (!m) throw new Error('Could not extract spreadsheet ID from SOURCE_SS_ID: ' + sourceRaw);
+    ss = SpreadsheetApp.openById(m[0]);
+  } else {
+    ss = SpreadsheetApp.getActive();
+  }
+
+  const sheet = ss.getSheetByName(masterSheetName);
+  if (!sheet) {
+    throw new Error(
+      'Masterfile sheet "' + masterSheetName +
+      '" not found in spreadsheet "' + ss.getName() + '".'
+    );
+  }
+  return { cfg, ss, sheet };
+}
+
+// =====================
+// COA STORAGE & ACCESS
+// =====================
+
+function loadCoa() {
+  const raw = PropertiesService.getDocumentProperties().getProperty(KEY_COA_JSON);
+  if (!raw) return [];
+  try {
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    Logger.log('loadCoa: ' + e);
+    return [];
+  }
+}
+
+function saveCoa(coaArray) {
+  if (!Array.isArray(coaArray)) throw new Error('COA must be an array.');
+  const cleaned = coaArray
+    .map(r => ({
+      code: String(r.code || '').trim(),
+      name: String(r.name || '').trim(),
+      type: String(r.type || '').trim()
+    }))
+    .filter(r => r.code);
+
+  PropertiesService.getDocumentProperties().setProperty(KEY_COA_JSON, JSON.stringify(cleaned));
+  return { success: true, count: cleaned.length };
+}
+
+/**
+ * Helper for dropdowns: returns COA plus label.
+ */
+function getCoaAccounts() {
+  return loadCoa().map(a => ({
+    code: a.code,
+    name: a.name,
+    type: a.type || '',
+    label: a.name ? (a.code + ' — ' + a.name) : a.code
+  }));
+}
+
+// =====================
+// ACCOUNTING API — COA SYNC
+// =====================
+
+function syncCoaFromAccountingSystem(options) {
+  options = options || {};
+  const cfg = _getSettings_();
+
+  const provider = String(options.provider || cfg.ACC_PROVIDER || '').toUpperCase();
+  if (!provider) throw new Error('ACC_PROVIDER is not set in Settings Center.');
+
+  let coa = [];
+  if (provider === 'XERO') {
+    coa = _fetchXeroCoa_(cfg);
+  } else if (provider === 'ODOO') {
+    coa = _fetchOdooCoa_(cfg);
+  } else {
+    throw new Error('Unsupported provider: ' + provider);
+  }
+
+  const res = saveCoa(coa);
+  return { success: true, provider: provider, count: res.count || coa.length };
+}
+
+function _fetchXeroCoa_(cfg) {
+  const tenantId = String(cfg.XERO_TENANT_ID || '').trim();
+  const token    = String(cfg.XERO_ACCESS_TOKEN || '').trim();
+  if (!tenantId || !token) throw new Error('Missing XERO_TENANT_ID / XERO_ACCESS_TOKEN in Settings Center.');
+
+  const url = 'https://api.xero.com/api.xro/2.0/Accounts';
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'get',
+    muteHttpExceptions: true,
+    headers: {
+      Authorization: 'Bearer ' + token,
+      'xero-tenant-id': tenantId,
+      Accept: 'application/json'
+    }
+  });
+
+  const code = resp.getResponseCode();
+  const body = resp.getContentText();
+  if (code < 200 || code >= 300) {
+    throw new Error('Xero Accounts error ' + code + ': ' + body);
+  }
+
+  const json = JSON.parse(body || '{}');
+  const accounts = json.Accounts || [];
+  return accounts
+    .map(a => ({
+      code: String(a.Code || '').trim(),
+      name: String(a.Name || '').trim(),
+      type: String(a.Type || '').trim()
+    }))
+    .filter(a => a.code);
+}
+
+function _fetchOdooCoa_(cfg) {
+  const baseUrl = String(cfg.ODOO_BASE_URL || '').replace(/\/+$/, '');
+  const db      = String(cfg.ODOO_DB || '').trim();
+  const user    = String(cfg.ODOO_USERNAME || '').trim();
+  const apiKey  = String(cfg.ODOO_API_KEY || '').trim();
+  if (!baseUrl || !db || !user || !apiKey) {
+    throw new Error('Missing ODOO_BASE_URL / ODOO_DB / ODOO_USERNAME / ODOO_API_KEY in Settings Center.');
+  }
+
+  const url = baseUrl + '/jsonrpc';
+
+  // authenticate
+  const uid = _odooJsonRpcCoa_(url, {
+    service: 'common',
+    method: 'authenticate',
+    args: [db, user, apiKey, {}]
+  });
+  if (!uid) throw new Error('Odoo authenticate failed. Check DB/username/API key.');
+
+  // ✅ determine companyId (saved selection wins)
+  let companyId = cfg.ODOO_COMPANY_ID ? Number(cfg.ODOO_COMPANY_ID) : null;
+  if (!companyId) {
+    const u = _odooJsonRpcCoa_(url, {
+      service: 'object',
+      method: 'execute_kw',
+      args: [
+        db, uid, apiKey,
+        'res.users',
+        'read',
+        [[uid], ['company_id']]
+      ]
+    });
+
+    const row = (Array.isArray(u) && u[0]) ? u[0] : null;
+    if (row && row.company_id && Array.isArray(row.company_id) && row.company_id.length) {
+      companyId = Number(row.company_id[0]) || null;
+    }
+  }
+
+  const ctx = _odooBuildContext_(companyId);
+
+  // fetch accounts (company-aware)
+  const rows = _odooJsonRpcCoa_(url, {
+    service: 'object',
+    method: 'execute_kw',
+    args: [
+      db, uid, apiKey,
+      'account.account',
+      'search_read',
+      [[]],
+      { fields: ['code', 'name'], limit: 100000, context: ctx }
+    ]
+  });
+
+  const list = Array.isArray(rows) ? rows : [];
+  return list
+    .map(r => ({
+      code: String(r.code || '').trim(),
+      name: String(r.name || '').trim(),
+      type: ''
+    }))
+    .filter(a => a.code);
+}
+
+
+function _odooJsonRpcCoa_(url, call) {
+
+  const payload = {
+    jsonrpc: '2.0',
+    method: 'call',
+    params: call,
+    id: String(new Date().getTime())
+  };
+
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    muteHttpExceptions: true,
+    payload: JSON.stringify(payload)
+  });
+
+  const code = resp.getResponseCode();
+  const body = resp.getContentText();
+  const json = JSON.parse(body || '{}');
+
+  if (code < 200 || code >= 300) {
+    throw new Error('Odoo JSON-RPC HTTP ' + code + ': ' + body);
+  }
+  if (json.error) {
+    throw new Error('Odoo JSON-RPC error: ' + JSON.stringify(json.error));
+  }
+  return json.result;
+}
+
+function syncHeaderMapNamesFromCoa() {
+  const coa = getCoaAccounts();
+  const byCode = {};
+  coa.forEach(a => { if (a && a.code) byCode[String(a.code).trim()] = String(a.name || '').trim(); });
+
+  const map = loadHeaderMap();
+  if (!map.length) return { success: true, updated: 0, message: 'No header map to sync.' };
+
+  let updated = 0;
+
+  map.forEach(m => {
+    if (!m) return;
+
+    updated += _syncName_(m, 'empCostAccountCode', 'empCostAccountName', byCode);
+    updated += _syncName_(m, 'empOpexAccountCode', 'empOpexAccountName', byCode);
+    updated += _syncName_(m, 'conCostAccountCode', 'conCostAccountName', byCode);
+    updated += _syncName_(m, 'conOpexAccountCode', 'conOpexAccountName', byCode);
+  });
+
+  saveHeaderMap(map);
+  return { success: true, updated: updated };
+}
+
+function _syncName_(obj, codeKey, nameKey, byCode) {
+  const code = String(obj[codeKey] || '').trim();
+  if (!code) return 0;
+
+  const name = byCode[code];
+  if (!name) return 0;
+
+  if (String(obj[nameKey] || '').trim() === name) return 0;
+  obj[nameKey] = name;
+  return 1;
+}
+
+
+// =====================
+// HEADER→ACCOUNT MAP STORAGE (2×2 + Tracking)
+// =====================
+
+function loadHeaderMap() {
+  const raw = PropertiesService.getDocumentProperties().getProperty(KEY_HEADER_MAP_JSON);
+  if (!raw) return [];
+  try {
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    Logger.log('loadHeaderMap: ' + e);
+    return [];
+  }
+}
+
+/**
+ * Save 2×2 mapping schema.
+ * - lineType: POSITIVE | NEGATIVE
+ * - dimension1/2 stored as UPPERCASE header key or "NONE"
+ */
+function saveHeaderMap(mapArray, opts) {
+  if (!Array.isArray(mapArray)) throw new Error('Header map must be an array.');
+  opts = opts || {};
+
+  const replaceAll = opts.replaceAll === true;
+
+  // Load existing saved map unless explicitly replacing everything
+  const existing = replaceAll ? [] : (loadHeaderMap() || []);
+
+  // 1) Clean incoming rows (same schema as before)
+  const incomingClean = mapArray.map(row => {
+    let lt = _norm_(row.lineType || 'POSITIVE');
+    if (lt !== 'NEGATIVE') lt = 'POSITIVE';
+
+    const d1 = _norm_(row.dimension1 || 'NONE') || 'NONE';
+    const d2 = _norm_(row.dimension2 || 'NONE') || 'NONE';
+
+    return {
+      header: String(row.header || '').trim(),
+      include: row.include === true,
+      lineType: lt,
+
+      empCostAccountCode: String(row.empCostAccountCode || '').trim(),
+      empCostAccountName: String(row.empCostAccountName || '').trim(),
+      empOpexAccountCode: String(row.empOpexAccountCode || '').trim(),
+      empOpexAccountName: String(row.empOpexAccountName || '').trim(),
+
+      conCostAccountCode: String(row.conCostAccountCode || '').trim(),
+      conCostAccountName: String(row.conCostAccountName || '').trim(),
+      conOpexAccountCode: String(row.conOpexAccountCode || '').trim(),
+      conOpexAccountName: String(row.conOpexAccountName || '').trim(),
+
+      dimension1: d1 === 'NONE' ? 'NONE' : d1,
+      dimension2: d2 === 'NONE' ? 'NONE' : d2
+    };
+  }).filter(r => r.header); // ignore blank headers
+
+  // 2) Build a lookup of "final rows" keyed by header
+  const byHeader = Object.create(null);
+
+  // Start with existing
+  existing.forEach(r => {
+    const h = String(r && r.header ? r.header : '').trim();
+    if (!h) return;
+    byHeader[h] = r;
+  });
+
+  // Overlay incoming (updates existing headers, adds new headers)
+  incomingClean.forEach(r => {
+    byHeader[r.header] = r;
+  });
+
+  // 3) Preserve original ordering:
+  //    - keep existing order, but with updated rows
+  //    - then append truly new headers from incoming
+  const merged = [];
+  const seen = new Set();
+
+  existing.forEach(r => {
+    const h = String(r && r.header ? r.header : '').trim();
+    if (!h) return;
+    if (byHeader[h] && !seen.has(h)) {
+      merged.push(byHeader[h]);
+      seen.add(h);
+    }
+  });
+
+  incomingClean.forEach(r => {
+    const h = r.header;
+    if (!seen.has(h)) {
+      merged.push(r);
+      seen.add(h);
+    }
+  });
+
+  PropertiesService.getDocumentProperties().setProperty(KEY_HEADER_MAP_JSON, JSON.stringify(merged));
+  return { success: true, count: merged.length, incoming: incomingClean.length, preserved: existing.length };
+}
+
+
+// =====================
+// BANK MAP STORAGE
+// =====================
+
+function loadBankMap() {
+  const raw = PropertiesService.getDocumentProperties().getProperty(KEY_BANK_MAP_JSON);
+  if (!raw) return [];
+  try {
+    const list = JSON.parse(raw);
+    return Array.isArray(list) ? list : [];
+  } catch (e) {
+    Logger.log('loadBankMap: ' + e);
+    return [];
+  }
+}
+
+function saveBankMap(bankArray) {
+  if (!Array.isArray(bankArray)) throw new Error('Bank map must be an array.');
+
+  const cleaned = bankArray
+    .map(row => ({
+      bankKey: String(row.bankKey || '').trim(),
+      accountCode: String(row.accountCode || '').trim()
+    }))
+    .filter(r => r.accountCode); // require account code, bankKey may be "__DEFAULT__"
+
+  PropertiesService.getDocumentProperties().setProperty(KEY_BANK_MAP_JSON, JSON.stringify(cleaned));
+  return { success: true, count: cleaned.length };
+}
+
+// =====================
+// Schema migration (legacy -> V2)
+// =====================
+
+function migrateHeaderMapSchemaV2_() {
+  const raw = PropertiesService.getDocumentProperties().getProperty(KEY_HEADER_MAP_JSON);
+  if (!raw) return { success: true, migrated: 0, message: 'No existing header map.' };
+
+  let list;
+  try { list = JSON.parse(raw); } catch (e) { throw new Error('Header map JSON invalid: ' + e); }
+  if (!Array.isArray(list) || !list.length) return { success: true, migrated: 0, message: 'Empty header map.' };
+
+  let migrated = 0;
+
+  const out = list.map(m => {
+    // Already new schema?
+    if (m && (m.empOpexAccountCode !== undefined || m.conOpexAccountCode !== undefined)) {
+      // Normalize tracking fields just in case
+      const d1 = _norm_(m.dimension1 || 'NONE') || 'NONE';
+      const d2 = _norm_(m.dimension2 || 'NONE') || 'NONE';
+      m.dimension1 = d1 === 'NONE' ? 'NONE' : d1;
+      m.dimension2 = d2 === 'NONE' ? 'NONE' : d2;
+      m.lineType = _norm_(m.lineType || 'POSITIVE') === 'NEGATIVE' ? 'NEGATIVE' : 'POSITIVE';
+      return m;
+    }
+
+    // Old schema fields:
+    // accountCode/accountName, freelanceAccountCode/name, costAccountCode/name, opexAccountCode/name
+    const accountCode = String(m.accountCode || '').trim();
+    const accountName = String(m.accountName || '').trim();
+    const freeCode    = String(m.freelanceAccountCode || '').trim();
+    const freeName    = String(m.freelanceAccountName || '').trim();
+    const costCode    = String(m.costAccountCode || '').trim();
+    const costName    = String(m.costAccountName || '').trim();
+    const opexCode    = String(m.opexAccountCode || '').trim();
+    const opexName    = String(m.opexAccountName || '').trim();
+
+    migrated++;
+
+    return {
+      header: String(m.header || '').trim(),
+      include: m.include === true,
+      lineType: _norm_(m.lineType || 'POSITIVE') === 'NEGATIVE' ? 'NEGATIVE' : 'POSITIVE',
+
+      empCostAccountCode: costCode,
+      empCostAccountName: costName,
+      empOpexAccountCode: opexCode || accountCode,
+      empOpexAccountName: opexName || accountName,
+
+      conCostAccountCode: costCode,
+      conCostAccountName: costName,
+      conOpexAccountCode: freeCode,
+      conOpexAccountName: freeName,
+
+      dimension1: _norm_(m.dimension1 || 'NONE') || 'NONE',
+      dimension2: _norm_(m.dimension2 || 'NONE') || 'NONE'
+    };
+  });
+
+  PropertiesService.getDocumentProperties().setProperty(KEY_HEADER_MAP_JSON, JSON.stringify(out));
+  return { success: true, migrated: migrated, message: 'Migration applied.' };
+}
+
+// =====================
+// POSTED SHEETS + HEADER MERGE
+// =====================
+
+/**
+ * Returns sheet names whose names end with "(posted)".
+ */
+function getPostedPayrollSheets() {
+  const ss = SpreadsheetApp.getActive();
+  return ss.getSheets()
+    .map(s => s.getName())
+    .filter(name => /\(posted\)\s*$/i.test(name));
+}
+
+/**
+ * Returns header mapping rows for a given posted sheet:
+ * - Only numeric columns
+ * - Excludes NET PAY, TAXABLE INCOME, GROSS PAY
+ * - Merges with previously saved header map (case-insensitive header match)
+ */
+function getHeaderMapForSheet(sheetName) {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(sheetName);
+  if (!sheet) throw new Error('Sheet not found: ' + sheetName);
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastCol < 1) return [];
+
+  const headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0]
+    .map(h => String(h || '').trim());
+
+  let data = [];
+  if (lastRow > 1) data = sheet.getRange(2, 1, lastRow - 1, lastCol).getValues();
+
+  const isNumericCol = headers.map((_, colIdx) =>
+    data.some(row => typeof row[colIdx] === 'number' && !isNaN(row[colIdx]))
+  );
+
+  // Existing map keyed by normalized header (case-insensitive)
+  const existingMap = loadHeaderMap();
+  const byHeaderNorm = {};
+  existingMap.forEach(m => {
+    const key = _norm_(m && m.header);
+    if (key) byHeaderNorm[key] = m;
+  });
+
+  const merged = headers
+    .map((header, idx) => ({ header, idx }))
+    .filter(col => isNumericCol[col.idx])
+    .filter(col => {
+      const h = _norm_(col.header);
+      return h !== 'NET PAY' && h !== 'TAXABLE INCOME' && h !== 'GROSS PAY';
+    })
+    .map(col => {
+      const header = col.header;
+      const key = _norm_(header);
+      const existing = byHeaderNorm[key];
+
+      if (existing) {
+        // Ensure header shown matches current posted sheet header text
+        return {
+          header: header,
+          include: existing.include === true,
+          lineType: _norm_(existing.lineType || 'POSITIVE') === 'NEGATIVE' ? 'NEGATIVE' : 'POSITIVE',
+
+          empCostAccountCode: String(existing.empCostAccountCode || '').trim(),
+          empCostAccountName: String(existing.empCostAccountName || '').trim(),
+          empOpexAccountCode: String(existing.empOpexAccountCode || '').trim(),
+          empOpexAccountName: String(existing.empOpexAccountName || '').trim(),
+
+          conCostAccountCode: String(existing.conCostAccountCode || '').trim(),
+          conCostAccountName: String(existing.conCostAccountName || '').trim(),
+          conOpexAccountCode: String(existing.conOpexAccountCode || '').trim(),
+          conOpexAccountName: String(existing.conOpexAccountName || '').trim(),
+
+          dimension1: _norm_(existing.dimension1 || 'NONE') || 'NONE',
+          dimension2: _norm_(existing.dimension2 || 'NONE') || 'NONE'
+        };
+      }
+
+      // NEW DEFAULT STRUCTURE
+      return {
+        header: header,
+        include: false,
+        lineType: 'POSITIVE',
+
+        empCostAccountCode: '',
+        empCostAccountName: '',
+        empOpexAccountCode: '',
+        empOpexAccountName: '',
+
+        conCostAccountCode: '',
+        conCostAccountName: '',
+        conOpexAccountCode: '',
+        conOpexAccountName: '',
+
+        dimension1: 'NONE',
+        dimension2: 'NONE'
+      };
+    });
+
+  return merged;
+}
+
+// =====================
+// MASTERFILE & EMPLOYEE HELPERS
+// =====================
+
+/**
+ * EMPLOYEE ID → DISBURSING BANK map, from Masterfile.
+ */
+function buildEmployeeBankIndex_() {
+  let mf;
+  try { mf = _openMasterfile_(); } catch (e) { Logger.log('buildEmployeeBankIndex_: ' + e); return {}; }
+
+  const values = mf.sheet.getDataRange().getValues();
+  if (values.length < 2) return {};
+
+  const headersUp = values[0].map(h => _norm_(h));
+  const idxEmp  = headersUp.indexOf('EMPLOYEE ID');
+  const idxBank = headersUp.indexOf('DISBURSING BANK');
+  if (idxEmp === -1 || idxBank === -1) {
+    Logger.log('buildEmployeeBankIndex_: EMPLOYEE ID or DISBURSING BANK not found in ' + mf.sheet.getName());
+    return {};
+  }
+
+  const map = {};
+  for (let i = 1; i < values.length; i++) {
+    const row   = values[i];
+    const empId = String(row[idxEmp] || '').trim();
+    const bank  = String(row[idxBank] || '').trim();
+    if (!empId) continue;
+    // store blank bank as '' (caller handles default)
+    map[empId] = bank;
+  }
+  return map;
+}
+
+/**
+ * EMPLOYEE ID → CONTRACT TYPE map from Masterfile.
+ * We IGNORE STATUS and rely solely on CONTRACT TYPE.
+ */
+function buildEmployeeStatusIndex_() {
+  let mf;
+  try { mf = _openMasterfile_(); } catch (e) { Logger.log('buildEmployeeStatusIndex_: ' + e); return {}; }
+
+  const values = mf.sheet.getDataRange().getValues();
+  if (values.length < 2) return {};
+
+  const headersUp = values[0].map(h => _norm_(h));
+  const idxEmp      = headersUp.indexOf('EMPLOYEE ID');
+  const idxContract = headersUp.indexOf('CONTRACT TYPE');
+  if (idxEmp === -1 || idxContract === -1) {
+    Logger.log('buildEmployeeStatusIndex_: EMPLOYEE ID or CONTRACT TYPE not found in ' + mf.sheet.getName());
+    return {};
+  }
+
+  const map = {};
+  for (let i = 1; i < values.length; i++) {
+    const row   = values[i];
+    const empId = String(row[idxEmp] || '').trim();
+    if (!empId) continue;
+    map[empId] = String(row[idxContract] || '').trim();
+  }
+  return map;
+}
+
+/**
+ * EMPLOYEE ID → ALLOCATION map from Masterfile.
+ * If ALLOCATION missing, returns {} and resolver defaults to OPEX.
+ */
+function buildEmployeeAllocationIndex_() {
+  let mf;
+  try { mf = _openMasterfile_(); } catch (e) { Logger.log('buildEmployeeAllocationIndex_: ' + e); return {}; }
+
+  const values = mf.sheet.getDataRange().getValues();
+  if (values.length < 2) return {};
+
+  const headersUp = values[0].map(h => _norm_(h));
+  const idxEmp   = headersUp.indexOf('EMPLOYEE ID');
+  const idxAlloc = headersUp.indexOf('ALLOCATION');
+
+  if (idxEmp === -1) {
+    Logger.log('buildEmployeeAllocationIndex_: EMPLOYEE ID not found in ' + mf.sheet.getName());
+    return {};
+  }
+  if (idxAlloc === -1) {
+    Logger.log('buildEmployeeAllocationIndex_: ALLOCATION not found in ' + mf.sheet.getName() + ' (defaulting to OPEX).');
+    return {};
+  }
+
+  const map = {};
+  for (let i = 1; i < values.length; i++) {
+    const row   = values[i];
+    const empId = String(row[idxEmp] || '').trim();
+    if (!empId) continue;
+    map[empId] = String(row[idxAlloc] || '').trim();
+  }
+  return map;
+}
+
+/**
+ * EMPLOYEE ID → Masterfile row values keyed by UPPERCASE header
+ * Used for Tracking dimension value fallback when posted payroll lacks the column.
+ */
+function buildEmployeeDimensionIndex_() {
+  let mf;
+  try { mf = _openMasterfile_(); } catch (e) { Logger.log('buildEmployeeDimensionIndex_: ' + e); return {}; }
+
+  const values = mf.sheet.getDataRange().getValues();
+  if (values.length < 2) return {};
+
+  const headers = values[0].map(h => String(h || '').trim());
+  const headersUp = headers.map(h => _norm_(h));
+  const idxEmp = headersUp.indexOf('EMPLOYEE ID');
+  if (idxEmp === -1) {
+    Logger.log('buildEmployeeDimensionIndex_: EMPLOYEE ID not found in ' + mf.sheet.getName());
+    return {};
+  }
+
+  const out = {};
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i];
+    const empId = String(row[idxEmp] || '').trim();
+    if (!empId) continue;
+
+    const rec = {};
+    for (let c = 0; c < headersUp.length; c++) {
+      const key = headersUp[c];
+      if (!key) continue;
+      rec[key] = row[c];
+    }
+    out[empId] = rec;
+  }
+  return out;
+}
+
+/**
+ * Distinct DISBURSING BANK values from Masterfile (for Bank Mapping UI).
+ */
+function getDistinctBanksFromMasterfile() {
+  let mf;
+  try { mf = _openMasterfile_(); } catch (e) { Logger.log('getDistinctBanksFromMasterfile: ' + e); return []; }
+
+  const values = mf.sheet.getDataRange().getValues();
+  if (values.length < 2) return [];
+
+  const headersUp = values[0].map(h => _norm_(h));
+  const idxBank = headersUp.indexOf('DISBURSING BANK');
+  if (idxBank === -1) {
+    Logger.log('getDistinctBanksFromMasterfile: DISBURSING BANK column not found in ' + mf.sheet.getName());
+    return [];
+  }
+
+  const set = {};
+  for (let i = 1; i < values.length; i++) {
+    const bank = String(values[i][idxBank] || '').trim();
+    if (bank) set[bank] = true;
+  }
+  return Object.keys(set).sort();
+}
+
+/**
+ * For Bank Mapping dialog: returns banks, existing mapping, and COA.
+ */
+function getBankMappingInitData() {
+  const coa     = getCoaAccounts() || [];
+  const banks   = getDistinctBanksFromMasterfile() || [];
+  const bankMap = loadBankMap() || [];
+
+  if (!banks.includes('__DEFAULT__')) banks.unshift('__DEFAULT__');
+
+  Logger.log('Bank mapping init – COA: ' + coa.length +
+            ', Banks: ' + banks.length +
+            ', BankMap: ' + bankMap.length);
+
+  return { banks, bankMap, coa };
+}
+
+/**
+ * Returns dimension options based on Masterfile headers.
+ * - Returns ["NONE", "<HEADER1>", "<HEADER2>", ...] ALL UPPERCASE
+ *   (This matches how saveHeaderMap stores dimension1/2.)
+ */
+function getDimensionOptions() {
+  try {
+    const mf = _openMasterfile_();
+
+    const lastCol = mf.sheet.getLastColumn();
+    if (lastCol < 1) return ['NONE'];
+
+    const headers = mf.sheet
+      .getRange(1, 1, 1, lastCol)
+      .getValues()[0]
+      .map(h => _norm_(h))
+      .filter(h => h);
+
+    const seen = {};
+    const out = ['NONE'];
+    headers.forEach(h => {
+      if (!seen[h]) { seen[h] = true; out.push(h); }
+    });
+
+    return out;
+  } catch (e) {
+    Logger.log('getDimensionOptions failed: ' + e);
+    return ['NONE']; // ✅ DO NOT BLOCK UI
+  }
+}
+
+
+function debugBankMapping() {
+  const data = getBankMappingInitData();
+  Logger.log(JSON.stringify(data, null, 2));
+  return data;
+}
+
+// =====================
+// 2×2 account resolver
+// =====================
+
+function _resolveMappedAccount_(mapping, contractTypeRaw, allocationRaw) {
+  const isConsultant = _isConsultantContract_(contractTypeRaw);
+
+  const alloc = _norm_(allocationRaw);
+  const allocBucket = (alloc === 'COST') ? 'COST' : 'OPEX';
+
+  let code = '';
+  let name = '';
+
+  if (!isConsultant && allocBucket === 'COST') {
+    code = String(mapping.empCostAccountCode || '').trim();
+    name = String(mapping.empCostAccountName || '').trim();
+  } else if (!isConsultant && allocBucket === 'OPEX') {
+    code = String(mapping.empOpexAccountCode || '').trim();
+    name = String(mapping.empOpexAccountName || '').trim();
+  } else if (isConsultant && allocBucket === 'COST') {
+    code = String(mapping.conCostAccountCode || '').trim();
+    name = String(mapping.conCostAccountName || '').trim();
+  } else {
+    code = String(mapping.conOpexAccountCode || '').trim();
+    name = String(mapping.conOpexAccountName || '').trim();
+  }
+
+  return { code, name, isConsultant, allocBucket };
+}
+
+
+// =====================
+// JOURNAL GENERATION
+// =====================
+
+/**
+ * Generates summarized journal from a posted payroll sheet.
+ *
+ * Dimensions (DIM1/DIM2):
+ * - mapping.dimension1/2 store a header key (UPPERCASE) or "NONE"
+ * - value resolution:
+ *     1) from posted payroll row if that column exists
+ *     2) else from Masterfile row (matched by EMPLOYEE ID)
+ *
+ * options = { sheetName: string }
+ */
+function generateJournalFromPayroll(options) {
+  if (!options || !options.sheetName) throw new Error('Missing sheetName in options.');
+
+// Map ER headers to the EE header whose LIABILITY account we want to bump
+// (Use normalized keys to be robust to casing)
+const ER_TO_EE_LIAB = {};
+
+// --- SSS (split MC/MPF) ---
+ER_TO_EE_LIAB[_norm_('SSS ER MC')]  = _norm_('SSS EE MC');
+ER_TO_EE_LIAB[_norm_('SSS ER MPF')] = _norm_('SSS EE MPF');
+
+// EC has no EE equivalent; mirror it to the SAME liability account you use for SSS EE MC
+ER_TO_EE_LIAB[_norm_('SSS EC')]     = _norm_('SSS EE MC');
+
+// (optional backward compat if some sheets still use these headers)
+ER_TO_EE_LIAB[_norm_('SSS ER')]     = _norm_('SSS EE');
+
+// --- PhilHealth / Pag-IBIG ---
+ER_TO_EE_LIAB[_norm_('PHILHEALTH ER')] = _norm_('PHILHEALTH EE');
+ER_TO_EE_LIAB[_norm_('PAG-IBIG ER')]   = _norm_('PAG-IBIG EE');
+
+
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(options.sheetName);
+  if (!sheet) throw new Error('Source sheet not found: ' + options.sheetName);
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) throw new Error('No data rows found in source sheet.');
+
+  const headers = values[0].map(h => String(h || '').trim());
+  const headersUp = headers.map(h => _norm_(h));
+  const rows = values.slice(1);
+
+  // Header name -> column index (posted payroll)
+  const headerIndexByName = {};
+  headersUp.forEach((h, idx) => {
+    if (h && headerIndexByName[h] === undefined) headerIndexByName[h] = idx;
+  });
+
+  // Load header map and key it by normalized header
+  const headerMap = loadHeaderMap();
+  if (!headerMap.length) throw new Error('No header map configured yet. Please configure and save first.');
+
+  const mapByHeaderNorm = {};
+  headerMap.forEach(m => {
+    const k = _norm_(m && m.header);
+    if (!k) return;
+
+    // Normalize mapping fields defensively
+    const mm = Object.assign({}, m);
+    mm.include = mm.include === true;
+    mm.lineType = _norm_(mm.lineType || 'POSITIVE') === 'NEGATIVE' ? 'NEGATIVE' : 'POSITIVE';
+    mm.dimension1 = _norm_(mm.dimension1 || 'NONE') || 'NONE';
+    mm.dimension2 = _norm_(mm.dimension2 || 'NONE') || 'NONE';
+
+    mapByHeaderNorm[k] = mm;
+  });
+
+  // Important indices (robust to casing)
+  const idxEntity  = headersUp.indexOf('ENTITY');
+  const idxClient  = (headersUp.indexOf('CLIENTS') >= 0)
+  ? headersUp.indexOf('CLIENTS')
+  : headersUp.indexOf('CLIENT');
+
+  const idxEmpId   = headersUp.indexOf('EMPLOYEE ID');
+  const idxEmpName = headersUp.indexOf('EMPLOYEE NAME');
+  const idxPeriod  = headersUp.indexOf('PERIOD');
+  const idxNetPay  = headersUp.indexOf('NET PAY');
+
+  if (idxEmpId < 0) throw new Error('Posted payroll sheet missing EMPLOYEE ID column: ' + options.sheetName);
+
+  // Masterfile indices
+  const statusIndex     = buildEmployeeStatusIndex_();      // empId -> contract type
+  const allocationIndex = buildEmployeeAllocationIndex_();  // empId -> allocation
+  const dimIndexByEmpId = buildEmployeeDimensionIndex_();   // empId -> masterfile row dict
+
+  /**
+   * Resolve a dimension value by header key (UPPERCASE):
+   *  1) Posted payroll row if column exists
+   *  2) Masterfile row by EMPLOYEE ID
+   */
+  function resolveDimensionValue(dimKeyUpper, payrollRow, empId) {
+  const dk = _norm_(dimKeyUpper);
+  if (!dk || dk === 'NONE') return '';
+
+  const empKey = String(empId || '').trim();
+
+  // ✅ 1) MASTERFILE first (priority)
+  const mfRow = dimIndexByEmpId[empKey];
+  if (mfRow && mfRow[dk] !== undefined && mfRow[dk] !== null && mfRow[dk] !== '') {
+    return _safeStr_(mfRow[dk]);
+  }
+
+  // ✅ 2) then POSTED PAYROLL fallback
+  const colIdx = headerIndexByName[dk];
+  if (colIdx !== undefined && colIdx >= 0) {
+    const v = payrollRow[colIdx];
+    if (v !== null && v !== '') return _safeStr_(v);
+  }
+
+  return '';
+}
+
+
+  const journal = {}; // key -> aggregated line
+
+  // 1) Header-mapped lines (numeric headers excluding NET PAY)
+  rows.forEach(row => {
+    const empId   = String(row[idxEmpId] || '').trim();
+    const empName = idxEmpName >= 0 ? String(row[idxEmpName] || '').trim() : '';
+    if (!empId) return;
+    if (_rowIsTotal_(empId, empName)) return;
+
+    const entity = idxEntity >= 0 ? String(row[idxEntity] || '').trim() : '';
+    const client = idxClient >= 0 ? String(row[idxClient] || '').trim() : '';
+    const period = idxPeriod >= 0 ? String(row[idxPeriod] || '').trim() : '';
+
+    const contractTypeRaw = statusIndex[empId] || '';
+
+        const isConsultant = _isConsultantContract_(contractTypeRaw);
+    const empLabel = (empName && String(empName).trim()) ? String(empName).trim() : empId; // label fallback
+
+    const allocationRaw   = allocationIndex[empId] || '';
+
+    // iterate posted payroll headers
+    headers.forEach((header, colIdx) => {
+      const hKey = headersUp[colIdx];
+      if (!hKey) return;
+
+      if (hKey === 'NET PAY') return;
+
+      const mapping = mapByHeaderNorm[hKey];
+      if (!mapping || !mapping.include) return;
+
+      const v = Number(row[colIdx]);
+      if (isNaN(v) || Math.abs(v) < 1e-9) return;
+
+      const dim1 = resolveDimensionValue(mapping.dimension1, row, empId);
+      const dim2 = resolveDimensionValue(mapping.dimension2, row, empId);
+
+      const lt = mapping.lineType === 'NEGATIVE' ? 'NEGATIVE' : 'POSITIVE';
+
+      let debit = 0;
+      let credit = 0;
+
+      // SIGN LOGIC (kept exactly as your structure)
+      if (lt === 'POSITIVE') {
+        if (v > 0) debit = v;
+        else if (v < 0) credit = -v;
+      } else {
+        if (v < 0) credit = -v;
+        else if (v > 0) debit = v;
+      }
+
+      if (!debit && !credit) return;
+
+      const resolved = _resolveMappedAccount_(mapping, contractTypeRaw, allocationRaw);
+      const accountCode = resolved.code;
+      const accountName = resolved.name;
+      if (!accountCode) return;
+
+      const hasDims = (mapping.dimension1 && mapping.dimension1 !== 'NONE') ||
+                      (mapping.dimension2 && mapping.dimension2 !== 'NONE');
+
+      // If we are NOT tracking dimensions, do NOT carry ENTITY/CLIENT/DIMs
+      // because we aggregate across multiple rows.
+      let outEntity = entity;
+      let outClient = client;
+      let outDim1 = dim1;
+      let outDim2 = dim2;
+
+      if (!hasDims) {
+        outEntity = '';
+        outClient = '';
+        outDim1 = '';
+        outDim2 = '';
+      }
+
+      let key;
+      if (hasDims) {
+        key = isConsultant
+          ? [accountCode, lt, outEntity, outClient, outDim1, outDim2, empId].join('||')
+          : [accountCode, lt, outEntity, outClient, outDim1, outDim2].join('||');
+      } else {
+        key = isConsultant
+          ? [accountCode, lt, empId].join('||')
+          : [accountCode, lt].join('||');
+      }
+
+      if (!journal[key]) {
+        journal[key] = {
+          period: period,
+          entity: outEntity,
+          client: outClient,
+          accountCode: accountCode,
+          accountName: accountName,
+          label: (isConsultant ? empLabel : ''),
+          dim1: outDim1,
+          dim2: outDim2,
+          lineType: lt,
+          debit: 0,
+          credit: 0
+        };
+      }
+
+      journal[key].debit += debit;
+      journal[key].credit += credit;
+
+      // === MIRROR EMPLOYER CONTRIBUTIONS INTO LIABILITY (NEGATIVE) ===
+      const eeHeaderNorm = ER_TO_EE_LIAB[hKey];
+      if (eeHeaderNorm && v > 0) {
+        const eeMap = mapByHeaderNorm[eeHeaderNorm];
+        if (eeMap) {
+          const liabResolved = _resolveMappedAccount_(eeMap, contractTypeRaw, allocationRaw);
+          const liabCode = liabResolved.code;
+          if (!liabCode) return;
+
+          const liabDim1 = resolveDimensionValue(eeMap.dimension1, row, empId);
+          const liabDim2 = resolveDimensionValue(eeMap.dimension2, row, empId);
+
+          const liabHasDims = (eeMap.dimension1 && eeMap.dimension1 !== 'NONE') ||
+                              (eeMap.dimension2 && eeMap.dimension2 !== 'NONE');
+
+          let liabKey, liabEntity = entity, liabClient = client;
+          if (liabHasDims) {
+            liabKey = [liabCode, 'NEGATIVE', entity, client, liabDim1 || '', liabDim2 || ''].join('||');
+          } else {
+            liabEntity = '';
+            liabClient = '';
+            liabKey = [liabCode, 'NEGATIVE'].join('||');
+          }
+
+          if (!journal[liabKey]) {
+            journal[liabKey] = {
+              period,
+              entity: liabEntity,
+              client: liabClient,
+              accountCode: liabCode,
+              accountName: liabResolved.name || '',
+              dim1: liabDim1 || '',
+              dim2: liabDim2 || '',
+              lineType: 'NEGATIVE',
+              debit: 0,
+              credit: 0
+            };
+          }
+
+          // ER positive cost → CREDIT liability
+          journal[liabKey].credit += v;
+        }
+      }
+    });
+  });
+
+  // 2) BANK SIDE — NET PAY by disbursing bank (aggregated)
+  if (idxNetPay >= 0) {
+    const empToBank = buildEmployeeBankIndex_();
+    const bankMap = loadBankMap();
+    const coaList = getCoaAccounts();
+    const coaByCode = {};
+    coaList.forEach(a => { coaByCode[a.code] = a; });
+
+    const bankByKey = {};
+    bankMap.forEach(b => {
+      if (!b || !b.bankKey || !b.accountCode) return;
+      const coa = coaByCode[b.accountCode] || {};
+      bankByKey[_norm_(b.bankKey)] = {
+
+        accountCode: b.accountCode,
+        accountName: coa.name || ''
+      };
+    });
+
+    rows.forEach(row => {
+      const empId = String(row[idxEmpId] || '').trim();
+      const empName = idxEmpName >= 0 ? String(row[idxEmpName] || '').trim() : '';
+      if (!empId) return;
+      if (_rowIsTotal_(empId, empName)) return;
+
+      const v = Number(row[idxNetPay]);
+      if (isNaN(v) || Math.abs(v) < 1e-9) return;
+
+      let bankKeyRaw = empToBank[empId] || '';
+let bankKey = bankKeyRaw ? _norm_(bankKeyRaw) : '__DEFAULT__';
+
+let bankAcct = bankByKey[bankKey];
+
+      if (!bankAcct && bankKey !== '__DEFAULT__') {
+        bankKey = '__DEFAULT__';
+        bankAcct = bankByKey[bankKey];
+      }
+      if (!bankAcct) return;
+
+      const period = idxPeriod >= 0 ? String(row[idxPeriod] || '') : '';
+
+      let debit = 0, credit = 0;
+      if (v > 0) credit = v;
+      else if (v < 0) debit = -v;
+      else return;
+
+      const key = [bankAcct.accountCode || '', 'BANK', bankKey].join('||');
+
+      if (!journal[key]) {
+        journal[key] = {
+          period,
+          entity: '',
+          client: '',
+          accountCode: bankAcct.accountCode || '',
+          accountName: bankAcct.accountName || '',
+          dim1: '',
+          dim2: bankKey,   // keep bank key in DIM2 for traceability
+          lineType: 'BANK',
+          debit: 0,
+          credit: 0
+        };
+      }
+
+      journal[key].debit += debit;
+      journal[key].credit += credit;
+    });
+  }
+
+  // 3) Return canonical journal (no sheet created)
+  const outHeader = ['PERIOD','ENTITY','CLIENT','ACCOUNT CODE','ACCOUNT NAME','LABEL','DIM1','DIM2','LINE TYPE','DEBIT','CREDIT'];
+
+  const dataRows = [];
+
+  Object.keys(journal).forEach(key => {
+    const j = journal[key];
+    if (!j) return;
+
+    const debitRaw  = (typeof j.debit  === 'number') ? j.debit  : 0;
+    const creditRaw = (typeof j.credit === 'number') ? j.credit : 0;
+
+    let net = debitRaw - creditRaw;
+    if (Math.abs(net) < 1e-9) return;
+
+    net = _round2_(net);
+    if (Math.abs(net) < 0.005) return;
+
+    let outDebit = 0, outCredit = 0;
+    if (net > 0) outDebit = net;
+    else outCredit = -net;
+
+    outDebit = _round2_(outDebit);
+    outCredit = _round2_(outCredit);
+
+        dataRows.push([ j.period, j.entity, j.client, j.accountCode, j.accountName, (j.label || ''), (j.dim1 || ''), (j.dim2 || ''), (j.lineType || ''), outDebit, outCredit ]);
+
+
+  });
+
+  return { success: true, header: outHeader, rows: dataRows, rowCount: dataRows.length };
+}
+
+// =====================
+// EXPORT CSV BUILDER
+// =====================
+
+function buildPayrollExportCsv(options) {
+  if (!options) throw new Error('Missing options for export.');
+
+  var sheetName = options.sheetName;
+  if (!sheetName) throw new Error('Missing sheetName (posted payroll sheet).');
+  
+
+  var target = String(options.targetSystem || options.system || '').toUpperCase();
+  var kind   = String(options.exportType  || options.mode   || '').toUpperCase();
+
+  if (kind === 'MANUAL') kind = 'JOURNAL';
+
+  if (!target) throw new Error('Missing targetSystem / system.');
+  if (!kind)   throw new Error('Missing exportType / mode (JOURNAL / BILL).');
+
+var odoo = null;
+if (target === 'ODOO') {
+  try { odoo = _odooOpen_(); } catch (e) { odoo = null; }
+}
+
+
+  var journal = generateJournalFromPayroll({ sheetName: sheetName });
+  if (!journal || !journal.rows || !journal.rows.length) {
+    throw new Error('No journal rows generated from sheet "' + sheetName + '".');
+  }
+
+  var hdr = journal.header.map(function (h) { return String(h || '').trim().toUpperCase(); });
+
+  var idxPeriod    = hdr.indexOf('PERIOD');
+  var idxEntity    = hdr.indexOf('ENTITY');
+  var idxClient    = hdr.indexOf('CLIENT');
+  var idxLabel     = hdr.indexOf('LABEL');
+  var idxAccCode   = hdr.indexOf('ACCOUNT CODE');
+  var idxAccName   = hdr.indexOf('ACCOUNT NAME');
+  var idxDim1      = hdr.indexOf('DIM1');
+  var idxDim2      = hdr.indexOf('DIM2');
+  var idxLineType  = hdr.indexOf('LINE TYPE');
+  var idxDebit     = hdr.indexOf('DEBIT');
+  var idxCredit    = hdr.indexOf('CREDIT');
+
+  if (idxAccCode < 0 || idxDebit < 0 || idxCredit < 0) {
+    throw new Error('Journal output missing ACCOUNT CODE / DEBIT / CREDIT columns.');
+  }
+
+  // Convert to signed-amount lines
+  var lines = [];
+  journal.rows.forEach(function (row) {
+    var accountCode = String(row[idxAccCode] || '').trim();
+    if (!accountCode) return;
+
+    var debit  = (typeof row[idxDebit]  === 'number') ? row[idxDebit]  : 0;
+    var credit = (typeof row[idxCredit] === 'number') ? row[idxCredit] : 0;
+
+    var net = _round2_(debit - credit);
+    if (Math.abs(net) < 0.005) return;
+
+    lines.push({
+      period:      idxPeriod   >= 0 ? String(row[idxPeriod]   || '') : '',
+      entity:      idxEntity   >= 0 ? String(row[idxEntity]   || '') : '',
+      client:      idxClient   >= 0 ? String(row[idxClient]   || '') : '',
+      accountCode: accountCode,
+      accountName: idxAccName  >= 0 ? String(row[idxAccName]  || '') : '',
+      label:       idxLabel    >= 0 ? String(row[idxLabel]    || '') : '',
+      dim1:        idxDim1     >= 0 ? String(row[idxDim1]     || '') : '',
+      dim2:        idxDim2     >= 0 ? String(row[idxDim2]     || '') : '',
+      lineType:    idxLineType >= 0 ? String(row[idxLineType] || '') : '',
+      amount:      net
+    });
+  });
+
+  var originalLines = lines.slice();
+
+  if (kind === 'BILL') {
+    lines = lines.filter(function (line) {
+      return String(line.lineType || '').toUpperCase() !== 'BANK';
+    });
+    if (!lines.length && originalLines.length) lines = originalLines.slice();
+  }
+
+  // Small rounding balance adjust
+  if (lines.length) {
+    var totalAmount = 0;
+    lines.forEach(function (l) { totalAmount += l.amount; });
+    totalAmount = _round2_(totalAmount);
+
+    if (Math.abs(totalAmount) >= 0.01 && Math.abs(totalAmount) <= 0.05) {
+      var adjIndex = 0, maxAbs = 0;
+      for (var i = 0; i < lines.length; i++) {
+        var a = Math.abs(lines[i].amount);
+        if (a > maxAbs) { maxAbs = a; adjIndex = i; }
+      }
+      lines[adjIndex].amount = _round2_(lines[adjIndex].amount - totalAmount);
+    }
+  }
+
+  if (!lines.length) throw new Error('No non-zero lines in journal to export for ' + target + ' / ' + kind + '.');
+
+  var dateStr      = options.docDate   || options.date   || '';
+  var numberStr    = options.docNumber || options.refNo  || '';
+  var supplierName = options.supplierName || '';
+  var trackName1   = options.trackingName1 || '';
+  var trackName2   = options.trackingName2 || '';
+
+  var rowsOut = [];
+
+  if (target === 'XERO' && kind === 'JOURNAL') {
+    rowsOut.push(['JournalDate','JournalNumber','Reference','AccountCode','Amount','Description','TrackingName1','TrackingOption1','TrackingName2','TrackingOption2']);
+    lines.forEach(function (line) {
+      var ref  = line.period || '';
+      var desc = (String(line.label || '').trim() || line.accountName || ('Payroll ' + (line.period || '')));
+      rowsOut.push([dateStr, numberStr, ref, line.accountCode, line.amount, desc, trackName1 || '', line.dim1 || '', trackName2 || '', line.dim2 || '']);
+    });
+
+  } else if (target === 'XERO' && kind === 'BILL') {
+    rowsOut.push(['Type','ContactName','InvoiceNumber','Reference','InvoiceDate','DueDate','AccountCode','Description','Quantity','UnitAmount','TrackingName1','TrackingOption1','TrackingName2','TrackingOption2']);
+    lines.forEach(function (line) {
+      var ref  = line.period || '';
+      var desc = (String(line.label || '').trim() || line.accountName || ('Payroll ' + (line.period || '')));
+      rowsOut.push(['ACCPAY', supplierName, numberStr, ref, dateStr, dateStr, line.accountCode, desc, 1, line.amount, trackName1 || '', line.dim1 || '', trackName2 || '', line.dim2 || '']);
+    });
+
+  } else if (target === 'QBO' && kind === 'JOURNAL') {
+    rowsOut.push(['JournalDate','Currency','AccountName','Debits','Credits','Memo','Description','TaxCode','Type','Name','Location','Class']);
+    lines.forEach(function (line) {
+      var debit   = line.amount > 0 ? line.amount : 0;
+      var credit  = line.amount < 0 ? -line.amount : 0;
+      var acctStr = line.accountCode ? (line.accountCode + (line.accountName ? ' ' + line.accountName : '')) : (line.accountName || '');
+      var memo = 'Payroll ' + (line.period || '');
+      var desc = (String(line.label || '').trim() || line.accountName || '');
+      var name = line.entity || line.client || supplierName || '';
+      rowsOut.push([dateStr, currencyStr, acctStr, debit, credit, memo, desc, taxCode || '', typeStr || '', name || '', line.dim1 || '', line.dim2 || '']);
+    });
+
+  } else if (target === 'QBO' && kind === 'BILL') {
+    rowsOut.push(['Vendor','TransactionDate','BillNo','Account','Amount','Description','Class','Location']);
+    lines.forEach(function (line) {
+      var desc = (String(line.label || '').trim() || line.accountName || ('Payroll ' + (line.period || '')));
+      rowsOut.push([supplierName, dateStr, numberStr, line.accountCode, line.amount, desc, line.dim1 || '', line.dim2 || '']);
+    });
+
+  } else if (target === 'ODOO' && kind === 'JOURNAL') {
+  rowsOut.push([
+    'Number','Date','Journal*',
+    'Journal Items/Account*',
+    'Journal Items/Partner',
+    'Journal Items/Label',
+    'Journal Items/Analytic Distribution', // ✅ ADD
+    'Journal Items/Debit','Journal Items/Credit'
+  ]);
+
+  lines.forEach(function (line, index) {
+    var isFirst = (index === 0);
+    var debit  = line.amount > 0 ? line.amount : 0;
+    var credit = line.amount < 0 ? -line.amount : 0;
+    var label  = (String(line.label || '').trim() || line.accountName || ('Payroll ' + (line.period || '')));
+    var partner = line.entity || line.client || supplierName || '';
+
+    var lt = String(line.lineType || '').toUpperCase();
+var analytic = (lt === 'BANK')
+  ? ''
+  : _formatOdooAnalyticDistCsvFromDims_(line.dim1 || '', line.dim2 || '', odoo);
+  Logger.log('### CSV ANALYTIC dim1=' + JSON.stringify(line.dim1 || '') +
+           ' dim2=' + JSON.stringify(line.dim2 || '') +
+           ' analytic=' + JSON.stringify(analytic));
+
+
+
+
+    rowsOut.push([
+      isFirst ? (numberStr || (line.period || '')) : '',
+      isFirst ? dateStr : '',
+      isFirst ? 'Miscellaneous Operations' : '',
+      line.accountCode,
+      partner,
+      label,
+      analytic, // ✅ ADD
+      debit,
+      credit
+    ]);
+  });
+
+
+  } else if (target === 'ODOO' && kind === 'BILL') {
+  rowsOut.push([
+    'Partner','Reference','Invoice Bill Date','Date','Due Date','Payment Terms','Journal*',
+    'Invoice Lines/Label',
+    'Invoice Lines/Account*',
+    'Invoice Lines/Analytic Distribution', // ✅ ADD
+    'Invoice Lines/Quantity',
+    'Invoice Lines/Unit Price',
+    'Invoice Lines/Taxes'
+  ]);
+
+  lines.forEach(function (line, index) {
+    var isFirst = (index === 0);
+
+var label = (String(line.label || '').trim() || line.accountName || ('Payroll ' + (line.period || '')));
+
+
+    var lt = String(line.lineType || '').toUpperCase();
+    var analytic = (lt === 'BANK')
+      ? ''
+      : _formatOdooAnalyticDistCsvFromDims_(line.dim1 || '', line.dim2 || '', odoo);
+
+    rowsOut.push([
+      isFirst ? supplierName : '',
+      isFirst ? (numberStr || (line.period || '')) : '',
+      isFirst ? dateStr : '',
+      isFirst ? dateStr : '',
+      isFirst ? dateStr : '',
+      isFirst ? '' : '',
+      isFirst ? 'Purchases' : '',
+      label,
+      line.accountCode,
+      analytic,
+      1,
+      line.amount,
+      ''
+    ]);
+  });
+
+
+  } else {
+    throw new Error('Unsupported export combination: ' + target + ' / ' + kind);
+  }
+
+  var csvLines = rowsOut.map(function (r) {
+    return r.map(function (v) {
+      if (typeof v === 'number') return v.toString();
+      var s = (v == null ? '' : String(v));
+      if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+      return s;
+    }).join(',');
+  });
+
+  var csv = csvLines.join('\r\n');
+  var baseName = target + '_' + kind + '_' + (dateStr || 'PAYROLL') + '.csv';
+
+  return { fileName: baseName, csv: csv };
+}
+
+// =====================
+// ODOO: Direct Posting (uses ID mapping in code)
+// =====================
+
+function postPayrollToOdooApi(options) {
+  Logger.log('### HIT postPayrollToOdooApi');
+  Logger.log('### RAW options type=' + (typeof options));
+  Logger.log('### RAW options=' + (typeof options === 'string' ? options : JSON.stringify(options)));
+  if (typeof options === 'string') options = JSON.parse(options);
+  Logger.log('### PARSED options=' + JSON.stringify(options || {}));
+  if (typeof options === 'string') options = JSON.parse(options);
+  options = options || {};
+
+  const sheetName = options.sheetName;
+  if (!sheetName) throw new Error('Missing sheetName.');
+
+  const mode = String(options.mode || options.exportType || '').toUpperCase(); // 'MANUAL'/'JOURNAL' or 'BILL'
+  const kind = (mode === 'BILL') ? 'BILL' : 'JOURNAL';
+
+  const dateStr = String(options.date || options.docDate || '').trim();
+  if (!dateStr) throw new Error('Missing date.');
+
+  const refNo = String(options.refNo || options.docNumber || '').trim();
+  const supplierName = String(options.supplierName || '').trim();
+
+  const journal = generateJournalFromPayroll({ sheetName: sheetName });
+
+    // === DEBUG: check balance of generated journal rows ===
+  (function () {
+    const hdr = journal.header.map(h => String(h || '').trim().toUpperCase());
+    const iD = hdr.indexOf('DEBIT');
+    const iC = hdr.indexOf('CREDIT');
+    const iA = hdr.indexOf('ACCOUNT CODE');
+    const iT = hdr.indexOf('LINE TYPE');
+
+    let td = 0, tc = 0;
+    journal.rows.forEach(r => { td += Number(r[iD] || 0); tc += Number(r[iC] || 0); });
+
+    Logger.log('### JOURNAL TOTALS debit=' + _round2_(td) + ' credit=' + _round2_(tc) + ' diff=' + _round2_(td - tc));
+
+    // log top lines if diff exists
+    const diff = _round2_(td - tc);
+    if (Math.abs(diff) >= 0.01) {
+      Logger.log('### JOURNAL NOT BALANCED. First 30 lines:');
+      for (let k = 0; k < Math.min(30, journal.rows.length); k++) {
+        const r = journal.rows[k];
+        Logger.log(
+          '  ' + k +
+          ' acct=' + r[iA] +
+          ' lt=' + r[iT] +
+          ' d=' + r[iD] +
+          ' c=' + r[iC]
+        );
+      }
+    }
+  })();
+
+  if (!journal || !journal.rows || !journal.rows.length) {
+    throw new Error('No journal rows generated from sheet "' + sheetName + '".');
+  }
+
+  const hdr = journal.header.map(h => String(h || '').trim().toUpperCase());
+  const idxAccCode = hdr.indexOf('ACCOUNT CODE');
+  const idxAccName = hdr.indexOf('ACCOUNT NAME');
+  const idxLabel   = hdr.indexOf('LABEL');
+  const idxDebit   = hdr.indexOf('DEBIT');
+  const idxCredit  = hdr.indexOf('CREDIT');
+  const idxLineType = hdr.indexOf('LINE TYPE');
+
+  const idxDim1    = hdr.indexOf('DIM1'); // ✅ ADD
+const idxDim2    = hdr.indexOf('DIM2'); // ✅ ADD
+
+
+
+  if (idxAccCode < 0 || idxDebit < 0 || idxCredit < 0) {
+    throw new Error('Journal output missing ACCOUNT CODE / DEBIT / CREDIT columns.');
+  }
+
+  const odoo = _odooOpen_();
+
+  if (kind === 'JOURNAL') {
+  const journalId = _odooGetJournalId_(odoo, 'JOURNAL');
+  if (!journalId) {
+  return {
+    success: false,
+    needsJournalSelection: true,
+    journalKind: 'JOURNAL',
+    journalType: 'general',
+    journals: debugOdooJournals('JOURNAL')
+  };
+}
+
+
+  const moveLines = [];
+  journal.rows.forEach(r => {
+    const code = String(r[idxAccCode] || '').trim();
+    if (!code) return;
+
+    const debit  = (typeof r[idxDebit] === 'number') ? r[idxDebit] : Number(r[idxDebit] || 0);
+    const credit = (typeof r[idxCredit] === 'number') ? r[idxCredit] : Number(r[idxCredit] || 0);
+
+    const d = _round2_(debit);
+    const c = _round2_(credit);
+    if (Math.abs(d) < 0.005 && Math.abs(c) < 0.005) return;
+
+    const accountId = _odooGetAccountIdByCode_(odoo, code);
+const lineName =
+  (idxLabel >= 0 ? String(r[idxLabel] || '').trim() : '') ||
+  String(r[idxAccName] || '').trim() ||
+  (refNo ? ('Payroll ' + refNo) : 'Payroll');
+
+
+
+    const dim1 = (idxDim1 >= 0) ? String(r[idxDim1] || '').trim() : '';
+    const dim2 = (idxDim2 >= 0) ? String(r[idxDim2] || '').trim() : '';
+    const lt = (idxLineType >= 0) ? String(r[idxLineType] || '').trim().toUpperCase() : '';
+
+    let analyticDist = null;
+    if (lt !== 'BANK') {
+      analyticDist = _odooBuildAnalyticDistributionFromDims_(odoo, dim1, dim2);
+    }
+
+    const lineVals = {
+      account_id: accountId,
+      name: lineName,
+      debit: d > 0 ? d : 0,
+      credit: c > 0 ? c : 0
+    };
+    if (analyticDist) lineVals.analytic_distribution = analyticDist;
+
+    moveLines.push([0, 0, lineVals]);
+  });
+
+  if (!moveLines.length) throw new Error('No non-zero lines for Odoo Journal Entry.');
+
+  Logger.log('### ODOO moveLines count=' + moveLines.length);
+
+  // ✅ Create the move FIRST (no lines), then append lines in chunks (prevents "cut" issues)
+  const moveHead = {
+    move_type: 'entry',
+    journal_id: journalId,
+    date: dateStr,
+    name: refNo || undefined,
+    ref: refNo || undefined
+  };
+
+    const createContext = Object.assign({}, odoo.context || {}, {
+    check_move_validity: false
+  });
+
+  const moveId = _odooJsonRpc_(odoo.url, {
+    service: 'object',
+    method: 'execute_kw',
+    args: [
+      odoo.db, odoo.uid, odoo.apiKey,
+      'account.move', 'create', [moveHead],
+      { context: createContext }
+    ]
+  });
+
+
+  // Append lines in batches of 40 (tune if needed)
+  _odooAppendX2ManyInChunks_(odoo, 'account.move', moveId, 'line_ids', moveLines, 10);
+
+  // ✅ Verify count in Odoo (so we KNOW it wasn't cut)
+  const count = _odooSearchCount_(odoo, 'account.move.line', [['move_id', '=', Number(moveId)]]);
+  Logger.log('### ODOO move.line count=' + count + ' expected=' + moveLines.length);
+
+  if (Number(count) !== Number(moveLines.length)) {
+    throw new Error('Odoo push incomplete: created ' + count + ' lines but expected ' + moveLines.length + '.');
+  }
+
+  // ✅ DO NOT AUTO POST (kept)
+  return { success: true, kind: 'JOURNAL', moveId: moveId, lineCount: count };
+}
+
+
+  
+// =====================
+// BILL (Vendor Bill) — invoice_line_ids (STRAIGHTFORWARD)
+// - Include ALL journal rows EXCEPT BANK
+// - Use invoice_line_ids only (NO line_ids)
+// =====================
+if (!supplierName) throw new Error('Missing supplierName for Odoo Vendor Bill.');
+
+const journalId = _odooGetJournalId_(odoo, 'BILL');
+if (!journalId) {
+  return {
+    success: false,
+    needsJournalSelection: true,
+    journalKind: 'BILL',
+    journalType: 'purchase',
+    journals: debugOdooJournals('BILL')
+  };
+}
+
+const partnerId = _odooGetPartnerIdByName_(odoo, supplierName);
+
+const invoiceLines = [];
+let sumNet = 0;
+
+// Build invoice lines from journal rows (exclude BANK)
+journal.rows.forEach(r => {
+  const lt = (idxLineType >= 0) ? String(r[idxLineType] || '').trim().toUpperCase() : '';
+  if (lt === 'BANK') return;
+
+  const code = String(r[idxAccCode] || '').trim();
+  if (!code) return;
+
+  const debit  = (typeof r[idxDebit]  === 'number') ? r[idxDebit]  : Number(r[idxDebit]  || 0);
+  const credit = (typeof r[idxCredit] === 'number') ? r[idxCredit] : Number(r[idxCredit] || 0);
+
+  const net = _round2_(debit - credit); // signed
+  if (Math.abs(net) < 0.005) return;
+
+  const accountId = _odooGetAccountIdByCode_(odoo, code);
+  const label =
+  (idxLabel >= 0 ? String(r[idxLabel] || '').trim() : '') ||
+  String(r[idxAccName] || '').trim() ||
+  (refNo ? ('Payroll ' + refNo) : 'Payroll');
+
+
+  // IMPORTANT: avoid negative price_unit quirks → encode sign via quantity instead
+  const qty = net >= 0 ? 1 : -1;
+  const price = _round2_(Math.abs(net));
+
+  sumNet = _round2_(sumNet + net);
+
+    const dim1 = (idxDim1 >= 0) ? String(r[idxDim1] || '').trim() : '';
+  const dim2 = (idxDim2 >= 0) ? String(r[idxDim2] || '').trim() : '';
+
+  const analyticDist = _odooBuildAnalyticDistributionFromDims_(odoo, dim1, dim2);
+
+  const invLineVals = {
+    name: label,
+    account_id: accountId,
+    quantity: qty,
+    price_unit: price,
+    partner_id: partnerId  // optional; safe for vendor bill lines
+  };
+
+  if (analyticDist) invLineVals.analytic_distribution = analyticDist; // ✅ ADD
+
+  invoiceLines.push([0, 0, invLineVals]);
+
+});
+
+if (!invoiceLines.length) {
+  throw new Error('No non-zero invoice lines after removing BANK lines.');
+}
+
+Logger.log('### BILL(invoice_line_ids) lines=' + invoiceLines.length + ' sumNet=' + sumNet);
+
+// 1) Create BILL header only (no lines yet)
+const billHead = {
+  move_type: 'in_invoice',
+  journal_id: journalId,
+  partner_id: partnerId,
+  invoice_date: dateStr,
+  date: dateStr,
+  ref: refNo || undefined
+};
+
+const createContext = Object.assign({}, odoo.context || {}, {
+  check_move_validity: false
+});
+
+const billId = _odooJsonRpc_(odoo.url, {
+  service: 'object',
+  method: 'execute_kw',
+  args: [
+    odoo.db, odoo.uid, odoo.apiKey,
+    'account.move', 'create', [billHead],
+    { context: createContext }
+  ]
+});
+
+// 2) Append invoice_line_ids in chunks (prevents “cut” and intermediate imbalance)
+_odooAppendX2ManyInChunks_(odoo, 'account.move', billId, 'invoice_line_ids', invoiceLines,10);
+
+// 3) Verify invoice line count (read invoice_line_ids, not account.move.line count)
+const readBack = _odooJsonRpc_(odoo.url, {
+  service: 'object',
+  method: 'execute_kw',
+  args: [
+    odoo.db, odoo.uid, odoo.apiKey,
+    'account.move',
+    'read',
+    [[Number(billId)]],
+    { fields: ['invoice_line_ids'], context: (odoo.context || {}) }
+  ]
+});
+
+
+const got = (readBack && readBack[0] && Array.isArray(readBack[0].invoice_line_ids))
+  ? readBack[0].invoice_line_ids.length
+  : 0;
+
+Logger.log('### ODOO BILL invoice_line_ids count=' + got + ' expected=' + invoiceLines.length);
+
+if (Number(got) !== Number(invoiceLines.length)) {
+  throw new Error('Odoo BILL push incomplete: created ' + got + ' invoice lines but expected ' + invoiceLines.length + '.');
+}
+
+// ✅ DO NOT AUTO POST (kept)
+return { success: true, kind: 'BILL', moveType: 'in_invoice', moveId: billId, invoiceLineCount: got };
+
+
+}
+
+
+function postPayrollExportToApi(options) {
+   Logger.log('### HIT postPayrollExportToApi');
+  Logger.log('### RAW options type=' + (typeof options));
+  Logger.log('### RAW options=' + (typeof options === 'string' ? options : JSON.stringify(options)));
+  if (typeof options === 'string') options = JSON.parse(options);
+  Logger.log('### PARSED options=' + JSON.stringify(options || {}));
+
+  if (typeof options === 'string') options = JSON.parse(options);
+  if (!options) throw new Error('Missing options.');
+  const cfg = _getSettings_();
+
+  const provider = String(options.system || options.targetSystem || cfg.ACC_PROVIDER || '').toUpperCase();
+  const kind = String(options.mode || options.exportType || '').toUpperCase() === 'BILL' ? 'BILL' : 'JOURNAL';
+
+  if (provider === 'XERO') {
+    return _postToXero_(cfg, options, kind);
+  }
+  if (provider === 'ODOO') {
+  // ensure postPayrollToOdooApi reads the mode correctly
+  options = Object.assign({}, options, { mode: kind });
+  return postPayrollToOdooApi(options);
+}
+
+  throw new Error('Unsupported provider for API push: ' + provider);
+}
+
+function _postToXero_(cfg, options, kind) {
+  const tenantId = String(cfg.XERO_TENANT_ID || '').trim();
+  const token    = String(cfg.XERO_ACCESS_TOKEN || '').trim();
+  if (!tenantId || !token) throw new Error('Missing XERO_TENANT_ID / XERO_ACCESS_TOKEN in Settings Center.');
+
+  // Reuse your canonical journal generator (NOT CSV)
+  const journal = generateJournalFromPayroll({ sheetName: options.sheetName });
+  const hdr = journal.header.map(h => String(h || '').trim().toUpperCase());
+
+  const idxAccCode = hdr.indexOf('ACCOUNT CODE');
+  const idxAccName = hdr.indexOf('ACCOUNT NAME');
+  const idxLabel   = hdr.indexOf('LABEL');
+  const idxDim1    = hdr.indexOf('DIM1');
+  const idxDim2    = hdr.indexOf('DIM2');
+  const idxDebit   = hdr.indexOf('DEBIT');
+  const idxCredit  = hdr.indexOf('CREDIT');
+
+  const dateStr = String(options.date || options.docDate || '').trim();
+  const refNo   = String(options.refNo || options.docNumber || '').trim();
+
+  if (!dateStr) throw new Error('Missing date for Xero post.');
+
+  if (kind === 'JOURNAL') {
+    const trackName1 = String(options.trackingName1 || '').trim();
+    const trackName2 = String(options.trackingName2 || '').trim();
+
+    const lines = journal.rows.map(r => {
+      const code = String(r[idxAccCode] || '').trim();
+      if (!code) return null;
+
+      const debit  = Number(r[idxDebit] || 0);
+      const credit = Number(r[idxCredit] || 0);
+      const net = _round2_(debit - credit);
+      if (Math.abs(net) < 0.005) return null;
+
+      const tracking = [];
+      if (trackName1 && r[idxDim1]) tracking.push({ Name: trackName1, Option: String(r[idxDim1] || '').trim() });
+      if (trackName2 && r[idxDim2]) tracking.push({ Name: trackName2, Option: String(r[idxDim2] || '').trim() });
+
+      return {
+        AccountCode: code,
+        LineAmount: net, // signed
+        Description: (idxLabel >= 0 ? String(r[idxLabel] || '').trim() : '') || String(r[idxAccName] || '').trim() || ('Payroll ' + (refNo || '')),
+
+        Tracking: tracking.length ? tracking : undefined
+      };
+    }).filter(Boolean);
+
+    const payload = {
+      ManualJournals: [{
+        Date: dateStr,
+        Narration: refNo || ('Payroll ' + dateStr),
+        Status: 'DRAFT',
+        JournalLines: lines
+      }]
+    };
+
+    const res = _xeroFetch_(tenantId, token, 'https://api.xero.com/api.xro/2.0/ManualJournals', payload);
+    return { success: true, provider: 'XERO', kind: 'JOURNAL', response: res };
+  }
+
+  // BILL (ACCPAY)
+  const supplierName = String(options.supplierName || '').trim();
+  if (!supplierName) throw new Error('Missing supplierName for Xero BILL post.');
+
+  // Use only positive expense lines as line items (avoid negative/credits)
+  const lineItems = journal.rows.map(r => {
+    const code = String(r[idxAccCode] || '').trim();
+    if (!code) return null;
+
+    const debit  = Number(r[idxDebit] || 0);
+    const credit = Number(r[idxCredit] || 0);
+    const net = _round2_(debit - credit);
+    if (net <= 0.005) return null;
+
+    return {
+      Description: (idxLabel >= 0 ? String(r[idxLabel] || '').trim() : '') || String(r[idxAccName] || '').trim() || ('Payroll ' + (refNo || '')),
+
+      Quantity: 1,
+      UnitAmount: net,
+      AccountCode: code
+    };
+  }).filter(Boolean);
+
+  const payload = {
+    Invoices: [{
+      Type: 'ACCPAY',
+      Contact: { Name: supplierName },
+      InvoiceNumber: refNo || undefined,
+      Reference: refNo || undefined,
+      Date: dateStr,
+      DueDate: dateStr,
+      LineItems: lineItems,
+      Status: 'DRAFT'
+    }]
+  };
+
+  const res = _xeroFetch_(tenantId, token, 'https://api.xero.com/api.xro/2.0/Invoices', payload);
+  return { success: true, provider: 'XERO', kind: 'BILL', response: res };
+}
+
+function _xeroFetch_(tenantId, token, url, payloadObj) {
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    muteHttpExceptions: true,
+    headers: {
+      Authorization: 'Bearer ' + token,
+      'xero-tenant-id': tenantId,
+      Accept: 'application/json'
+    },
+    payload: JSON.stringify(payloadObj)
+  });
+
+  const code = resp.getResponseCode();
+  const body = resp.getContentText();
+  if (code < 200 || code >= 300) throw new Error('Xero POST error ' + code + ': ' + body);
+  return JSON.parse(body || '{}');
+}
+
+function _postToOdoo_(cfg, options, kind) {
+  // Keep it strict: only enable if Odoo settings exist
+  const baseUrl = String(cfg.ODOO_BASE_URL || '').replace(/\/+$/, '');
+  const db      = String(cfg.ODOO_DB || '').trim();
+  const user    = String(cfg.ODOO_USERNAME || '').trim();
+  const apiKey  = String(cfg.ODOO_API_KEY || '').trim();
+  if (!baseUrl || !db || !user || !apiKey) throw new Error('Missing Odoo settings in Settings Center.');
+
+  // For now: return an explicit error to force CSV import flow
+  // (Your CSV output already conforms to Odoo import formats in buildPayrollExportCsv)
+  throw new Error('Odoo direct API posting not enabled in this build. Use CSV export (ODOO / JOURNAL or BILL) for import.');
+}
+
+
+// =====================
+// BANK FILE GENERATION
+// =====================
+
+function buildEmployeeBankDetailsIndex_() {
+  let mf;
+  try { mf = _openMasterfile_(); } catch (e) { Logger.log('buildEmployeeBankDetailsIndex_: ' + e); return {}; }
+
+  const values = mf.sheet.getDataRange().getValues();
+  if (values.length < 2) return {};
+
+  const headersUp = values[0].map(h => _norm_(h));
+  const idxEmp        = headersUp.indexOf('EMPLOYEE ID');
+  const idxDisbBank   = headersUp.indexOf('DISBURSING BANK');
+  const idxBankName   = headersUp.indexOf('BANK NAME');
+  const idxAcctName   = headersUp.indexOf('BANK ACCOUNT NAME');
+  const idxAcctNumber = headersUp.indexOf('BANK ACCOUNT NUMBER');
+
+  if (idxEmp === -1) {
+    Logger.log('buildEmployeeBankDetailsIndex_: EMPLOYEE ID not found in ' + mf.sheet.getName());
+    return {};
+  }
+
+  const map = {};
+  for (let i = 1; i < values.length; i++) {
+    const row = values[i];
+    const empId = String(row[idxEmp] || '').trim();
+    if (!empId) continue;
+
+    map[empId] = {
+      disbursingBank:    idxDisbBank   >= 0 ? String(row[idxDisbBank]   || '').trim() : '',
+      bankName:          idxBankName   >= 0 ? String(row[idxBankName]   || '').trim() : '',
+      bankAccountName:   idxAcctName   >= 0 ? String(row[idxAcctName]   || '').trim() : '',
+      bankAccountNumber: idxAcctNumber >= 0 ? String(row[idxAcctNumber] || '').trim() : ''
+    };
+  }
+  return map;
+}
+
+function generateBankFilesFromPayroll(options) {
+  if (!options || !options.sheetName) throw new Error('Missing sheetName for bank file generation.');
+
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(options.sheetName);
+  if (!sheet) throw new Error('Posted payroll sheet not found: ' + options.sheetName);
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) throw new Error('No data rows in posted payroll sheet: ' + options.sheetName);
+
+  const hdrsUp = values[0].map(h => _norm_(h));
+  const idxEmpId   = hdrsUp.indexOf('EMPLOYEE ID');
+  const idxEmpName = hdrsUp.indexOf('EMPLOYEE NAME');
+  const idxNetPay  = hdrsUp.indexOf('NET PAY');
+
+  if (idxEmpId < 0 || idxNetPay < 0) {
+    throw new Error('Posted payroll sheet must have EMPLOYEE ID and NET PAY columns. Sheet: ' + options.sheetName);
+  }
+
+  const bankDetailsByEmp = buildEmployeeBankDetailsIndex_();
+  const byBank = {};
+
+  values.slice(1).forEach(row => {
+    const empId = String(row[idxEmpId] || '').trim();
+    const empName = idxEmpName >= 0 ? String(row[idxEmpName] || '').trim() : '';
+    if (!empId) return;
+    if (_rowIsTotal_(empId, empName)) return;
+
+    const netVal = Number(row[idxNetPay]);
+    if (isNaN(netVal) || Math.abs(netVal) < 1e-9) return;
+
+    const details = bankDetailsByEmp[empId] || {};
+    const disbBankRaw = details.disbursingBank || '';
+    const bankKey = disbBankRaw || '__UNSPECIFIED__';
+
+    const rec = {
+      bankAccountName:   details.bankAccountName || '',
+      bankName:          details.bankName || disbBankRaw || '',
+      bankAccountNumber: details.bankAccountNumber || '',
+      netPay:            _round2_(netVal)
+    };
+
+    if (!byBank[bankKey]) byBank[bankKey] = [];
+    byBank[bankKey].push(rec);
+  });
+
+  const files = [];
+
+  Object.keys(byBank).forEach(bankKey => {
+    const records = byBank[bankKey];
+    if (!records || !records.length) return;
+
+    const rowsOut = [];
+    rowsOut.push(['BANK ACCOUNT NAME', 'BANK NAME', 'BANK ACCOUNT NUMBER', 'NET PAY']);
+    records.forEach(rec => rowsOut.push([rec.bankAccountName, rec.bankName, rec.bankAccountNumber, rec.netPay]));
+
+    const csvLines = rowsOut.map(r =>
+      r.map(v => {
+        if (typeof v === 'number') return v.toString();
+        const s = (v == null ? '' : String(v));
+        if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+        return s;
+      }).join(',')
+    );
+
+    const csv = csvLines.join('\r\n');
+
+    const safeBank = (bankKey && bankKey !== '__UNSPECIFIED__')
+      ? bankKey.replace(/[^\w\-]+/g, '_')
+      : 'UNSPECIFIED';
+
+    files.push({
+      bankKey: bankKey,
+      fileName: 'BANK_' + safeBank + '_' + options.sheetName + '.csv',
+      csv: csv,
+      rowCount: records.length
+    });
+  });
+
+  if (!files.length) throw new Error('No bank records found (check NET PAY and Masterfile bank columns).');
+
+  return { success: true, sheetName: options.sheetName, bankCount: files.length, files: files };
+}
+
+// =====================
+// DEBUG HELPERS (kept compatible)
+// =====================
+
+function debugHeaderTotals() {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getActiveSheet();
+  const sheetName = sheet.getName();
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) throw new Error('No data rows in sheet: ' + sheetName);
+
+  const headers = values[0].map(h => String(h || '').trim());
+  const headersUp = headers.map(h => _norm_(h));
+  const rows = values.slice(1);
+
+  const headerMap = loadHeaderMap();
+  const mapByHeader = {};
+  headerMap.forEach(m => { const k = _norm_(m && m.header); if (k) mapByHeader[k] = m; });
+
+  const perHeader = {};
+
+  rows.forEach(row => {
+    headers.forEach((header, colIdx) => {
+      const v = row[colIdx];
+      if (typeof v !== 'number' || v === 0) return;
+
+      const k = headersUp[colIdx];
+      if (!perHeader[k]) {
+        const map = mapByHeader[k] || {};
+        perHeader[k] = {
+          rawSum: 0,
+          include: !!map.include,
+          lineType: map.lineType || '',
+          empCost: (map.empCostAccountCode || '') + ' ' + (map.empCostAccountName || ''),
+          empOpex: (map.empOpexAccountCode || '') + ' ' + (map.empOpexAccountName || ''),
+          conCost: (map.conCostAccountCode || '') + ' ' + (map.conCostAccountName || ''),
+          conOpex: (map.conOpexAccountCode || '') + ' ' + (map.conOpexAccountName || '')
+        };
+      }
+      perHeader[k].rawSum += v;
+    });
+  });
+
+  Logger.log('=== DEBUG HEADER TOTALS for sheet ' + sheetName + ' ===');
+  Object.keys(perHeader).forEach(k => {
+    const info = perHeader[k];
+    Logger.log(
+      k +
+      ' -> rawSum=' + info.rawSum +
+      ', include=' + info.include +
+      ', lineType=' + info.lineType +
+      ', empCost=' + info.empCost +
+      ', empOpex=' + info.empOpex +
+      ', conCost=' + info.conCost +
+      ', conOpex=' + info.conOpex
+    );
+  });
+
+  return perHeader;
+}
+
+function debugNetPayVsBank() {
+  const ss = SpreadsheetApp.getActive();
+  const postedSheet = ss.getActiveSheet();
+  const postedName  = postedSheet.getName();
+
+  const postedValues = postedSheet.getDataRange().getValues();
+  if (postedValues.length < 2) throw new Error('Active sheet "' + postedName + '" has no data rows.');
+
+  const pHeadersUp = postedValues[0].map(h => _norm_(h));
+  const idxEmpId   = pHeadersUp.indexOf('EMPLOYEE ID');
+  const idxEmpName = pHeadersUp.indexOf('EMPLOYEE NAME');
+  const idxNetPay  = pHeadersUp.indexOf('NET PAY');
+
+  if (idxEmpId < 0 || idxNetPay < 0) {
+    throw new Error('Active sheet must have EMPLOYEE ID and NET PAY columns.');
+  }
+
+  const empToBank = buildEmployeeBankIndex_();
+
+  const netByBank = {};
+  let totalNet = 0;
+
+  postedValues.slice(1).forEach(row => {
+    const empId = String(row[idxEmpId] || '').trim();
+    const empName = idxEmpName >= 0 ? String(row[idxEmpName] || '').trim() : '';
+    if (!empId) return;
+    if (_rowIsTotal_(empId, empName)) return;
+
+    const netVal = Number(row[idxNetPay]);
+    if (isNaN(netVal) || Math.abs(netVal) < 1e-9) return;
+
+    const bankKey = empToBank[empId] || '__DEFAULT__';
+    totalNet += netVal;
+    netByBank[bankKey] = (netByBank[bankKey] || 0) + netVal;
+  });
+
+  Logger.log('=== NET PAY DEBUG for posted sheet "' + postedName + '" ===');
+  Logger.log('Total NET PAY = ' + totalNet.toFixed(2));
+  Object.keys(netByBank).sort().forEach(bk => Logger.log('NET [' + bk + '] = ' + netByBank[bk].toFixed(2)));
+
+  return { totalNet, netByBank };
+}
+
+function debugJournalImbalance(postedSheetName) {
+  const ss = SpreadsheetApp.getActive();
+  if (!postedSheetName) postedSheetName = ss.getActiveSheet().getName();
+
+  const j = generateJournalFromPayroll({ sheetName: postedSheetName });
+  let totalDebit = 0, totalCredit = 0;
+
+  const hdr = j.header.map(h => _norm_(h));
+  const idxDebit = hdr.indexOf('DEBIT');
+  const idxCredit = hdr.indexOf('CREDIT');
+
+  j.rows.forEach(r => {
+    const d = (typeof r[idxDebit] === 'number') ? r[idxDebit] : 0;
+    const c = (typeof r[idxCredit] === 'number') ? r[idxCredit] : 0;
+    totalDebit += d;
+    totalCredit += c;
+  });
+
+  Logger.log('=== JOURNAL IMBALANCE (computed) for posted sheet "' + postedSheetName + '" ===');
+  Logger.log('Total DEBIT  = ' + totalDebit.toFixed(2));
+  Logger.log('Total CREDIT = ' + totalCredit.toFixed(2));
+  Logger.log('Diff (D - C) = ' + (totalDebit - totalCredit).toFixed(2));
+
+  return { totalDebit, totalCredit, diff: totalDebit - totalCredit };
+}
+
+function debugSkippedMappedLinesByMissingAccount(postedSheetName) {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(postedSheetName || ss.getActiveSheet().getName());
+  if (!sheet) throw new Error('Sheet not found.');
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) throw new Error('No data rows in sheet: ' + sheet.getName());
+
+  const headers = values[0].map(h => String(h || '').trim());
+  const headersUp = headers.map(h => _norm_(h));
+  const rows = values.slice(1);
+
+  const idxEmpId   = headersUp.indexOf('EMPLOYEE ID');
+  const idxEmpName = headersUp.indexOf('EMPLOYEE NAME');
+  if (idxEmpId < 0) throw new Error('Missing EMPLOYEE ID column.');
+
+  const headerMap = loadHeaderMap();
+  if (!headerMap.length) throw new Error('No header map configured yet.');
+
+  const mapByHeaderNorm = {};
+  headerMap.forEach(m => {
+    const k = _norm_(m && m.header);
+    if (!k) return;
+    const mm = Object.assign({}, m);
+    mm.include = mm.include === true;
+    mapByHeaderNorm[k] = mm;
+  });
+
+  const statusIndex     = buildEmployeeStatusIndex_();     // contract type
+  const allocationIndex = buildEmployeeAllocationIndex_(); // allocation
+
+  // aggregated: key = HEADER||bucket||isConsultant
+  const agg = {}; // {count, sumSigned, sumAbs, examples[]}
+
+  rows.forEach(row => {
+    const empId = String(row[idxEmpId] || '').trim();
+    const empName = idxEmpName >= 0 ? String(row[idxEmpName] || '').trim() : '';
+    if (!empId) return;
+    if (_rowIsTotal_(empId, empName)) return;
+
+    const contractTypeRaw = statusIndex[empId] || '';
+    const allocationRaw   = allocationIndex[empId] || '';
+
+    headersUp.forEach((hKey, colIdx) => {
+      if (!hKey) return;
+      if (hKey === 'NET PAY') return; // generator also skips NET PAY in header loop
+
+      const mapping = mapByHeaderNorm[hKey];
+      if (!mapping || !mapping.include) return;
+
+      const v = Number(row[colIdx]);
+      if (isNaN(v) || Math.abs(v) < 1e-9) return;
+
+      const resolved = _resolveMappedAccount_(mapping, contractTypeRaw, allocationRaw);
+      const code = String(resolved.code || '').trim();
+
+      if (code) return; // only report missing account code cases
+
+      const bucket = (resolved.isConsultant ? 'CONSULTANT' : 'EMPLOYEE') + '_' + resolved.allocBucket; // e.g. EMPLOYEE_OPEX
+      const key = [headers[colIdx], bucket].join('||');
+
+      if (!agg[key]) {
+        agg[key] = { header: headers[colIdx], bucket, count: 0, sumSigned: 0, sumAbs: 0, examples: [] };
+      }
+      agg[key].count++;
+      agg[key].sumSigned += v;
+      agg[key].sumAbs += Math.abs(v);
+
+      if (agg[key].examples.length < 5) {
+        agg[key].examples.push({ empId, value: _round2_(v), contractType: contractTypeRaw, allocation: allocationRaw });
+      }
+    });
+  });
+
+  // sort by biggest abs impact
+  const out = Object.keys(agg)
+    .map(k => agg[k])
+    .sort((a,b) => b.sumAbs - a.sumAbs);
+
+  const result = {
+    sheet: sheet.getName(),
+    missingAccountHits: out.length,
+    top: out.slice(0, 30),
+    all: out
+  };
+
+  Logger.log(JSON.stringify(result, null, 2));
+  return result;
+}
+
+function debugBankPostingCoverage(postedSheetName) {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName(postedSheetName || ss.getActiveSheet().getName());
+  if (!sheet) throw new Error('Sheet not found: ' + postedSheetName);
+
+  const values = sheet.getDataRange().getValues();
+  if (values.length < 2) throw new Error('No data rows in sheet: ' + sheet.getName());
+
+  const hdrUp = values[0].map(h => _norm_(h));
+  const idxEmpId   = hdrUp.indexOf('EMPLOYEE ID');
+  const idxEmpName = hdrUp.indexOf('EMPLOYEE NAME');
+  const idxNetPay  = hdrUp.indexOf('NET PAY');
+
+  if (idxEmpId < 0) throw new Error('Missing EMPLOYEE ID column.');
+  if (idxNetPay < 0) {
+    return { ok:false, reason:'Posted sheet has no NET PAY column, so BANK step never runs.' };
+  }
+
+  const empToBank = buildEmployeeBankIndex_();
+  const bankMap = loadBankMap();
+  const coaByCode = {};
+  (getCoaAccounts() || []).forEach(a => { if (a && a.code) coaByCode[a.code] = a; });
+
+  const bankByKey = {};
+  bankMap.forEach(b => {
+    if (!b || !b.bankKey || !b.accountCode) return;
+    const coa = coaByCode[b.accountCode] || {};
+    bankByKey[b.bankKey] = { accountCode: b.accountCode, accountName: coa.name || '' };
+  });
+
+  let totalNet = 0;
+  let mappedNet = 0;
+  const skipped = []; // {empId, netPay, bankKey, reason}
+
+  values.slice(1).forEach(row => {
+    const empId = String(row[idxEmpId] || '').trim();
+    const empName = idxEmpName >= 0 ? String(row[idxEmpName] || '').trim() : '';
+    if (!empId) return;
+    if (_rowIsTotal_(empId, empName)) return;
+
+    const v = Number(row[idxNetPay]);
+    if (isNaN(v) || Math.abs(v) < 1e-9) return;
+
+    totalNet += v;
+
+    let bankKey = (empToBank[empId] || '').trim();
+    if (!bankKey) bankKey = '__DEFAULT__';
+
+    let bankAcct = bankByKey[bankKey];
+    if (!bankAcct && bankKey !== '__DEFAULT__') {
+      // fallback to default
+      bankKey = '__DEFAULT__';
+      bankAcct = bankByKey[bankKey];
+    }
+
+    if (!bankAcct || !bankAcct.accountCode) {
+      skipped.push({
+        empId,
+        netPay: _round2_(v),
+        bankKey,
+        reason: 'No bank mapping resolved (missing mapping for bankKey and/or __DEFAULT__).'
+      });
+      return;
+    }
+
+    mappedNet += v;
+  });
+
+  const out = {
+    sheet: sheet.getName(),
+    totalNetPay: _round2_(totalNet),
+    netPayWithResolvedBankGL: _round2_(mappedNet),
+    netPaySkipped: _round2_(totalNet - mappedNet),
+    skippedCount: skipped.length,
+    skipped: skipped
+  };
+
+  Logger.log(JSON.stringify(out, null, 2));
+  return out;
+}
+
+function debugMasterfileForDimensions() {
+  const mf = _openMasterfile_();
+  const lastCol = mf.sheet.getLastColumn();
+  const headers = mf.sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(h => String(h||''));
+  Logger.log('SS: ' + mf.ss.getName());
+  Logger.log('Sheet: ' + mf.sheet.getName());
+  Logger.log('Headers count: ' + headers.length);
+  Logger.log('Headers sample: ' + headers.slice(0, 30).join(' | '));
+  return { ss: mf.ss.getName(), sheet: mf.sheet.getName(), headersCount: headers.length, headers: headers };
+}
+// ===== Public (no-underscore) Odoo endpoints for container/UI =====
+function saveOdooConnection(conn) {
+  return saveOdooConnection_(conn);
+}
+
+function saveOdooJournalHints(payload) {
+  return saveOdooJournalHints_(payload);
+}
+
+function clearOdooIdCache() {
+  return clearOdooIdCache_();
+}
+function debugOdooJournals(kind) {
+  const odoo = _odooOpen_();
+  const t = (String(kind || '').toUpperCase() === 'BILL') ? 'purchase' : 'general';
+
+  const dom = [['type', '=', t]];
+  if (odoo.companyId) dom.push(['company_id', '=', odoo.companyId]);
+
+  const rows = _odooSearchRead_(
+    odoo,
+    'account.journal',
+    dom,
+    ['id', 'code', 'name', 'type', 'company_id'],
+    200
+  );
+
+  Logger.log(JSON.stringify({ companyId: odoo.companyId, type: t, journals: rows }, null, 2));
+  return rows;
+}
+
+
+function listOdooSuppliers() {
+  const odoo = _odooOpen_();
+
+  // supplier_rank > 0 = vendor/supplier in modern Odoo
+  const rows = _odooSearchRead_(
+    odoo,
+    'res.partner',
+    [['supplier_rank', '>', 0]],
+    ['id', 'name'],
+    2000
+  ) || [];
+
+  // Return sorted unique names
+  const seen = {};
+  const out = [];
+  rows.forEach(r => {
+    const n = String(r.name || '').trim();
+    if (!n) return;
+    if (seen[n]) return;
+    seen[n] = true;
+    out.push(n);
+  });
+
+  out.sort((a,b) => a.localeCompare(b));
+  return out;
+}
+
+function getPayrollPostingDialogInit() {
+  const cfg = _getSettings_() || {};
+  return {
+    provider: String(cfg.ACC_PROVIDER || '').trim().toUpperCase() || '',
+    odooCompanyId: cfg.ODOO_COMPANY_ID ? Number(cfg.ODOO_COMPANY_ID) : null
+  };
+}
+function DEBUG_PostingDialogInit() {
+  return {
+    postedSheets: PayrollCore.getPostedPayrollSheets(),
+    dimensionOptions: PayrollCore.getDimensionOptions(),
+    coaCount: (PayrollCore.getCoaAccounts() || []).length,
+    bankInit: PayrollCore.getBankMappingInitData(),
+    initCfg: PayrollCore.getPayrollPostingDialogInit()
+  };
+}
+
+function isOdooConfigured() {
+  // 1) Prefer the dedicated conn key (what _odooOpen_ uses)
+  const conn = loadOdooConnection_();
+  if (conn && conn.baseUrl && conn.db && conn.username && conn.apiKey) return true;
+
+  // 2) Fallback: if settings exist but conn key not yet written
+  const cfg = (typeof _getSettings_ === 'function') ? (_getSettings_() || {}) : (loadAccountingSettings_() || {});
+  const baseUrl = String(cfg.ODOO_BASE_URL || '').trim();
+  const db      = String(cfg.ODOO_DB || '').trim();
+  const user    = String(cfg.ODOO_USERNAME || '').trim();
+  const apiKey  = String(cfg.ODOO_API_KEY || '').trim();
+
+  return !!(baseUrl && db && user && apiKey);
+}
+
+function _isConsultantContract_(contractTypeRaw) {
+  const ct = _norm_(String(contractTypeRaw || ''));
+  // Allow values like "Consultant - Project" / "Freelance (PT)" (substring match).
+  return ct.indexOf('CONSULTANT') >= 0 || ct.indexOf('FREELANCE') >= 0;
+}
+

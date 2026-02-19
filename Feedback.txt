@@ -1,0 +1,1087 @@
+/**************************************************
+ * USER FEEDBACK (Centralized Spreadsheet) — v1.4 (FIXED ODOO NOTIFY)
+ * ------------------------------------------------
+ * ✅ Fixes:
+ *  - Removes duplicate notify functions
+ *  - Fixes Odoo execute_kw usage for message_post (keyword-only in newer Odoo)
+ *  - Adds reliable Gmail fallback email to assignees (so you actually receive an email)
+ *
+ * Notes:
+ *  - Odoo “Task Created” messages can exist without generating mail.notification/mail.mail
+ *    depending on Odoo mail settings. This script now ALWAYS sends Gmail fallback email
+ *    (configurable) so you don’t get blocked by Odoo’s outgoing mail config.
+ *
+ * ✅ CHANGE ONLY THIS ID:
+ *    FEEDBACK_REPO_SS_ID
+ **************************************************/
+
+
+
+// === ODOO TASK CREATION (Odoo 19) ===
+const ODOO_CFG = {
+  BASE_URL: "https://proseso-ventures.odoo.com",            // no trailing slash
+  DB: "proseso-ventures",                                  // database name
+  USERNAME: "joseph@proseso-consulting.com",             // login
+  API_KEY: "d34a856129a38111ec568c230bc04788965122a0", // API key
+
+  PROJECT_ID: 195,                                   // required (project.project id)
+  ASSIGNEE_UID: 21,                                 // default assignee uid
+
+  // Per-issue-type assignees (keys MUST match your <option value="..."> exactly)
+  ASSIGNEE_UID_BY_ISSUE_TYPE: {
+    "Pay amount looks off": 31,
+    "Deduction/loan amount looks off": 31,
+    "Payroll won’t run / shows an error": 31,
+    "Payslip doesn’t look right": 31,
+    "Report/Export issue": 31,
+    "Settings/Setup issue": 31,
+    "Data entry/import issue": 31,
+    "Access/Permission issue": 31,
+    "Bug": 21,
+    "UI/UX": 21,
+    "Feature request": 21,
+    "Others": 21
+  },
+
+  STAGE_ID: 100,                                     // optional (project.task.type id)
+
+  // Per-issue-type stages (keys MUST match your <option value="..."> exactly)
+  // Values MUST be project.task.type IDs
+  STAGE_ID_BY_ISSUE_TYPE: {
+    "Pay amount looks off": 0,
+    "Deduction/loan amount looks off": 0,
+    "Payroll won’t run / shows an error": 0,
+    "Payslip doesn’t look right": 0,
+    "Report/Export issue": 0,
+    "Settings/Setup issue": 0,
+    "Data entry/import issue": 0,
+    "Access/Permission issue": 0,
+    "Bug": 0,
+    "UI/UX": 0,
+    "Feature request": 315,
+    "Others": 0
+  },
+
+  DEADLINE_HOURS: 24,                           // ✅ exact 24 hours from creation
+  DEADLINE_DAYS: 1,                                // +1 day
+  DEADLINE_HOUR: 12,                               // 12 noon
+  DEADLINE_MINUTE: 0,
+  DEADLINE_TZ: "Asia/Manila",                      // interpret noon in this TZ
+};
+
+const FEEDBACK_EMAIL_CFG = {
+  // Optional: always CC these addresses (comma-separated)
+  CC: "joseph@proseso-consulting.com",
+
+  // ✅ If true: always send Gmail email regardless of Odoo mail config
+  ALWAYS_SEND_GMAIL_FALLBACK: true,
+
+  // REQUIRED fallback map when Odoo res.users email read is blocked/restricted
+  USER_EMAIL_BY_UID: {
+    2: "joseph@proseso-consulting.com"
+    // 3: "someone@yourdomain.com",
+  },
+};
+
+// Odoo subtype for project.task "Task Created" (you already confirmed id=4)
+const ODOO_TASK_CREATED_SUBTYPE_ID = 4;
+const ODOO_DISCUSSIONS_SUBTYPE_ID  = 1;
+
+// =========================
+// CONTEXT BUILDER (REQUIRED)
+// =========================
+function _feedbackContext_(moduleName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const userEmail = (function () {
+    try { return Session.getActiveUser().getEmail() || ""; } catch (_) {}
+    try { return Session.getEffectiveUser().getEmail() || ""; } catch (_) {}
+    return "";
+  })();
+
+  let sheetName = "";
+  let activeCellA1 = "";
+  try {
+    const sh = ss.getActiveSheet();
+    sheetName = sh ? sh.getName() : "";
+    const r = sh ? sh.getActiveRange() : null;
+    activeCellA1 = r ? r.getA1Notation() : "";
+  } catch (_) {}
+
+  return {
+    module: String(moduleName || "").trim(),
+    userEmail: userEmail || "(not available)",
+
+    fileName: ss ? ss.getName() : "",
+    fileId: ss ? ss.getId() : "",
+    fileUrl: ss ? ss.getUrl() : "",
+
+    sheetName: sheetName,
+    activeCellA1: activeCellA1,
+
+    timestampIso: new Date().toISOString()
+  };
+}
+
+
+// =========================
+// UI ENTRYPOINT
+// =========================
+
+function showFeedbackDialog(moduleName) {
+  const ctx = _feedbackContext_(moduleName);
+
+  const t = HtmlService.createTemplateFromFile("FeedbackDialog");
+  t.ctx = ctx;
+
+  const html = t.evaluate().setWidth(520).setHeight(520);
+  SpreadsheetApp.getUi().showModalDialog(html, "Send Feedback");
+}
+
+// Called by HTML via google.script.run (container wrapper required)
+function submitUserFeedback(payload) {
+  const p = payload || {};
+
+  const issueType = String(p.issueType || "").trim();
+  const details = String(p.details || "").trim();
+  const otherConcern = String(p.otherConcern || "").trim();
+  const moduleName = String(p.moduleName || "").trim();
+
+  let ssArr = Array.isArray(p && p.screenshots) ? (p.screenshots.slice()) : [];
+
+// Backward compat if older HTML still sends p.screenshot
+if (!ssArr.length && p && p.screenshot && typeof p.screenshot === "object") {
+  ssArr.push(p.screenshot);
+}
+
+
+
+
+  if (!issueType) return { ok: false, message: "Issue type is required." };
+  if (!details) return { ok: false, message: "Details are required." };
+
+  // Server-side truth for context (source file)
+  const ctx = _feedbackContext_(moduleName);
+
+_logFeedback_("[PayrollCore submitUserFeedback] context ready");
+
+
+  
+    // Optional screenshot upload (Drive) -> URL
+  let screenshotUrls = []; // array of URLs
+try {
+  (ssArr || []).forEach(function(s) {
+    const dataUrl = String(s && s.dataUrl || "").trim();
+    if (!dataUrl) return;
+
+        const url = _saveFeedbackScreenshot_(ctx, {
+      dataUrl: dataUrl,
+      name: String(s && s.name || "").trim(),
+      mimeType: String(s && s.mimeType || "").trim()
+    });
+
+
+    if (url) screenshotUrls.push(url);
+  });
+} catch (e) {
+  const m = "[Feedback] Screenshot upload failed: " + _errStr_(e);
+  _logFeedback_(m);
+}
+
+
+  const detailsWithShot = screenshotUrls.length
+  ? (details + "\n\nScreenshots:\n" + screenshotUrls.join("\n"))
+  : details;
+
+
+
+  
+  // --- Create Odoo task (best-effort) ---
+  let odooTaskId = "";
+  const warnings = [];
+
+  try {
+    const vals = _odooTaskValsFromFeedback_(ctx, issueType, detailsWithShot, otherConcern);
+    odooTaskId = String(_odooCreateTask_(vals) || "");
+    _logFeedback_("[PayrollCore submitUserFeedback] created odoo task id=" + odooTaskId);
+    // ✅ Create Odoo attachments (ir.attachment) linked to the task
+    let odooAttachmentIds = [];
+    try {
+      odooAttachmentIds = _odooAttachFilesToTask_(Number(odooTaskId || 0), ssArr);
+      _logFeedback_("[Feedback] Odoo attachments created: " + JSON.stringify(odooAttachmentIds));
+    } catch (eAtt) {
+      const mAtt = "[Feedback] Odoo attachment upload failed: " + _errStr_(eAtt);
+      _logFeedback_(mAtt);
+      warnings.push(mAtt);
+    }
+
+
+    // ✅ Odoo notify attempt (fixed keyword-only message_post)
+    try {
+      _odooNotifyAssignees_TaskCreated_(Number(odooTaskId || 0), issueType, odooAttachmentIds);
+    } catch (e) {
+      const m = "[Feedback] Odoo notify pipeline failed: " + _errStr_(e);
+      _logFeedback_(m);
+      warnings.push(m);
+    }
+
+    // ✅ Gmail fallback (reliable “you will receive email” path)
+    try {
+      if (FEEDBACK_EMAIL_CFG.ALWAYS_SEND_GMAIL_FALLBACK) {
+        _sendFeedbackEmailToAssignees_(ctx, issueType, detailsWithShot, otherConcern, odooTaskId);
+
+      }
+    } catch (e) {
+      const m = "[Feedback] Gmail fallback email failed: " + _errStr_(e);
+      _logFeedback_(m);
+      warnings.push(m);
+    }
+
+  } catch (e) {
+    return {
+  ok: false,
+  message: "Failed to create Odoo task.\n" + _errStr_(e)
+};
+
+  }
+
+  const odooTaskUrl = _odooTaskUrl_(odooTaskId);
+
+return {
+  ok: true,
+  odooTaskId: odooTaskId,
+  odooTaskUrl: odooTaskUrl,
+  warnings: warnings
+};
+
+}
+
+
+// =========================
+// ODOO JSON-RPC (CORRECT execute_kw)
+// =========================
+
+function _feedbackOdooJsonRpc_(paramsObj) {
+
+  const url = String(ODOO_CFG.BASE_URL || "").trim() + "/jsonrpc";
+  const payload = {
+    jsonrpc: "2.0",
+    method: "call",
+    params: paramsObj,
+    id: String(new Date().getTime()),
+  };
+
+  const resp = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+  });
+
+  const txt = resp.getContentText();
+  let data;
+  try {
+    data = JSON.parse(txt);
+  } catch (e) {
+    throw new Error("Odoo JSON-RPC non-JSON response: " + txt);
+  }
+
+  if (data && data.error) {
+    const msg = (data.error && data.error.message) ? data.error.message : "Odoo JSON-RPC error";
+    throw new Error(msg + " | data=" + JSON.stringify(data.error));
+  }
+  return data ? data.result : null;
+}
+
+function _odooAuthenticateUid_() {
+  const db = String(ODOO_CFG.DB || "").trim();
+  const username = String(ODOO_CFG.USERNAME || "").trim();
+  const apiKey = String(ODOO_CFG.API_KEY || "").trim();
+
+  if (!db || !username || !apiKey) {
+    throw new Error("ODOO_CFG DB/USERNAME/API_KEY must be set.");
+  }
+
+  const uid = _feedbackOdooJsonRpc_({
+  service: "common",
+  method: "authenticate",
+  args: [db, username, apiKey, {}],
+});
+
+
+  if (!uid) throw new Error("Odoo authenticate returned empty uid. Check DB/USERNAME/API_KEY.");
+  return uid;
+}
+
+/**
+ * Generic execute_kw wrapper:
+ * - methodArgs is ARRAY of positional args
+ * - kwargs is OBJECT of keyword args (and may include {context:{...}})
+ */
+function _odooExecuteKw_(model, method, methodArgs, kwargs) {
+  const db = String(ODOO_CFG.DB || "").trim();
+  const apiKey = String(ODOO_CFG.API_KEY || "").trim();
+  const uid = _odooAuthenticateUid_();
+
+  const argsArray = Array.isArray(methodArgs) ? methodArgs : [];
+  const kwargsObj = (kwargs && typeof kwargs === "object") ? kwargs : {};
+
+  return _feedbackOdooJsonRpc_({
+  service: "object",
+  method: "execute_kw",
+  args: [db, uid, apiKey, String(model), String(method), argsArray, kwargsObj],
+});
+
+}
+
+function _odooCreateTask_(vals) {
+  const tz = String(ODOO_CFG.DEADLINE_TZ || "").trim();
+  const kwargs = tz ? { context: { tz: tz } } : {};
+  return _odooExecuteKw_("project.task", "create", [vals], kwargs);
+}
+
+// field existence cache
+const _ODOO_TASK_FIELD_CACHE = {}; // { "<field>": true/false }
+
+function _fmtOdooDate_(d, tz) {
+  const z = String(tz || Session.getScriptTimeZone() || "GMT").trim();
+  return Utilities.formatDate(d, z, "yyyy-MM-dd");
+}
+
+function _fmtOdooDatetime_(d, tz) {
+  const z = String(tz || Session.getScriptTimeZone() || "GMT").trim();
+  return Utilities.formatDate(d, z, "yyyy-MM-dd HH:mm:ss");
+}
+
+function _fmtOdooDatetimeUtc_(d) {
+  // Odoo stores datetime in UTC; UI converts to user TZ
+  return Utilities.formatDate(d, "GMT", "yyyy-MM-dd HH:mm:ss");
+}
+
+
+function _odooTaskHasField_(fieldName) {
+  const f = String(fieldName || "").trim();
+  if (!f) return false;
+  if (Object.prototype.hasOwnProperty.call(_ODOO_TASK_FIELD_CACHE, f)) return _ODOO_TASK_FIELD_CACHE[f];
+
+  const res = _odooExecuteKw_("project.task", "fields_get", [[f], ["type"]], {});
+  const ok = !!(res && res[f]);
+  _ODOO_TASK_FIELD_CACHE[f] = ok;
+  return ok;
+}
+
+// =========================
+// TASK PAYLOAD BUILDER
+// =========================
+
+function _odooTaskValsFromFeedback_(ctx, issueType, details, otherConcern) {
+  const projectId = Number(ODOO_CFG.PROJECT_ID || 0);
+  if (!projectId) throw new Error("ODOO_CFG.PROJECT_ID must be set to a valid Odoo Project ID.");
+
+  const title =
+    "[" + (String(ctx.module || "Feedback")) + "] " +
+    String(issueType || "Feedback").trim() +
+    " — " +
+    String(ctx.fileName || "").trim();
+
+  const oneLine = (v) => String(v == null ? "" : v).replace(/\s+/g, " ").trim();
+
+  const bodyLines = [
+    "Module: " + oneLine(ctx.module || ""),
+    "User: " + oneLine(ctx.userEmail || "(not available)"),
+    "Source File: " + oneLine(ctx.fileName || ""),
+    "Source File ID: " + oneLine(ctx.fileId || ""),
+    "Source URL: " + oneLine(ctx.fileUrl || ""),
+    "Active Sheet: " + oneLine(ctx.sheetName || ""),
+    "Active Cell: " + oneLine(ctx.activeCellA1 || ""),
+    "Timestamp ISO: " + oneLine(ctx.timestampIso || ""),
+    "Issue Type: " + oneLine(issueType || ""),
+    "Details: " + oneLine(details || ""),
+    "Other Concerns: " + oneLine(otherConcern || ""),
+  ];
+
+  const escHtml = (s) =>
+    String(s == null ? "" : s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+
+  const safeHref = (url) => {
+    const u = String(url == null ? "" : url).trim();
+    if (!/^https?:\/\//i.test(u)) return "";
+    return u;
+  };
+
+  const sourceUrl = safeHref(ctx.fileUrl || "");
+
+  const descriptionHtml = bodyLines.map(function(line) {
+    const s = String(line || "");
+    if (s.indexOf("Source URL:") === 0) {
+      if (!sourceUrl) return escHtml(s);
+      const label = escHtml("Source URL: ");
+      const linkText = escHtml(sourceUrl);
+      const href = escHtml(sourceUrl);
+      return label + '<a href="' + href + '" target="_blank" rel="noopener noreferrer">' + linkText + "</a>";
+    }
+    return escHtml(s);
+  }).join("<br/>");
+
+  const vals = {
+    name: title,
+    description: descriptionHtml,
+    project_id: projectId,
+  };
+
+  // Assignee per issue type (fallback to default ASSIGNEE_UID)
+  const ids = _resolveAssigneeUidsForIssue_(issueType);
+  if (ids.length) {
+    vals.user_ids = [[6, 0, ids]];
+  }
+
+    // Stage (per issue type, fallback to default)
+  const stageId = _resolveStageIdForIssue_(issueType);
+  if (stageId) vals.stage_id = stageId;
+
+
+      // Deadline (✅ exact +24 hours from creation time)
+  const deadlineHours = Number(ODOO_CFG.DEADLINE_HOURS || 24);
+
+  if (deadlineHours > 0) {
+    const nowMs = new Date().getTime();
+    const due = new Date(nowMs + (deadlineHours * 60 * 60 * 1000));
+
+    // ✅ date_deadline is DATETIME in your Odoo (per DEBUG), so send UTC datetime
+    vals.date_deadline = _fmtOdooDatetimeUtc_(due);
+  }
+
+
+
+  return vals;
+}
+
+function _resolveAssigneeUidsForIssue_(issueType) {
+  const issueKey = String(issueType || "").trim();
+  const map = (ODOO_CFG && ODOO_CFG.ASSIGNEE_UID_BY_ISSUE_TYPE) ? ODOO_CFG.ASSIGNEE_UID_BY_ISSUE_TYPE : {};
+
+  let assignees = map[issueKey];
+  if (assignees == null) assignees = ODOO_CFG.ASSIGNEE_UID;
+
+  let ids = [];
+  if (Array.isArray(assignees)) {
+    ids = assignees.map(n => Number(n)).filter(n => n > 0);
+  } else {
+    const one = Number(assignees || 0);
+    if (one > 0) ids = [one];
+  }
+  return ids;
+}
+
+function _resolveStageIdForIssue_(issueType) {
+  const map = (ODOO_CFG && ODOO_CFG.STAGE_ID_BY_ISSUE_TYPE && typeof ODOO_CFG.STAGE_ID_BY_ISSUE_TYPE === "object")
+    ? ODOO_CFG.STAGE_ID_BY_ISSUE_TYPE
+    : {};
+
+  const rawKey = String(issueType || "").trim();
+  const normKey = rawKey.replace(/[\u2018\u2019]/g, "'"); // normalize smart quotes → straight
+
+  // try raw key first, then normalized key
+  let sid = Number(map[rawKey] || 0);
+  if (sid <= 0 && normKey !== rawKey) sid = Number(map[normKey] || 0);
+
+  if (sid > 0) return sid;
+
+  const fallback = Number(ODOO_CFG.STAGE_ID || 0);
+  return fallback > 0 ? fallback : 0;
+}
+
+
+
+// =========================
+// ✅ FIXED ODOO NOTIFY PIPELINE
+// =========================
+
+/**
+ * Ensures assignees are subscribed to subtype 4 (Task Created) then posts a Task Created notification.
+ *
+ * IMPORTANT FIX:
+ * - message_post is keyword-only in newer Odoo => do NOT pass a dict as positional arg.
+ *   Correct:
+ *     execute_kw(..., "message_post", [[tid]], {body: "...", message_type:"notification", ...})
+ */
+function _odooNotifyAssignees_TaskCreated_(taskId, issueType, attachmentIds) {
+  const tid = Number(taskId || 0);
+  if (!tid) throw new Error("Invalid taskId for notify.");
+
+  const assigneeUids = _resolveAssigneeUidsForIssue_(issueType);
+  if (!assigneeUids.length) {
+    _logFeedback_("[OdooNotify] No assignee UIDs resolved; skipping Odoo notify.");
+    return;
+  }
+
+  const partnerIds = _odooGetPartnerIdsByUserUids_(assigneeUids);
+  if (!partnerIds.length) {
+    _logFeedback_("[OdooNotify] No partner IDs resolved from assignee UIDs=" + JSON.stringify(assigneeUids));
+    return;
+  }
+
+  const tz = String(ODOO_CFG.DEADLINE_TZ || "").trim();
+
+  // 1) Subscribe partners (include Task Created)
+  _odooExecuteKw_(
+    "project.task",
+    "message_subscribe",
+    [[tid], partnerIds],
+        {
+      subtype_ids: [ODOO_DISCUSSIONS_SUBTYPE_ID, ODOO_TASK_CREATED_SUBTYPE_ID],
+      context: tz ? { tz: tz } : {}
+    }
+
+  );
+
+  // 2) Post notification (KEYWORD ARGS ONLY) + force send context
+  const body =
+    "Task created from Google Sheets feedback form.<br/>" +
+    "Issue: " + String(issueType || "").trim();
+
+  _odooExecuteKw_(
+    "project.task",
+    "message_post",
+    [[tid]],
+    {
+  body: body,
+  message_type: "notification",
+  subtype_id: ODOO_TASK_CREATED_SUBTYPE_ID,
+  partner_ids: partnerIds, // explicit recipients
+  attachment_ids: Array.isArray(attachmentIds) ? attachmentIds : [],
+  context: Object.assign(
+    {},
+    tz ? { tz: tz } : {},
+    { mail_notify_force_send: true }
+  )
+}
+
+  );
+
+  _logFeedback_(
+    "[OdooNotify] Posted Task Created notification. taskId=" + tid +
+    " partnerIds=" + JSON.stringify(partnerIds)
+  );
+}
+
+function _odooGetPartnerIdsByUserUids_(userUids) {
+  const ids = (userUids || []).map(n => Number(n)).filter(n => n > 0);
+  if (!ids.length) return [];
+
+  const rows = _odooExecuteKw_("res.users", "read", [ids, ["id", "partner_id"]], {}) || [];
+  const partnerIds = [];
+
+  (rows || []).forEach(r => {
+    const p = r && r.partner_id; // [id, name]
+    const pid = Array.isArray(p) ? Number(p[0]) : 0;
+    if (pid > 0) partnerIds.push(pid);
+  });
+
+  return Array.from(new Set(partnerIds));
+}
+
+// =========================
+// ✅ GMAIL FALLBACK EMAIL (ASSIGNEE + CC)
+// =========================
+
+function _sendFeedbackEmailToAssignees_(ctx, issueType, detailsWithShot, otherConcern, odooTaskId) {
+  const ids = _resolveAssigneeUidsForIssue_(issueType);
+  if (!ids.length) return;
+
+  let emailMap = {};
+  try {
+    emailMap = _odooGetUserEmailsByUid_(ids);
+  } catch (e) {
+    _logFeedback_(
+      "[Feedback] Odoo email lookup failed. Using local UID->email map. " +
+      "uids=" + JSON.stringify(ids) + " | " +
+      "error=" + (e && e.message ? e.message : String(e))
+    );
+    emailMap = (FEEDBACK_EMAIL_CFG && FEEDBACK_EMAIL_CFG.USER_EMAIL_BY_UID)
+      ? FEEDBACK_EMAIL_CFG.USER_EMAIL_BY_UID
+      : {};
+  }
+
+  const toList = ids
+    .map(id => String(emailMap[id] || "").trim())
+    .filter(e => e);
+
+  if (!toList.length) return;
+
+  const cc = String(FEEDBACK_EMAIL_CFG.CC || "").trim();
+
+  const subject =
+    "New Feedback: " + String(issueType || "Feedback") +
+    " (" + String(ctx.module || "") + ")";
+
+  // ✅ DEFINE taskUrl HERE so it can’t be undefined
+  const taskUrl = _odooTaskUrl_(odooTaskId);
+
+    const fileUrl = String(ctx.fileUrl || "").trim();
+  const fileUrlSafe = fileUrl ? ("<" + fileUrl + ">") : "";
+  const taskUrlSafe = taskUrl ? ("<" + taskUrl + ">") : "";
+
+
+  // ✅ Build body safely (no dangling +, easy to edit)
+  const lines = [
+    "A feedback was submitted and an Odoo task was created.",
+    "",
+    "Issue Type: " + String(issueType || ""),
+    "Module: " + String(ctx.module || ""),
+    "Reported by: " + String(ctx.userEmail || "(not available)"),
+    "File: " + String(ctx.fileName || ""),
+        "Link:",
+    fileUrlSafe || "(not available)",
+    "Sheet/Cell: " + String(ctx.sheetName || "") + " / " + String(ctx.activeCellA1 || ""),
+
+    "Time: " + String(ctx.timestampIso || ""),
+    "",
+    "Details:",
+    String(detailsWithShot || ""),
+    "",
+    "Other concerns:",
+    String(otherConcern || ""),
+    "",
+        "Odoo Task Link:",
+    taskUrlSafe || "(not available)",
+
+    "Odoo Task ID: " + String(odooTaskId || "")
+  ];
+
+  const msg = {
+    to: toList.join(","),
+    subject: subject,
+    body: lines.join("\n"),
+  };
+  if (cc) msg.cc = cc;
+_logFeedback_("[PayrollCore submitUserFeedback] sending gmail fallback to=" + msg.to + " cc=" + (msg.cc || ""));
+
+  MailApp.sendEmail(msg);
+}
+
+
+function _odooGetUserEmailsByUid_(uids) {
+  const ids = (uids || []).map(n => Number(n)).filter(n => n > 0);
+  if (!ids.length) return {};
+
+  // Try to read from res.users (may be restricted in your environment)
+  const rows = _odooExecuteKw_("res.users", "read", [ids, ["id", "name", "email", "login"]], {}) || [];
+
+  const map = {};
+  (rows || []).forEach(function(r) {
+    const id = Number(r && r.id);
+    // Prefer email, else login
+    const email = String((r && (r.email || r.login)) || "").trim();
+    if (id > 0 && email) map[id] = email;
+  });
+  return map;
+}
+
+// =========================
+// LOGGING / ERR
+// =========================
+
+function _logFeedback_(msg) {
+  Logger.log(String(msg || ""));
+}
+
+function _errStr_(e) {
+  try {
+    if (e && e.message) return String(e.message);
+    return String(e);
+  } catch (_) {
+    return "Unknown error";
+  }
+}
+
+// =========================
+// DEBUG HELPERS (OPTIONAL)
+// =========================
+
+function DEBUG_OdooTaskEmailPipeline(taskId) {
+  const tid = Number(taskId || 0);
+  Logger.log("=== DEBUG Odoo Task Email Pipeline (SAFE) ===");
+  Logger.log("Task ID=" + tid);
+  if (!tid) return;
+
+  try {
+    const task = _odooExecuteKw_("project.task", "read", [[tid], [
+      "id","name","user_ids","stage_id","date_deadline","create_date","write_date","message_follower_ids","message_ids"
+    ]], {});
+    Logger.log("[task.read] " + JSON.stringify(task && task[0] ? task[0] : task));
+  } catch (e) {
+    Logger.log("[task.read] FAILED: " + _errStr_(e));
+  }
+
+  try {
+    const followers = _odooExecuteKw_("mail.followers", "search_read", [[
+      ["res_model","=","project.task"],
+      ["res_id","=",tid]
+    ]], {
+      fields: ["id","res_model","res_id","partner_id","subtype_ids"],
+      order: "id desc",
+      limit: 50
+    });
+    Logger.log("[mail.followers] count=" + (followers ? followers.length : 0));
+    (followers || []).slice(0, 10).forEach(f => {
+      Logger.log("  fol.id=" + f.id + " partner_id=" + JSON.stringify(f.partner_id) + " subtype_ids=" + JSON.stringify(f.subtype_ids));
+    });
+  } catch (e) {
+    Logger.log("[mail.followers] FAILED: " + _errStr_(e));
+  }
+
+  let msgIds = [];
+  try {
+    const msgs = _odooExecuteKw_("mail.message", "search_read", [[
+      ["model","=","project.task"],
+      ["res_id","=",tid]
+    ]], {
+      fields: ["id","date","message_type","subtype_id","subject","author_id","partner_ids"],
+      order: "id desc",
+      limit: 10
+    });
+
+    Logger.log("[mail.message] count=" + (msgs ? msgs.length : 0));
+    (msgs || []).forEach(m => {
+      Logger.log("  msg.id=" + m.id + " type=" + m.message_type + " subtype=" + JSON.stringify(m.subtype_id) + " subject=" + (m.subject || ""));
+    });
+
+    msgIds = (msgs || []).map(m => Number(m.id)).filter(n => n > 0);
+  } catch (e) {
+    Logger.log("[mail.message] FAILED: " + _errStr_(e));
+  }
+
+  try {
+    if (!msgIds.length) throw new Error("No message IDs found.");
+    const notifs = _odooExecuteKw_("mail.notification", "search_read", [[
+      ["mail_message_id","in",msgIds]
+    ]], {
+      fields: ["id","mail_message_id","res_partner_id","notification_type","notification_status","failure_type","failure_reason"],
+      order: "id desc",
+      limit: 200
+    });
+    Logger.log("[mail.notification] count=" + (notifs ? notifs.length : 0));
+  } catch (e) {
+    Logger.log("[mail.notification] FAILED: " + _errStr_(e));
+  }
+
+  try {
+    if (!msgIds.length) throw new Error("No message IDs found.");
+    const mails = _odooExecuteKw_("mail.mail", "search_read", [[
+      ["mail_message_id","in",msgIds]
+    ]], {
+      fields: ["id","state","email_to","email_cc","subject","failure_reason"],
+      order: "id desc",
+      limit: 50
+    });
+    Logger.log("[mail.mail] count=" + (mails ? mails.length : 0));
+  } catch (e) {
+    Logger.log("[mail.mail] FAILED: " + _errStr_(e));
+  }
+
+  Logger.log("=== END DEBUG ===");
+}
+
+// 1) ADD this helper anywhere in Feedback.gs (e.g., near other helpers)
+function _odooTaskUrl_(taskId) {
+  const tid = Number(taskId || 0);
+  if (!tid) return "";
+
+  const base = String(ODOO_CFG.BASE_URL || "").trim().replace(/\/+$/, "");
+  if (!base) return "";
+
+  return base + "/web#id=" + encodeURIComponent(String(tid)) + "&model=project.task&view_type=form";
+}
+
+function _odooAttachFilesToTask_(taskId, filesArr) {
+  const tid = Number(taskId || 0);
+  if (!tid) return [];
+
+  const arr = Array.isArray(filesArr) ? filesArr : [];
+  if (!arr.length) return [];
+
+  const ids = [];
+
+  arr.forEach(function(f, i) {
+    const dataUrl = String(f && f.dataUrl || "").trim();
+    if (!dataUrl) return;
+
+    const parsed = _parseDataUrlBase64_(dataUrl);
+    if (!parsed.base64) return;
+
+    const mimeType = String((f && f.mimeType) || parsed.mimeType || "application/octet-stream").trim();
+    const name = String((f && f.name) || "").trim() || ("Feedback-Attachment-" + String(i + 1));
+
+    const id = _odooCreateTaskAttachment_(tid, name, mimeType, parsed.base64);
+    if (id) ids.push(Number(id));
+  });
+
+  // unique + numeric
+  return Array.from(new Set(ids)).filter(function(n) { return n > 0; });
+}
+
+function _odooCreateTaskAttachment_(taskId, name, mimeType, base64Data) {
+  const tid = Number(taskId || 0);
+  if (!tid) return 0;
+
+  const vals = {
+    name: String(name || "attachment").trim(),
+    type: "binary",
+    datas: String(base64Data || "").trim(), // base64 (no data: prefix)
+    mimetype: String(mimeType || "application/octet-stream").trim(),
+    res_model: "project.task",
+    res_id: tid
+  };
+
+  return _odooExecuteKw_("ir.attachment", "create", [vals], {}) || 0;
+}
+
+function _parseDataUrlBase64_(dataUrl) {
+  const s = String(dataUrl || "").trim();
+  const m = s.match(/^data:([^;]+);base64,(.+)$/i);
+  if (!m) return { mimeType: "", base64: "" };
+  return {
+    mimeType: String(m[1] || "").trim(),
+    base64: String(m[2] || "").trim()
+  };
+}
+
+
+function _getOrCreateFeedbackScreenshotFolder_(ctx) {
+  // Put screenshots beside the ACTIVE spreadsheet file (same Drive folder), fallback to root
+  const activeFile = DriveApp.getFileById(String(ctx && ctx.fileId || "").trim());
+
+  let parentFolder = null;
+  const parents = activeFile.getParents();
+  if (parents && parents.hasNext()) parentFolder = parents.next();
+
+  const folderName = "Feedback Screenshots";
+  let target = null;
+
+  try {
+    const searchIn = parentFolder || DriveApp.getRootFolder();
+    const iter = searchIn.getFoldersByName(folderName);
+    if (iter.hasNext()) target = iter.next();
+    else target = searchIn.createFolder(folderName);
+  } catch (e) {
+    const iter2 = DriveApp.getRootFolder().getFoldersByName(folderName);
+    target = iter2.hasNext() ? iter2.next() : DriveApp.getRootFolder().createFolder(folderName);
+  }
+
+  return target;
+}
+
+
+function _saveFeedbackScreenshot_(ctx, shot) {
+  const dataUrl = String(shot && shot.dataUrl || "").trim();
+  if (!dataUrl) return "";
+
+  // Expect data URL like: data:image/png;base64,XXXX
+  const m = dataUrl.match(/^data:([^;]+);base64,(.+)$/i);
+  if (!m) throw new Error("Invalid screenshot format (expected base64 data URL).");
+
+  const mimeType = String(m[1] || "image/png").trim();
+  const b64 = String(m[2] || "").trim();
+  if (!b64) throw new Error("Empty screenshot payload.");
+
+  const bytes = Utilities.base64Decode(b64);
+  const blob = Utilities.newBlob(bytes, mimeType);
+
+  const tz = String((ODOO_CFG && ODOO_CFG.DEADLINE_TZ) || Session.getScriptTimeZone() || "GMT").trim();
+  const stamp = Utilities.formatDate(new Date(), tz, "yyyyMMdd-HHmmss");
+
+  const cleanModule = String((ctx && ctx.module) || "Feedback")
+    .replace(/[^\w\- ]+/g, "")
+    .trim()
+    .slice(0, 40);
+
+  const ext =
+    mimeType.toLowerCase().indexOf("png") !== -1 ? "png" :
+    mimeType.toLowerCase().indexOf("jpeg") !== -1 ? "jpg" :
+    mimeType.toLowerCase().indexOf("jpg") !== -1 ? "jpg" : "img";
+
+  const filename = `Feedback-${cleanModule || "Feedback"}-${stamp}.${ext}`;
+  blob.setName(filename);
+
+  const folder = _getOrCreateFeedbackScreenshotFolder_(ctx);
+  const file = folder.createFile(blob);
+
+  // Make link accessible (best-effort). Remove if you want Drive-permission-only access.
+  try {
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  } catch (_) {}
+
+  return file.getUrl();
+}
+
+
+function DEBUG_WhichProjectAndConstants() {
+  const out = {
+    scriptId: "",
+    has_FEEDBACK_REPO_SS_ID: (typeof FEEDBACK_REPO_SS_ID !== "undefined"),
+    has_FEEDBACK_REPO_SHEET_NAME: (typeof FEEDBACK_REPO_SHEET_NAME !== "undefined"),
+    repoIdValue: "",
+  };
+  try { out.scriptId = ScriptApp.getScriptId(); } catch (_) {}
+  try { out.repoIdValue = String(FEEDBACK_REPO_SS_ID || ""); } catch (_) {}
+  Logger.log(JSON.stringify(out, null, 2));
+  return out;
+}
+function DEBUG_Feedback_UserSubmitPrereqs() {
+  var out = {
+    scriptId: "",
+    spreadsheetId: "",
+    spreadsheetName: "",
+    activeUserEmail: "",
+    effectiveUserEmail: "",
+    payrollCorePresent: false,
+    payrollCoreType: "",
+    hasRepoConst: false,
+    repoIdResolved: "",
+    repoOpenOk: false,
+    repoName: "",
+    repoError: "",
+    nowIso: new Date().toISOString()
+  };
+
+  try { out.scriptId = ScriptApp.getScriptId(); } catch (_) {}
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    out.spreadsheetId = ss.getId();
+    out.spreadsheetName = ss.getName();
+  } catch (_) {}
+
+  try { out.activeUserEmail = Session.getActiveUser().getEmail() || ""; } catch (_) {}
+  try { out.effectiveUserEmail = Session.getEffectiveUser().getEmail() || ""; } catch (_) {}
+
+  // PayrollCore presence (do NOT reference PayrollCore identifier directly)
+  try {
+    var pc = (typeof globalThis !== "undefined") ? globalThis.PayrollCore : null;
+    out.payrollCorePresent = !!pc;
+    out.payrollCoreType = pc == null ? String(typeof pc) : Object.prototype.toString.call(pc);
+  } catch (e) {
+    out.payrollCorePresent = false;
+    out.payrollCoreType = "ERROR: " + (e && e.message ? e.message : String(e));
+  }
+
+  // Repo const + open test
+  try {
+    out.hasRepoConst = (typeof FEEDBACK_REPO_SS_ID !== "undefined");
+    if (!out.hasRepoConst) throw new Error("FEEDBACK_REPO_SS_ID is not defined");
+
+    var id = String(FEEDBACK_REPO_SS_ID || "").trim();
+    var m = id.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (m && m[1]) id = m[1];
+    out.repoIdResolved = id;
+
+    var file = DriveApp.getFileById(id);
+    var repo = SpreadsheetApp.open(file);
+    out.repoOpenOk = true;
+    out.repoName = repo.getName();
+  } catch (e2) {
+    out.repoOpenOk = false;
+    out.repoError = (e2 && e2.message) ? e2.message : String(e2);
+  }
+
+  Logger.log(JSON.stringify(out, null, 2));
+  return out;
+}
+
+function DEBUG_PayrollCore_FeedbackRepoAccess() {
+  var out = {
+    inLibrary: true,
+    hasRepoConst: (typeof FEEDBACK_REPO_SS_ID !== "undefined"),
+    repoIdResolved: "",
+    repoOpenOk: false,
+    repoName: "",
+    repoError: "",
+    mailQuotaOk: false,
+    mailQuota: null,
+    mailError: "",
+    nowIso: new Date().toISOString()
+  };
+
+  // repo open
+  try {
+    var id = String(FEEDBACK_REPO_SS_ID || "").trim();
+    var m = id.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    if (m && m[1]) id = m[1];
+    out.repoIdResolved = id;
+
+    var file = DriveApp.getFileById(id);
+    var ss = SpreadsheetApp.open(file);
+    out.repoOpenOk = true;
+    out.repoName = ss.getName();
+  } catch (e) {
+    out.repoOpenOk = false;
+    out.repoError = (e && e.message) ? e.message : String(e);
+  }
+
+  // mail quota (tests MailApp permission without sending)
+  try {
+    out.mailQuota = MailApp.getRemainingDailyQuota();
+    out.mailQuotaOk = true;
+  } catch (e2) {
+    out.mailQuotaOk = false;
+    out.mailError = (e2 && e2.message) ? e2.message : String(e2);
+  }
+
+  Logger.log(JSON.stringify(out, null, 2));
+  return out;
+}
+function DEBUG_Odoo_ListUsers(limit) {
+  var n = Number(limit || 25);
+
+  var rows = _odooExecuteKw_(
+    "res.users",
+    "search_read",
+    [[]],
+    { fields: ["id", "name", "login", "email"], order: "id asc", limit: n }
+  ) || [];
+
+  Logger.log(JSON.stringify(rows, null, 2));
+  return rows;
+}
+function DEBUG_Odoo_ListTaskStagesForProject(projectId) {
+  var pid = Number(projectId || ODOO_CFG.PROJECT_ID || 0);
+  if (!pid) throw new Error("Provide projectId or set ODOO_CFG.PROJECT_ID");
+
+  // project.task.type has project_ids M2M in many Odoo setups
+  var domain = [["project_ids", "in", [pid]]];
+
+  var rows = _odooExecuteKw_(
+    "project.task.type",
+    "search_read",
+    [domain],
+    { fields: ["id", "name", "sequence"], order: "sequence asc, id asc", limit: 200 }
+  ) || [];
+
+  Logger.log(JSON.stringify(rows, null, 2));
+  return rows;
+}
+
+function DEBUG_Odoo_TaskDeadlineFields() {
+  var fields = [
+    "date_deadline",
+    "planned_date_end",
+    "planned_date_begin",
+    "create_date",
+    "write_date"
+  ];
+
+  var res = _odooExecuteKw_(
+    "project.task",
+    "fields_get",
+    [fields, ["type", "string"]],
+    {}
+  ) || {};
+
+  Logger.log(JSON.stringify(res, null, 2));
+  return res;
+}

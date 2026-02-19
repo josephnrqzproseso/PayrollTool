@@ -1,0 +1,1963 @@
+/*******************************************************
+ * BIR 1604C ALPHALIST GENERATOR (DAT) — v1
+ * - Reads "Annualization - YYYY" (Final Annualization output)
+ * - Uses DocumentProperties PREV_EMPLOYER_MAP_V1 (saved from Final Annualization dialog)
+ * - Splits schedules by Masterfile column "MWE":
+ *     TRUE  => Schedule 2
+ *     else  => Schedule 1
+ *******************************************************/
+
+const BIR1604C_V1 = {
+  PREV_MAP_PROP: "PREV_EMPLOYER_MAP_V1",
+  SHEET_PREFIX: "Annualization - ",
+  HEADER_FTYPE: "H1604C",
+  DETAIL_FTYPE: "1604C",
+  BRANCH_CODE_DEFAULT: "0000"
+};
+
+function generateBir1604CAlphalist(payload) {
+  payload = payload || {};
+  const year = Number(payload.year || 0);
+  if (!year || year < 2000) throw new Error("Invalid year.");
+
+  const folderId = bir2316ParseFileId_(String(payload.folderIdOrUrl || ""));
+  if (!folderId) throw new Error("Could not parse output folder ID/URL.");
+
+  const cfg = bir2316GetSettings_();
+
+const employerTinRaw = bir1604cGetSetting_(cfg, "COMPANY_TIN");
+const employerTin = bir1604cDigits_(employerTinRaw || "");
+
+if (!employerTin) {
+  const keys = Object.keys(cfg || {}).slice(0, 40).join(", ");
+  throw new Error(
+    "Missing Company TIN.\n" +
+    "Expected setting key: COMPANY_TIN (or equivalent like 'Company TIN').\n" +
+    "Available settings keys (first 40): " + keys
+  );
+}
+
+
+  const returnPeriod = bir1604cFormatDate_(new Date(year, 11, 31)); // 12/31/YYYY
+
+  // 1) Read Annualization sheet rows
+  const annual = bir1604cReadAnnualization_(year);
+
+  // 2) Get the SAME classification used by Final Annualization (so we can compute totals w/o adding columns)
+  //    NOTE: _buildFinalAnnFacts_ is defined in /mnt/data/FinalAnnualization.txt
+  if (typeof _buildFinalAnnFacts_ !== "function") {
+    throw new Error("_buildFinalAnnFacts_ not found. This generator requires FinalAnnualization code in the same project.");
+  }
+  const facts = _buildFinalAnnFacts_(year, cfg);
+  const histHeaders = (facts && facts.headers) ? facts.headers : [];
+  const groupCols = (facts && facts.groupCols) ? facts.groupCols : null;
+  if (!histHeaders.length || !groupCols) {
+    throw new Error("Could not build PAYROLL_HISTORY classification (missing PAYROLL_HISTORY or FinalAnnualization build failed).");
+  }
+
+  // 3) Map PAYROLL_HISTORY headers to Annualization component columns (by header text)
+  const annualHeaderUpperToIndex = annual.headerUpperToIndex;
+  const groupHeaderNames = {
+    BASIC:        (groupCols.BASIC || []).map(i => String(histHeaders[i] || "").trim()),
+    DEMINIMIS:    (groupCols.DEMINIMIS || []).map(i => String(histHeaders[i] || "").trim()),
+    NONTAX_OTHER: (groupCols.NONTAX_OTHER || []).map(i => String(histHeaders[i] || "").trim()),
+    TAXABLE:      (groupCols.TAXABLE || []).map(i => String(histHeaders[i] || "").trim()),
+    OTHER13:      (groupCols.OTHER13 || []).map(i => String(histHeaders[i] || "").trim()),
+  };
+
+  // 4) Masterfile meta needed by file structure
+  const mfMeta = bir1604cReadMasterfileMeta_(year); // year needed for computed fields
+
+
+  // 5) Prev employer map (saved by Final Annualization dialog)
+  const prevMap = bir1604cLoadPrevEmployerMap_();
+
+  // 6) Build lines
+  const lines = [];
+
+  // Header record
+  lines.push(bir1604cCsvLine_([
+  BIR1604C_V1.HEADER_FTYPE,
+  bir1604cPadTin9_(employerTin),
+  "0000",
+  returnPeriod
+]));
+
+
+  // Separate employees by schedule using Masterfile MWE
+  const s1 = [];
+  const s2 = [];
+  annual.order.forEach(empId => {
+    const meta = mfMeta.get(empId);
+    if (!meta) return; // skip if not in masterfile
+    const isMwe = String(meta.mwe || "").toUpperCase() === "TRUE";
+    (isMwe ? s2 : s1).push(empId);
+  });
+
+  const totals1 = bir1604cInitTotalsS1_();
+  const totals2 = bir1604cInitTotalsS2_();
+
+  // Schedule 1 Details
+  let seq1 = 1;
+  s1.forEach(empId => {
+    const row = annual.byEmpId.get(empId);
+    if (!row) return;
+
+    const meta = mfMeta.get(empId);
+    const prev = prevMap[empId] || {};
+
+    const sums = bir1604cComputePresentSumsFromAnnualRow_(
+      row,
+      annualHeaderUpperToIndex,
+      groupHeaderNames
+    );
+
+    const rec = bir1604cBuildS1Record_(
+      year, seq1++, employerTin, returnPeriod,
+      meta, prev, row, annualHeaderUpperToIndex, sums
+    );
+
+    bir1604cAccumulateS1_(totals1, rec);
+    lines.push(bir1604cCsvLine_(bir1604cS1DetailCsv_(rec)));
+
+  });
+
+  // Schedule 1 Controls
+  lines.push(bir1604cCsvLine_(bir1604cS1ControlCsv_(employerTin, returnPeriod, totals1)));
+
+
+  // Schedule 2 (MWE)
+  // We cannot extrapolate Schedule 2 present-employer special fields without explicit mapping to Annualization columns.
+  // If there are Schedule 2 employees, we require these Annualization component headers to exist:
+  // - Holiday Pay, Overtime Pay, Night Diff, Hazard Pay (present employer)
+  // - Basic/SMW per Day/Month/Year and Factor Used
+ 
+
+  let seq2 = 1;
+  s2.forEach(empId => {
+    const row = annual.byEmpId.get(empId);
+    if (!row) return;
+
+    const meta = mfMeta.get(empId);
+    const prev = prevMap[empId] || {};
+
+    const sums = bir1604cComputePresentSumsFromAnnualRow_(
+      row,
+      annualHeaderUpperToIndex,
+      groupHeaderNames
+    );
+
+    const rec = bir1604cBuildS2Record_(
+      year, seq2++, employerTin, returnPeriod,
+      meta, prev, row, annualHeaderUpperToIndex, sums
+    );
+
+    bir1604cAccumulateS2_(totals2, rec);
+    lines.push(bir1604cCsvLine_(bir1604cS2DetailCsv_(rec)));
+
+  });
+
+  // Schedule 2 Controls
+  // Schedule 2 Controls (ONLY if there are Schedule 2 employees)
+if (s2.length) {
+  lines.push(bir1604cCsvLine_(bir1604cS2ControlCsv_(employerTin, returnPeriod, totals2)));
+}
+
+
+
+  const content = lines.join("\r\n");
+const fileName = `${bir1604cPadTin9_(employerTin)}00001231${year}1604C.dat`;
+
+// ✅ Save to Google Drive (in the provided folder)
+const folder = DriveApp.getFolderById(folderId);
+const file = folder.createFile(fileName, content, MimeType.PLAIN_TEXT);
+const fileId = file.getId();
+const url = file.getUrl();
+
+// ✅ Return BOTH: Drive info + raw content (for immediate download in dialog)
+return {
+  fileName: fileName,
+  fileId: fileId,
+  url: url,
+  content: content,
+  counts: { s1: s1.length, s2: s2.length }
+};
+
+
+}
+
+// -------------------------
+// Annualization reader
+// -------------------------
+
+function bir1604cReadAnnualization_(year) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const shName = BIR1604C_V1.SHEET_PREFIX + year;
+  const sh = ss.getSheetByName(shName);
+  if (!sh) throw new Error(`Missing sheet: "${shName}". Generate Final Annualization first.`);
+
+  const data = sh.getDataRange().getValues();
+  if (data.length < 2) throw new Error(`Sheet "${shName}" has no data.`);
+
+  const headers = data[0].map(h => String(h || "").trim());
+  const headerUpperToIndex = {};
+  headers.forEach((h, i) => {
+    const up = String(h || "").trim().toUpperCase();
+    if (up) headerUpperToIndex[up] = i;
+  });
+
+  const empIdIdx = headerUpperToIndex["EMPLOYEE ID"];
+  if (empIdIdx == null) throw new Error(`"${shName}" missing required column: EMPLOYEE ID`);
+
+  const byEmpId = new Map();
+  const order = [];
+
+  for (let r = 1; r < data.length; r++) {
+    const row = data[r];
+    const empId = String(row[empIdIdx] || "").trim();
+    if (!empId) continue;
+    byEmpId.set(empId, row);
+    order.push(empId);
+  }
+
+  // Required summary columns already present in Final Annualization output
+  const need = [
+    "GROSS COMPENSATION INCOME – PRESENT EMPLOYER",
+    "NON-TAX 13TH + OTHER (≤90K)",
+    "SSS EE MC (YTD)",
+    "SSS EE MPF (YTD)",
+    "PHILHEALTH EE (YTD)",
+    "PAG-IBIG EE (YTD)",
+    "TOTAL NON-TAXABLE COMPENSATION INCOME",
+    "TAXABLE COMPENSATION INCOME – PRESENT EMPLOYER",
+    "TAXABLE COMPENSATION INCOME – PREVIOUS EMPLOYER",
+    "TOTAL TAXABLE COMPENSATION INCOME",
+    "ANNUAL TAX DUE",
+    "TAXES WITHHELD BY PREVIOUS EMPLOYER",
+    "TAX WITHHELD – PRESENT EMPLOYER (YTD)"
+  ];
+  const missing = need.filter(h => headerUpperToIndex[h] == null);
+  if (missing.length) {
+    throw new Error(`Annualization sheet missing required summary columns:\n- ${missing.join("\n- ")}`);
+  }
+
+  return { headers, headerUpperToIndex, byEmpId, order };
+}
+
+// -------------------------
+// Compute present-employer fields from EXISTING Annualization columns
+// -------------------------
+
+function bir1604cComputePresentSumsFromAnnualRow_(row, annualHeaderUpperToIndex, groupHeaderNames) {
+  // Sum component columns by matching header names (from PAYROLL_HISTORY classification)
+  const sumByHeaders = (names) => {
+    let s = 0;
+    names.forEach(name => {
+      const up = String(name || "").trim().toUpperCase();
+      const idx = annualHeaderUpperToIndex[up];
+      if (idx == null) return;
+      const v = Number(row[idx] || 0);
+      if (isFinite(v)) s += v;
+    });
+    return s;
+  };
+
+  const basicSum = sumByHeaders(groupHeaderNames.BASIC);
+  const demSum = sumByHeaders(groupHeaderNames.DEMINIMIS);
+  const nonTaxOtherSum = sumByHeaders(groupHeaderNames.NONTAX_OTHER);
+  const taxableSum = sumByHeaders(groupHeaderNames.TAXABLE);
+  const other13Sum = sumByHeaders(groupHeaderNames.OTHER13);
+
+  const sssMc = Number(row[annualHeaderUpperToIndex["SSS EE MC (YTD)"]] || 0);
+  const sssMpf = Number(row[annualHeaderUpperToIndex["SSS EE MPF (YTD)"]] || 0);
+  const ph = Number(row[annualHeaderUpperToIndex["PHILHEALTH EE (YTD)"]] || 0);
+  const pi = Number(row[annualHeaderUpperToIndex["PAG-IBIG EE (YTD)"]] || 0);
+
+  const eeShare = (Number(sssMc) + Number(sssMpf) + Number(ph) + Number(pi));
+  const basicNetEe = Math.max(0, basicSum - eeShare);
+
+  const field28_nonTax13th = Number(row[annualHeaderUpperToIndex["NON-TAX 13TH + OTHER (≤90K)"]] || 0);
+// FIELD 34 = (ALL components categorized as 13th month & other benefits) - FIELD 28
+const taxable13thExcess = Number(other13Sum || 0) - Number(field28_nonTax13th || 0);
+
+  const totalTaxableComp = Number(row[annualHeaderUpperToIndex["TOTAL TAXABLE COMPENSATION INCOME"]] || 0);
+  const nonTaxBasicIfLe250k = (totalTaxableComp <= 250000) ? basicNetEe : 0;
+
+  return {
+    basicSum: basicSum,
+    demSum: demSum,
+    nonTaxOtherSum: nonTaxOtherSum,
+    taxableSum: taxableSum,
+    other13Sum: other13Sum,
+    eeShare: eeShare,
+    basicNetEe: basicNetEe,
+    taxable13thExcess: taxable13thExcess,
+    nonTaxBasicIfLe250k: nonTaxBasicIfLe250k
+  };
+}
+
+// -------------------------
+// Masterfile requirements for file structure
+// -------------------------
+
+function bir1604cReadMasterfileMeta_() {
+  const mf = bir2316ReadMasterfile_();
+  const headers = mf.headers.map(h => String(h || "").trim());
+  const rows = mf.rows;
+
+const norm_ = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+const findIdxAny_ = (names) => {
+  const wants = (names || []).map(norm_);
+  for (let i = 0; i < headers.length; i++) {
+    const hn = norm_(headers[i]);
+    if (!hn) continue;
+    if (wants.indexOf(hn) >= 0) return i;
+  }
+  return -1;
+};
+
+
+const idxEmpId    = findIdxAny_(["Employee ID", "Emp ID"]);
+const idxTin      = findIdxAny_(["TIN", "Taxpayer Identification Number"]);
+const idxLast     = findIdxAny_(["Last Name", "Lastname", "Surname"]);
+const idxFirst    = findIdxAny_(["First Name", "Firstname", "Given Name"]);
+const idxMid      = findIdxAny_(["Middle Name", "Middlename", "MI"]);
+const idxMwe      = findIdxAny_(["MWE", "Minimum Wage Earner"]);
+
+const idxStart    = findIdxAny_(["Start Date", "Employment Start Date", "Date Hired", "Hire Date"]);
+const idxSep      = findIdxAny_(["Separation Date", "Employment To", "End Date", "Date Separated", "Termination Date"]);
+const idxStatus   = findIdxAny_(["Status", "Employment Status", "Employee Status"]);
+const idxReg      = findIdxAny_(["Regularization Date", "Regularisation Date", "Date Regularized"]);
+
+const idxPayBasis = findIdxAny_(["Pay Basis", "Paybasis"]);
+const idxBasicPay = findIdxAny_(["Basic Pay", "Basic Salary"]);
+const idxWdpy     = findIdxAny_(["Working Days per Year", "Working Days/Year", "WDPY"]);
+
+const idxWithPrev  = findIdxAny_(["With Previous Employer", "With Prev Employer", "Previous Employer", "Has Previous Employer"]);
+const idxReasonSep = findIdxAny_(["Reason for Separation", "Reason Separation", "Reason of Separation"]);
+
+const idxRegionOpt = findIdxAny_(["Region Num", "Region", "Region No"]); // optional
+const idxNatOpt    = findIdxAny_(["Nationality"]); // optional
+
+const mustHave = [
+  ["Employee ID", idxEmpId],
+  ["TIN", idxTin],
+  ["Last Name", idxLast],
+  ["First Name", idxFirst],
+  ["Middle Name", idxMid],
+  ["MWE", idxMwe],
+  ["Start Date", idxStart],
+  ["Separation Date", idxSep],
+  ["Status", idxStatus],
+  ["Regularization Date", idxReg],
+  ["Pay Basis", idxPayBasis],
+  ["Basic Pay", idxBasicPay],
+  ["Working Days per Year", idxWdpy],
+  ["With Previous Employer", idxWithPrev],
+  ["Reason for Separation", idxReasonSep],
+];
+
+const missing = mustHave.filter(x => x[1] < 0).map(x => x[0]);
+if (missing.length) {
+  throw new Error("Masterfile missing required columns for 1604C Alphalist:\n- " + missing.join("\n- "));
+}
+
+  const out = new Map();
+
+  rows.forEach(r => {
+    const empId = String(r[idxEmpId] || "").trim();
+    if (!empId) return;
+
+    const regionRaw = (idxRegionOpt >= 0) ? String(r[idxRegionOpt] || "").trim() : "";
+    const natRaw = (idxNatOpt >= 0) ? String(r[idxNatOpt] || "").trim() : "";
+
+    out.set(empId, {
+      empId: empId,
+      empTin: String(r[idxTin] || "").trim(),
+
+      // Branch is ALWAYS 0000
+      empBranchCode: "0000",
+
+      lastName: String(r[idxLast] || "").trim(),
+      firstName: String(r[idxFirst] || "").trim(),
+      middleName: String(r[idxMid] || "").trim(),
+
+      // Region Num: default NCR if no header OR blank
+      regionNum: regionRaw || "NCR",
+
+      // Nationality: default FILIPINO if blank
+      nationality: natRaw || "FILIPINO",
+
+      // inputs for derived logic
+      startDateRaw: String(r[idxStart] || "").trim(),
+      separationDateRaw: String(r[idxSep] || "").trim(),
+      statusRaw: String(r[idxStatus] || "").trim(),
+      regularizationDateRaw: String(r[idxReg] || "").trim(),
+
+      payBasis: String(r[idxPayBasis] || "").trim(),
+      basicPay: Number(r[idxBasicPay] || 0),
+      workingDaysPerYear: Number(r[idxWdpy] || 0),
+
+      withPrevEmployerRaw: String(r[idxWithPrev] || "").trim(),
+      reasonSeparationRaw: String(r[idxReasonSep] || "").trim(),
+
+
+      mwe: String(r[idxMwe] || "").trim()
+    });
+  });
+
+  return out;
+}
+
+
+// -------------------------
+// Prev employer map
+// -------------------------
+
+function bir1604cLoadPrevEmployerMap_() {
+  const props = PropertiesService.getDocumentProperties();
+  const raw = props.getProperty(BIR1604C_V1.PREV_MAP_PROP) || "{}";
+  try {
+    const obj = JSON.parse(raw);
+    return obj && typeof obj === "object" ? obj : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+// -------------------------
+// Schedule 1 record builder (uses your mapping)
+// -------------------------
+
+function bir1604cBuildS1Record_(year, seqNum, employerTin, returnPeriod, meta, prev, row, idx, sums) {
+  const presGross = Number(row[idx["GROSS COMPENSATION INCOME – PRESENT EMPLOYER"]] || 0);
+  const presNonTaxTotal = Number(row[idx["TOTAL NON-TAXABLE COMPENSATION INCOME"]] || 0);
+  const presTaxableTotal = Number(row[idx["TAXABLE COMPENSATION INCOME – PRESENT EMPLOYER"]] || 0);
+
+  const taxablePrev = Number(row[idx["TAXABLE COMPENSATION INCOME – PREVIOUS EMPLOYER"]] || 0);
+  const totalTaxableComp = Number(row[idx["TOTAL TAXABLE COMPENSATION INCOME"]] || 0);
+
+  const taxDue = Number(row[idx["ANNUAL TAX DUE"]] || 0);
+  const prevWthld = Number(row[idx["TAXES WITHHELD BY PREVIOUS EMPLOYER"]] || 0);
+  const presWthld = Number(row[idx["TAX WITHHELD – PRESENT EMPLOYER (YTD)"]] || 0);
+
+  // Prev gross for GROSS_COMP_INCOME: per spec "pres plus prev"
+  const prevGross = Number(prev.prevNonTaxGrossCompIncome || 0);
+
+    // =========================
+  // Schedule 1 TOTALS (per your field rules)
+  // =========================
+
+  // PREV:
+  // Field 19 = Field 15..18
+  const prevNonTax13thMonth_v = Number(prev.prevNonTax13thMonth || 0);
+  const prevNonTaxDeMinimis_v = Number(prev.prevNonTaxDeMinimis || 0);
+  const prevNonTaxSssEtc_v    = Number(prev.prevNonTaxSssEtc || 0);
+  const prevNonTaxSalaries_v  = Number(prev.prevNonTaxSalaries || 0);
+
+  const prevTotalNonTaxCompIncomeComputed =
+    prevNonTax13thMonth_v +
+    prevNonTaxDeMinimis_v +
+    prevNonTaxSssEtc_v +
+    prevNonTaxSalaries_v;
+
+  // Field 23 = Field 20..22
+  const prevTaxableBasicSalary_v = Number(prev.prevTaxableBasicSalary || 0);
+  const prevTaxable13thMonth_v   = Number(prev.prevTaxable13thMonth || 0);
+  const prevTaxableSalaries_v    = Number(prev.prevTaxableSalaries || 0);
+
+  const prevTotalTaxableComputed =
+    prevTaxableBasicSalary_v +
+    prevTaxable13thMonth_v +
+    prevTaxableSalaries_v;
+
+    // Field 32 = Field 27..31
+  // ✅ Removed Field 27 vs Field 33 condition (Sched 1):
+  // Always put basicNetEe into Field 33 (taxable basic salary), Field 27 is 0
+  const presNonTax13thMonth_v = Number(row[idx["NON-TAX 13TH + OTHER (≤90K)"]] || 0);
+
+  const nonTaxBasicSalComputed = 0;                       // Field 27
+  const taxBasicSalComputed    = Number(sums.basicNetEe || 0); // Field 33
+
+  const presTotalNonTaxCompIncomeComputed =
+    Number(nonTaxBasicSalComputed || 0) +
+    presNonTax13thMonth_v +
+    Number(sums.demSum || 0) +
+    Number(sums.eeShare || 0) +
+    Number(sums.nonTaxOtherSum || 0);
+
+  // Field 36 = Field 33..35 (final)
+  const presTotalCompComputed =
+    Number(taxBasicSalComputed || 0) +
+    Number(sums.taxable13thExcess || 0) +
+    Number(sums.taxableSum || 0);
+
+
+  // Field 37 = Field 36 + Field 23
+  const grossCompIncomeComputed =
+    Number(presTotalCompComputed || 0) +
+    Number(prevTotalTaxableComputed || 0);
+
+
+
+  return {
+    scheduleNum: "D1",
+    ftype: BIR1604C_V1.DETAIL_FTYPE,
+    tinEmpyr: bir1604cPadTin9_(employerTin),
+    branchEmpyr: "0000",
+    returnPeriod: returnPeriod,
+    seqNum: seqNum,
+
+    empTin: bir1604cPadTin9_(bir1604cDigits_(meta.empTin || "")),
+    empBranch: "0000",
+    lastName: meta.lastName || "",
+    firstName: meta.firstName || "",
+    middleName: meta.middleName || "",
+    regionNum: meta.regionNum || "NCR",
+
+    // Previous employer amounts (from dialog map)
+    prevNonTaxGrossCompIncome: Number(prev.prevNonTaxGrossCompIncome || 0),
+    prevNonTaxBasicSmw: Number(prev.prevNonTaxBasicSmw || 0),
+    prevNonTax13thMonth: Number(prev.prevNonTax13thMonth || 0),
+    prevNonTaxDeMinimis: Number(prev.prevNonTaxDeMinimis || 0),
+    prevNonTaxSssEtc: Number(prev.prevNonTaxSssEtc || 0),
+    prevNonTaxSalaries: Number(prev.prevNonTaxSalaries || 0),
+    prevTotalNonTaxCompIncome: prevTotalNonTaxCompIncomeComputed,
+
+    prevTaxableBasicSalary: Number(prev.prevTaxableBasicSalary || 0),
+    prevTaxable13thMonth: Number(prev.prevTaxable13thMonth || 0),
+    prevTaxableSalaries: Number(prev.prevTaxableSalaries || 0),
+    prevTotalTaxable: prevTotalTaxableComputed,
+
+    // Employment dates must be in Masterfile columns (required)
+    employmentFrom: bir1604cDeriveEmploymentFrom_(meta, year),
+employmentTo: bir1604cDeriveEmploymentTo_(meta, year),
+
+    // Present employer amounts (YOUR mapping)
+    presNonTaxGrossCompIncome: presGross,                // PRES_NONTAX_GROSS_COMP_INCOME
+nonTaxBasicSal: nonTaxBasicSalComputed,
+    presNonTax13thMonth: Number(row[idx["NON-TAX 13TH + OTHER (≤90K)"]] || 0), // PRES_NONTAX_13TH_MONTH
+    presNonTaxDeMinimis: sums.demSum,                    // PRES_NONTAX_DE_MINIMIS
+    presNonTaxSssEtc: sums.eeShare,                      // PRES_NONTAX_SSS_ETC
+    presNonTaxSalaries: sums.nonTaxOtherSum,             // PRES_NONTAX_SALARIES
+    presTotalNonTaxCompIncome: presTotalNonTaxCompIncomeComputed,
+
+
+    taxBasicSal: taxBasicSalComputed,
+    presTaxable13thMonth: sums.taxable13thExcess,        // PRES_TAXABLE_13TH_MONTH (excess)
+    presTaxableSalaries: sums.taxableSum,                // PRES_TAXABLE_SALARIES
+    presTotalComp: presTotalCompComputed,   
+
+grossCompIncome: grossCompIncomeComputed,   
+
+    netTaxableCompIncome: grossCompIncomeComputed,              // NET_TAXABLE_COMP_INCOME
+    taxDue: taxDue,                                      // TAX_DUE
+    prevTaxWthld: prevWthld,                             // PREV_TAX_WTHLD
+    presTaxWthld: presWthld,                             // PRES_TAX_WTHLD
+    amtWthldDec: 0,
+    overWthld: 0,
+    actualAmtWthld: taxDue,                              // ACTUAL_AMT_WTHLD
+
+    nationality: (meta.nationality || "FILIPINO"),
+employmentStatus: bir1604cDeriveEmploymentStatus_(meta, year),
+reasonSeparation: bir1604cDeriveReasonSeparation_(meta, year),
+
+subsFiling: bir1604cDeriveSubsFiling_(meta, year),
+
+    taxCreditPera: 0
+  };
+}
+
+// -------------------------
+// Schedule 2 mapping requirement (NO extrapolation)
+// -------------------------
+
+
+
+// NOTE: Schedule 2 builder is included but depends on the mapping columns above existing.
+function bir1604cBuildS2Record_(year, seqNum, employerTin, returnPeriod, meta, prev, row, idx, sums) {
+  const presGross = Number(row[idx["GROSS COMPENSATION INCOME – PRESENT EMPLOYER"]] || 0);
+  const presNonTaxTotal = Number(row[idx["TOTAL NON-TAXABLE COMPENSATION INCOME"]] || 0);
+  const presTaxableTotal = Number(row[idx["TAXABLE COMPENSATION INCOME – PRESENT EMPLOYER"]] || 0);
+  const totalTaxableComp = Number(row[idx["TOTAL TAXABLE COMPENSATION INCOME"]] || 0);
+
+  const taxDue = Number(row[idx["ANNUAL TAX DUE"]] || 0);
+  const prevWthld = Number(row[idx["TAXES WITHHELD BY PREVIOUS EMPLOYER"]] || 0);
+  const presWthld = Number(row[idx["TAX WITHHELD – PRESENT EMPLOYER (YTD)"]] || 0);
+
+  const prevGross = Number(prev.prevNonTaxGrossCompIncome || 0);
+
+  // Schedule 2: Overtime must come from Annualization header "OVERTIME"
+  const overtimeIdx = idx["OVERTIME"];
+  if (overtimeIdx == null) {
+    throw new Error('Schedule 2 employees found but Annualization sheet missing required column: OVERTIME');
+  }
+  const presOvertime = Number(row[overtimeIdx] || 0);
+
+    // ✅ S2/MWE rule: OVERTIME must NOT be included in FIELD 44 (presTaxableSalaries)
+  const taxableMinusOvertime = Math.max(
+    0,
+    Number(sums.taxableSum || 0) - Number(presOvertime || 0)
+  );
+
+
+  // Schedule 2: Basic/SMW fields computed from MASTERFILE (Basic Pay, Pay Basis, Working Days per Year; default 261)
+  const smw = bir1604cComputeSmwFields_(meta);
+
+    // =========================
+  // Schedule 2 TOTALS (replicate total-as-sum-of-components logic)
+  // =========================
+
+  // PREV: total non-tax = sum of ALL prev non-tax components EXCEPT gross + basic/smw
+  const prevNonTaxHolidayPay_v = Number(prev.prevNonTaxHolidayPay || 0);
+  const prevNonTaxOvertimePay_v = Number(prev.prevNonTaxOvertimePay || 0);
+  const prevNonTaxNightDiff_v = Number(prev.prevNonTaxNightDiff || 0);
+  const prevNonTaxHazardPay_v = Number(prev.prevNonTaxHazardPay || 0);
+  const prevNonTax13thMonth_v = Number(prev.prevNonTax13thMonth || 0);
+  const prevNonTaxDeMinimis_v = Number(prev.prevNonTaxDeMinimis || 0);
+  const prevNonTaxSssEtc_v    = Number(prev.prevNonTaxSssEtc || 0);
+  const prevNonTaxSalaries_v  = Number(prev.prevNonTaxSalaries || 0);
+
+  const prevTotalNonTaxCompIncomeComputed =
+    prevNonTaxHolidayPay_v +
+    prevNonTaxOvertimePay_v +
+    prevNonTaxNightDiff_v +
+    prevNonTaxHazardPay_v +
+    prevNonTax13thMonth_v +
+    prevNonTaxDeMinimis_v +
+    prevNonTaxSssEtc_v +
+    prevNonTaxSalaries_v;
+
+  // PREV: total taxable = sum of taxable components (Schedule 2 has no "prevTaxableBasicSalary" field)
+  const prevTaxable13thMonth_v = Number(prev.prevTaxable13thMonth || 0);
+  const prevTaxableSalaries_v  = Number(prev.prevTaxableSalaries || 0);
+
+  const prevTotalTaxableComputed =
+    prevTaxable13thMonth_v +
+    prevTaxableSalaries_v;
+
+  // PRESENT: total non-tax = sum of ALL present non-tax components EXCEPT gross + basic/smw day/month/year + factor
+  // (we include nonTaxBasicSal because it's the non-tax basic salary rule you already compute from sums)
+  const presNonTax13thMonth_v = Number(row[idx["NON-TAX 13TH + OTHER (≤90K)"]] || 0);
+
+  const presNonTaxHolidayPay_v = 0;
+  const presNonTaxOvertimePay_v = Number(presOvertime || 0);
+  const presNonTaxNightDiff_v = 0;
+  const presNonTaxHazardPay_v = 0;
+
+  const presTotalNonTaxCompIncomeComputed =
+    Number(sums.basicNetEe || 0) +
+    presNonTaxHolidayPay_v +
+    presNonTaxOvertimePay_v +
+    presNonTaxNightDiff_v +
+    presNonTaxHazardPay_v +
+    presNonTax13thMonth_v +
+    Number(sums.demSum || 0) +
+    Number(sums.eeShare || 0) +
+    Number(sums.nonTaxOtherSum || 0);
+
+  // PRESENT: total taxable = sum of taxable components in Schedule 2 (no taxBasicSal field here)
+    const presTotalCompComputed =
+    Number(sums.taxable13thExcess || 0) +
+    Number(taxableMinusOvertime || 0);
+
+
+  // GROSS COMP (replicate): total taxable present + total taxable previous
+  const grossCompIncomeComputed =
+    Number(presTotalCompComputed || 0) +
+    Number(prevTotalTaxableComputed || 0);
+
+
+  return {
+    scheduleNum: "D2",
+    ftype: BIR1604C_V1.DETAIL_FTYPE,
+    tinEmpyr: bir1604cPadTin9_(employerTin),
+    branchEmpyr: "0000",
+    returnPeriod: returnPeriod,
+    seqNum: seqNum,
+
+    empTin: bir1604cPadTin9_(bir1604cDigits_(meta.empTin || "")),
+    empBranch: "0000",
+
+    lastName: meta.lastName || "",
+    firstName: meta.firstName || "",
+    middleName: meta.middleName || "",
+    regionNum: meta.regionNum || "NCR",
+
+    // Previous employer (Schedule 2 includes more non-tax fields)
+    prevNonTaxGrossCompIncome: Number(prev.prevNonTaxGrossCompIncome || 0),
+    prevNonTaxBasicSmw: Number(prev.prevNonTaxBasicSmw || 0),
+    prevNonTaxHolidayPay: Number(prev.prevNonTaxHolidayPay || 0),
+    prevNonTaxOvertimePay: Number(prev.prevNonTaxOvertimePay || 0),
+    prevNonTaxNightDiff: Number(prev.prevNonTaxNightDiff || 0),
+    prevNonTaxHazardPay: Number(prev.prevNonTaxHazardPay || 0),
+    prevNonTax13thMonth: Number(prev.prevNonTax13thMonth || 0),
+    prevNonTaxDeMinimis: Number(prev.prevNonTaxDeMinimis || 0),
+    prevNonTaxSssEtc: Number(prev.prevNonTaxSssEtc || 0),
+    prevNonTaxSalaries: Number(prev.prevNonTaxSalaries || 0),
+    prevTotalNonTaxCompIncome: prevTotalNonTaxCompIncomeComputed,
+    prevTaxable13thMonth: Number(prev.prevTaxable13thMonth || 0),
+    prevTaxableSalaries: Number(prev.prevTaxableSalaries || 0),
+     prevTotalTaxable: prevTotalTaxableComputed,
+
+    // Derived employment dates (per your rules)
+    employmentFrom: bir1604cDeriveEmploymentFrom_(meta, year),
+    employmentTo: bir1604cDeriveEmploymentTo_(meta, year),
+
+    // Present employer Schedule 2 special fields (per your rules)
+    presNonTaxGrossCompIncome: presGross,
+
+    // BASIC/SMW from MASTERFILE basic pay
+    presNonTaxBasicSmwDay: Number(smw.perDay || 0),
+    presNonTaxBasicSmwMonth: Number(smw.perMonth || 0),
+    presNonTaxBasicSmwYear: Number(smw.perYear || 0),
+
+    // FACTOR USED = working days per year (default 261)
+    factorUsed: Number(smw.factorUsed || 261),
+
+    // Defaults
+    presNonTaxHolidayPay: 0,
+    presNonTaxNightDiff: 0,
+    presNonTaxHazardPay: 0,
+
+    // Overtime from Annualization "OVERTIME"
+     presNonTaxOvertimePay: presOvertime,
+
+    // Remaining present employer fields reuse existing annualization-derived sums
+    presNonTax13thMonth: Number(row[idx["NON-TAX 13TH + OTHER (≤90K)"]] || 0),
+    presNonTaxDeMinimis: Number(sums.demSum || 0),
+    presNonTaxSssEtc: Number(sums.eeShare || 0),
+    presNonTaxSalaries: Number(sums.nonTaxOtherSum || 0),
+    presTotalNonTaxCompIncome: presTotalNonTaxCompIncomeComputed,
+
+
+    presTaxable13thMonth: Number(sums.taxable13thExcess || 0),
+        presTaxableSalaries: Number(taxableMinusOvertime || 0),
+
+    presTotalComp: presTotalCompComputed,
+
+    grossCompIncome: grossCompIncomeComputed,                   // Total Taxable Compensation Income (Previous & Present Employers)
+
+    netTaxableCompIncome: grossCompIncomeComputed,
+    taxDue: taxDue,
+    prevTaxWthld: prevWthld,
+    presTaxWthld: presWthld,
+    amtWthldDec: 0,
+    overWthld: 0,
+    actualAmtWthld: taxDue,
+
+    nationality: (meta.nationality || "FILIPINO"),
+    employmentStatus: bir1604cDeriveEmploymentStatus_(meta, year),
+    reasonSeparation: bir1604cDeriveReasonSeparation_(meta, year),
+
+    subsFiling: bir1604cDeriveSubsFiling_(meta, year),
+
+    taxCreditPera: 0,
+
+    // Schedule 2 includes this at end (same rule as S1)
+    nonTaxBasicSal: Number(sums.basicNetEe || 0)
+
+  };
+}
+
+
+// -------------------------
+// Fixed-width rendering helpers
+// -------------------------
+
+function bir1604cDigits_(s) {
+  return String(s || "").replace(/\D/g, "");
+}
+function bir1604cPadTin9_(tin) {
+  const d = bir1604cDigits_(tin);
+  return String(d).padStart(9, "0").slice(-9);
+}
+function bir1604cPad4_(s) {
+  const d = bir1604cDigits_(s);
+  return String(d).padStart(4, "0").slice(-4);
+}
+function bir1604cFormatDate_(d) {
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const yy = String(d.getFullYear());
+  return `${mm}/${dd}/${yy}`;
+}
+function bir1604cFormatDateFromMaster_(s) {
+  // Must be parseable; no extrapolation.
+  const v = String(s || "").trim();
+  if (!v) throw new Error("Employment From/To missing in Masterfile for at least one employee.");
+  const d = new Date(v);
+  if (String(d) === "Invalid Date") throw new Error(`Invalid date in Masterfile: "${v}" (Employment From/To)`);
+  return bir1604cFormatDate_(d);
+}
+
+function bir1604cFmtNum_(n, decimals) {
+  const x = Number(n || 0);
+  const fixed = isFinite(x) ? x.toFixed(decimals) : (0).toFixed(decimals);
+  return fixed; // includes decimal point
+}
+
+// ✅ Remove/replace invalid characters for BIR DAT outputs (ASCII-safe)
+// - Converts ñ -> n, é -> e, etc.
+// - Removes any remaining non-ASCII chars
+function bir1604cSanitizeAscii_(input) {
+  let s = String(input == null ? "" : input);
+
+  // Normalize + strip diacritics (ñ -> n, á -> a, etc.)
+  try {
+    if (typeof s.normalize === "function") {
+      s = s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    }
+  } catch (e) {
+    // ignore if normalize not supported
+  }
+
+  // Replace any remaining non-ASCII chars with empty string
+  // Keep printable ASCII only (space..~)
+  s = s.replace(/[^\x20-\x7E]/g, "");
+
+  return s;
+}
+
+
+function bir1604cCsvEscape_(v, forceQuote) {
+  if (v == null) v = "";
+  let s = String(v);
+
+  // ✅ sanitize invalid characters (ñ, etc.) for BOTH S1 and S2 outputs
+  s = bir1604cSanitizeAscii_(s);
+
+  s = s.replace(/"/g, '""');
+  const mustQuote = forceQuote || /[",\r\n]/.test(s) || /^\s|\s$/.test(s);
+  return mustQuote ? `"${s}"` : s;
+}
+
+function bir1604cFmt2_(n) {
+  const x = Number(n || 0);
+  return isFinite(x) ? x.toFixed(2) : "0.00";
+}
+
+function bir1604cFmt0_(n) {
+  const x = Number(n || 0);
+  return isFinite(x) ? String(Math.round(x)) : "0";
+}
+
+function bir1604cCsvLine_(arr) {
+  return arr.map(String).join(",");
+}
+
+// -------------------------
+// Schedule 1 fields (exact widths per spec)
+// -------------------------
+
+function bir1604cS1DetailFields_(r) {
+  return [
+    { v: r.scheduleNum, w: 2, kind: "text" },
+    { v: r.ftype, w: 5, kind: "text" },
+    { v: r.tinEmpyr, w: 9, kind: "digits" },
+    { v: r.branchEmpyr, w: 4, kind: "digits" },
+    { v: r.returnPeriod, w: 10, kind: "date" },
+    { v: r.seqNum, w: 6, kind: "num0" },
+    { v: r.empTin, w: 9, kind: "digits" },
+    { v: r.empBranch, w: 4, kind: "digits" },
+    { v: r.lastName, w: 30, kind: "text" },
+    { v: r.firstName, w: 30, kind: "text" },
+    { v: r.middleName, w: 30, kind: "text" },
+    { v: r.regionNum, w: 4, kind: "text" },
+
+    { v: r.prevNonTaxGrossCompIncome, w: 14, kind: "num2" },
+    { v: r.prevNonTaxBasicSmw, w: 14, kind: "num2" },
+    { v: r.prevNonTax13thMonth, w: 14, kind: "num2" },
+    { v: r.prevNonTaxDeMinimis, w: 14, kind: "num2" },
+    { v: r.prevNonTaxSssEtc, w: 14, kind: "num2" },
+    { v: r.prevNonTaxSalaries, w: 14, kind: "num2" },
+    { v: r.prevTotalNonTaxCompIncome, w: 14, kind: "num2" },
+    { v: r.prevTaxableBasicSalary, w: 14, kind: "num2" },
+    { v: r.prevTaxable13thMonth, w: 14, kind: "num2" },
+    { v: r.prevTaxableSalaries, w: 14, kind: "num2" },
+    { v: r.prevTotalTaxable, w: 14, kind: "num2" },
+
+    { v: r.employmentFrom, w: 10, kind: "date" },
+    { v: r.employmentTo, w: 10, kind: "date" },
+
+    { v: r.presNonTaxGrossCompIncome, w: 14, kind: "num2" },
+    { v: r.nonTaxBasicSal, w: 14, kind: "num2" },
+    { v: r.presNonTax13thMonth, w: 14, kind: "num2" },
+    { v: r.presNonTaxDeMinimis, w: 14, kind: "num2" },
+    { v: r.presNonTaxSssEtc, w: 14, kind: "num2" },
+    { v: r.presNonTaxSalaries, w: 14, kind: "num2" },
+    { v: r.presTotalNonTaxCompIncome, w: 14, kind: "num2" },
+
+    { v: r.taxBasicSal, w: 14, kind: "num2" },
+    { v: r.presTaxable13thMonth, w: 14, kind: "num2" },
+    { v: r.presTaxableSalaries, w: 14, kind: "num2" },
+    { v: r.presTotalComp, w: 14, kind: "num2" },
+
+    { v: r.grossCompIncome, w: 14, kind: "num2" },
+    { v: r.netTaxableCompIncome, w: 14, kind: "num2" },
+    { v: r.taxDue, w: 14, kind: "num2" },
+    { v: r.prevTaxWthld, w: 14, kind: "num2" },
+    { v: r.presTaxWthld, w: 14, kind: "num2" },
+    { v: r.amtWthldDec, w: 14, kind: "num2" },
+    { v: r.overWthld, w: 14, kind: "num2" },
+    { v: r.actualAmtWthld, w: 14, kind: "num2" },
+
+    { v: r.nationality, w: 30, kind: "text" },
+    { v: r.employmentStatus, w: 2, kind: "text" },
+    { v: r.reasonSeparation, w: 2, kind: "text" },
+    { v: r.subsFiling, w: 2, kind: "text" },
+    { v: r.taxCreditPera, w: 14, kind: "num2" },
+  ];
+}
+
+function bir1604cInitTotalsS1_() {
+  return {
+    prevNonTaxGrossCompIncome: 0,
+    prevNonTaxBasicSmw: 0,
+    prevNonTax13thMonth: 0,
+    prevNonTaxDeMinimis: 0,
+    prevNonTaxSssEtc: 0,
+    prevNonTaxSalaries: 0,
+    prevTotalNonTaxCompIncome: 0,
+    prevTaxableBasicSalary: 0,
+    prevTaxable13thMonth: 0,
+    prevTaxableSalaries: 0,
+    prevTotalTaxable: 0,
+
+    presNonTaxGrossCompIncome: 0,
+    nonTaxBasicSal: 0,
+    presNonTax13thMonth: 0,
+    presNonTaxDeMinimis: 0,
+    presNonTaxSssEtc: 0,
+    presNonTaxSalaries: 0,
+    presTotalNonTaxCompIncome: 0,
+
+    taxBasicSal: 0,
+    presTaxable13thMonth: 0,
+    presTaxableSalaries: 0,
+    presTotalComp: 0,
+
+    grossCompIncome: 0,
+    netTaxableCompIncome: 0,
+    taxDue: 0,
+    prevTaxWthld: 0,
+    presTaxWthld: 0,
+    amtWthldDec: 0,
+    overWthld: 0,
+    actualAmtWthld: 0,
+
+    taxCreditPera: 0
+  };
+}
+
+function bir1604cAccumulateS1_(t, r) {
+  Object.keys(t).forEach(k => {
+    t[k] += Number(r[k] || 0);
+  });
+}
+
+function bir1604cS1ControlFields_(employerTin, returnPeriod, t) {
+  return [
+    { v: "C1", w: 2, kind: "text" },
+    { v: BIR1604C_V1.DETAIL_FTYPE, w: 5, kind: "text" },
+    { v: bir1604cPadTin9_(employerTin), w: 9, kind: "digits" },
+    { v: "0000", w: 4, kind: "digits" },
+    { v: returnPeriod, w: 10, kind: "date" },
+
+    { v: t.prevNonTaxGrossCompIncome, w: 14, kind: "num2" },
+    { v: t.prevNonTaxBasicSmw, w: 14, kind: "num2" },
+    { v: t.prevNonTax13thMonth, w: 14, kind: "num2" },
+    { v: t.prevNonTaxDeMinimis, w: 14, kind: "num2" },
+    { v: t.prevNonTaxSssEtc, w: 14, kind: "num2" },
+    { v: t.prevNonTaxSalaries, w: 14, kind: "num2" },
+    { v: t.prevTotalNonTaxCompIncome, w: 14, kind: "num2" },
+    { v: t.prevTaxableBasicSalary, w: 14, kind: "num2" },
+    { v: t.prevTaxable13thMonth, w: 14, kind: "num2" },
+    { v: t.prevTaxableSalaries, w: 14, kind: "num2" },
+    { v: t.prevTotalTaxable, w: 14, kind: "num2" },
+
+    { v: t.presNonTaxGrossCompIncome, w: 14, kind: "num2" },
+    { v: t.nonTaxBasicSal, w: 14, kind: "num2" },
+    { v: t.presNonTax13thMonth, w: 14, kind: "num2" },
+    { v: t.presNonTaxDeMinimis, w: 14, kind: "num2" },
+    { v: t.presNonTaxSssEtc, w: 14, kind: "num2" },
+    { v: t.presNonTaxSalaries, w: 14, kind: "num2" },
+    { v: t.presTotalNonTaxCompIncome, w: 14, kind: "num2" },
+
+    { v: t.taxBasicSal, w: 14, kind: "num2" },
+    { v: t.presTaxable13thMonth, w: 14, kind: "num2" },
+    { v: t.presTaxableSalaries, w: 14, kind: "num2" },
+    { v: t.presTotalComp, w: 14, kind: "num2" },
+
+    { v: t.grossCompIncome, w: 14, kind: "num2" },
+    { v: t.netTaxableCompIncome, w: 14, kind: "num2" },
+    { v: t.taxDue, w: 14, kind: "num2" },
+    { v: t.prevTaxWthld, w: 14, kind: "num2" },
+    { v: t.presTaxWthld, w: 14, kind: "num2" },
+    { v: t.amtWthldDec, w: 14, kind: "num2" },
+    { v: t.overWthld, w: 14, kind: "num2" },
+    { v: t.actualAmtWthld, w: 14, kind: "num2" },
+
+    { v: t.taxCreditPera, w: 14, kind: "num2" },
+  ];
+}
+
+// -------------------------
+// Schedule 2 stubs (totals + fields)
+// -------------------------
+
+function bir1604cInitTotalsS2_() {
+  return {
+    prevNonTaxGrossCompIncome: 0,
+    prevNonTaxBasicSmw: 0,
+    prevNonTaxHolidayPay: 0,
+    prevNonTaxOvertimePay: 0,
+    prevNonTaxNightDiff: 0,
+    prevNonTaxHazardPay: 0,
+    prevNonTax13thMonth: 0,
+    prevNonTaxDeMinimis: 0,
+    prevNonTaxSssEtc: 0,
+    prevNonTaxSalaries: 0,
+    prevTotalNonTaxCompIncome: 0,
+    prevTaxable13thMonth: 0,
+    prevTaxableSalaries: 0,
+    prevTotalTaxable: 0,
+
+    presNonTaxGrossCompIncome: 0,
+    presNonTaxBasicSmwDay: 0,
+    presNonTaxBasicSmwMonth: 0,
+    presNonTaxBasicSmwYear: 0,
+    factorUsed: 0,
+    presNonTaxHolidayPay: 0,
+    presNonTaxOvertimePay: 0,
+    presNonTaxNightDiff: 0,
+    presNonTaxHazardPay: 0,
+    presNonTax13thMonth: 0,
+    presNonTaxDeMinimis: 0,
+    presNonTaxSssEtc: 0,
+    presNonTaxSalaries: 0,
+    presTotalNonTaxCompIncome: 0,
+
+    presTaxable13thMonth: 0,
+    presTaxableSalaries: 0,
+    presTotalComp: 0,
+
+    grossCompIncome: 0,
+    netTaxableCompIncome: 0,
+    taxDue: 0,
+    prevTaxWthld: 0,
+    presTaxWthld: 0,
+    amtWthldDec: 0,
+    overWthld: 0,
+    actualAmtWthld: 0,
+    taxCreditPera: 0,
+    nonTaxBasicSal: 0
+  };
+}
+
+function bir1604cAccumulateS2_(t, r) {
+  Object.keys(t).forEach(k => {
+    t[k] += Number(r[k] || 0);
+  });
+}
+
+function bir1604cS2DetailFields_(r) {
+  // widths per spec for Schedule 2 use .00; we output 0 decimals for those fields using num0
+  // but still right-aligned.
+  // NOTE: This will run only if mapping columns exist (asserted earlier).
+  return [
+    { v: r.scheduleNum, w: 2, kind: "text" },
+    { v: r.ftype, w: 5, kind: "text" },
+    { v: r.tinEmpyr, w: 9, kind: "digits" },
+    { v: r.branchEmpyr, w: 4, kind: "digits" },
+    { v: r.returnPeriod, w: 10, kind: "date" },
+    { v: r.seqNum, w: 6, kind: "num0" },
+    { v: r.empTin, w: 9, kind: "digits" },
+    { v: r.empBranch, w: 4, kind: "digits" },
+    { v: r.lastName, w: 30, kind: "text" },
+    { v: r.firstName, w: 30, kind: "text" },
+    { v: r.middleName, w: 30, kind: "text" },
+    { v: r.regionNum, w: 4, kind: "text" },
+
+    { v: r.prevNonTaxGrossCompIncome, w: 14, kind: "num0" },
+    { v: r.prevNonTaxBasicSmw, w: 14, kind: "num0" },
+    { v: r.prevNonTaxHolidayPay, w: 14, kind: "num0" },
+    { v: r.prevNonTaxOvertimePay, w: 14, kind: "num0" },
+    { v: r.prevNonTaxNightDiff, w: 14, kind: "num0" },
+    { v: r.prevNonTaxHazardPay, w: 14, kind: "num0" },
+    { v: r.prevNonTax13thMonth, w: 14, kind: "num0" },
+    { v: r.prevNonTaxDeMinimis, w: 14, kind: "num0" },
+    { v: r.prevNonTaxSssEtc, w: 14, kind: "num0" },
+    { v: r.prevNonTaxSalaries, w: 14, kind: "num0" },
+    { v: r.prevTotalNonTaxCompIncome, w: 14, kind: "num0" },
+    { v: r.prevTaxable13thMonth, w: 14, kind: "num0" },
+    { v: r.prevTaxableSalaries, w: 14, kind: "num0" },
+    { v: r.prevTotalTaxable, w: 14, kind: "num0" },
+
+    { v: r.employmentFrom, w: 10, kind: "date" },
+    { v: r.employmentTo, w: 10, kind: "date" },
+
+    { v: r.presNonTaxGrossCompIncome, w: 14, kind: "num0" },
+    { v: r.presNonTaxBasicSmwDay, w: 14, kind: "num0" },
+    { v: r.presNonTaxBasicSmwMonth, w: 14, kind: "num0" },
+    { v: r.presNonTaxBasicSmwYear, w: 14, kind: "num0" },
+    { v: r.factorUsed, w: 3, kind: "num0" },
+    { v: r.presNonTaxHolidayPay, w: 14, kind: "num0" },
+    { v: r.presNonTaxOvertimePay, w: 14, kind: "num0" },
+    { v: r.presNonTaxNightDiff, w: 14, kind: "num0" },
+    { v: r.presNonTaxHazardPay, w: 14, kind: "num0" },
+    { v: r.presNonTax13thMonth, w: 14, kind: "num0" },
+    { v: r.presNonTaxDeMinimis, w: 14, kind: "num0" },
+    { v: r.presNonTaxSssEtc, w: 14, kind: "num0" },
+    { v: r.presNonTaxSalaries, w: 14, kind: "num0" },
+    { v: r.presTotalNonTaxCompIncome, w: 14, kind: "num0" },
+
+    { v: r.presTaxable13thMonth, w: 14, kind: "num0" },
+    { v: r.presTaxableSalaries, w: 14, kind: "num0" },
+    { v: r.presTotalComp, w: 14, kind: "num0" },
+
+    { v: r.grossCompIncome, w: 14, kind: "num0" },
+    { v: r.netTaxableCompIncome, w: 14, kind: "num0" },
+    { v: r.taxDue, w: 14, kind: "num0" },
+    { v: r.prevTaxWthld, w: 14, kind: "num0" },
+    { v: r.presTaxWthld, w: 14, kind: "num0" },
+    { v: r.amtWthldDec, w: 14, kind: "num0" },
+    { v: r.overWthld, w: 14, kind: "num0" },
+    { v: r.actualAmtWthld, w: 14, kind: "num0" },
+
+    { v: r.nationality, w: 30, kind: "text" },
+    { v: r.employmentStatus, w: 2, kind: "text" },
+    { v: r.reasonSeparation, w: 2, kind: "text" },
+    { v: r.subsFiling, w: 2, kind: "text" },
+    { v: r.taxCreditPera, w: 14, kind: "num0" },
+    { v: r.nonTaxBasicSal, w: 14, kind: "num0" },
+  ];
+}
+
+function bir1604cS2ControlFields_(employerTin, returnPeriod, t) {
+  return [
+    { v: "C2", w: 2, kind: "text" },
+    { v: BIR1604C_V1.DETAIL_FTYPE, w: 5, kind: "text" },
+    { v: bir1604cPadTin9_(employerTin), w: 9, kind: "digits" },
+    { v: "0000", w: 4, kind: "digits" },
+    { v: returnPeriod, w: 10, kind: "date" },
+
+    { v: t.prevNonTaxGrossCompIncome, w: 14, kind: "num0" },
+    { v: t.prevNonTaxBasicSmw, w: 14, kind: "num0" },
+    { v: t.prevNonTaxHolidayPay, w: 14, kind: "num0" },
+    { v: t.prevNonTaxOvertimePay, w: 14, kind: "num0" },
+    { v: t.prevNonTaxNightDiff, w: 14, kind: "num0" },
+    { v: t.prevNonTaxHazardPay, w: 14, kind: "num0" },
+    { v: t.prevNonTax13thMonth, w: 14, kind: "num0" },
+    { v: t.prevNonTaxDeMinimis, w: 14, kind: "num0" },
+    { v: t.prevNonTaxSssEtc, w: 14, kind: "num0" },
+    { v: t.prevNonTaxSalaries, w: 14, kind: "num0" },
+    { v: t.prevTotalNonTaxCompIncome, w: 14, kind: "num0" },
+    { v: t.prevTaxable13thMonth, w: 14, kind: "num0" },
+    { v: t.prevTaxableSalaries, w: 14, kind: "num0" },
+    { v: t.prevTotalTaxable, w: 14, kind: "num0" },
+
+    { v: t.presNonTaxGrossCompIncome, w: 14, kind: "num0" },
+    { v: t.presNonTaxBasicSmwDay, w: 14, kind: "num0" },
+    { v: t.presNonTaxBasicSmwMonth, w: 14, kind: "num0" },
+    { v: t.presNonTaxBasicSmwYear, w: 14, kind: "num0" },
+    { v: t.presNonTaxHolidayPay, w: 14, kind: "num0" },
+    { v: t.presNonTaxOvertimePay, w: 14, kind: "num0" },
+    { v: t.presNonTaxNightDiff, w: 14, kind: "num0" },
+    { v: t.presNonTaxHazardPay, w: 14, kind: "num0" },
+    { v: t.presNonTax13thMonth, w: 14, kind: "num0" },
+    { v: t.presNonTaxDeMinimis, w: 14, kind: "num0" },
+    { v: t.presNonTaxSssEtc, w: 14, kind: "num0" },
+    { v: t.presNonTaxSalaries, w: 14, kind: "num0" },
+    { v: t.presTotalNonTaxCompIncome, w: 14, kind: "num0" },
+
+    { v: t.presTaxable13thMonth, w: 14, kind: "num0" },
+    { v: t.presTaxableSalaries, w: 14, kind: "num0" },
+    { v: t.presTotalComp, w: 14, kind: "num0" },
+
+    { v: t.grossCompIncome, w: 14, kind: "num0" },
+    { v: t.netTaxableCompIncome, w: 14, kind: "num0" },
+    { v: t.taxDue, w: 14, kind: "num0" },
+    { v: t.prevTaxWthld, w: 14, kind: "num0" },
+    { v: t.presTaxWthld, w: 14, kind: "num0" },
+    { v: t.amtWthldDec, w: 14, kind: "num0" },
+    { v: t.overWthld, w: 14, kind: "num0" },
+    { v: t.actualAmtWthld, w: 14, kind: "num0" },
+
+    { v: t.taxCreditPera, w: 14, kind: "num0" },
+    { v: t.nonTaxBasicSal, w: 14, kind: "num0" },
+  ];
+}
+
+
+function bir1604cGetSetting_(cfg, key) {
+  const want = String(key || "")
+    .toLowerCase()
+    .replace(/[\s_]+/g, "");
+
+  if (cfg && typeof cfg === "object") {
+    const keys = Object.keys(cfg);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      const kn = String(k || "").toLowerCase().replace(/[\s_]+/g, "");
+      if (kn === want) return cfg[k];
+    }
+  }
+
+  // fallback (if your Settings Center stores to DocProps)
+  const p = PropertiesService.getDocumentProperties();
+  return p.getProperty(key) || "";
+}
+function bir1604cParseDateStrict_(s, label) {
+  const v = String(s || "").trim();
+  if (!v) return null;
+  const d = new Date(v);
+  if (String(d) === "Invalid Date") throw new Error(`Invalid date in Masterfile: "${v}" (${label})`);
+  return d;
+}
+
+function bir1604cStartOfYear_(year) {
+  return new Date(year, 0, 1);
+}
+
+function bir1604cEndOfYear_(year) {
+  return new Date(year, 11, 31);
+}
+
+// Employment Status:
+// - NO HEADER
+// - If Regularization Date <= Jan 1 of year => "R"
+// - else "CP"
+// Employment Status:
+// - If masterfile explicitly says REGULAR => "R"
+// - Else if NO separation date within year AND tenure from Start Date to 12/31/year is >= 6 months => "R"
+// - Else follow existing reg-date/status logic => "R" or "CP"
+function bir1604cDeriveEmploymentStatus_(meta, year) {
+  const jan1 = bir1604cStartOfYear_(year);
+  const end = bir1604cEndOfYear_(year);
+
+  const status = String(meta.statusRaw || "").trim().toUpperCase();
+  const reg = bir1604cParseDateStrict_(meta.regularizationDateRaw, "Regularization Date");
+
+  const start = bir1604cParseDateStrict_(meta.startDateRaw, "Start Date");
+  if (!start) throw new Error("Start Date missing in Masterfile for at least one employee.");
+
+  const sep = bir1604cParseDateStrict_(meta.separationDateRaw, "Separation Date");
+  const separatedWithinYear = !!(sep && sep <= end);
+
+  // If masterfile explicitly says REGULAR
+  if (status.indexOf("REGULAR") >= 0) return "R";
+
+  // ✅ YOUR RULE: default to R if NOT separated and tenure >= 6 months as of 12/31/year
+  if (!separatedWithinYear) {
+    const sixMonthsFromStart = new Date(start);
+    sixMonthsFromStart.setMonth(sixMonthsFromStart.getMonth() + 6);
+    if (sixMonthsFromStart <= end) return "R";
+  }
+
+// Existing logic
+if (status.indexOf("ACTIVE") >= 0) {
+  if (reg && reg <= jan1) return "R";
+  return "P"; // was "CP"
+}
+
+if (status.indexOf("PROB") >= 0 || status.indexOf("CONTRACT") >= 0 || status.indexOf("CASUAL") >= 0) {
+  return "P"; // was "CP" (already P here in this block after change)
+}
+
+if (reg && reg <= jan1) return "R";
+return "P"; // was "CP"
+
+}
+
+
+// Subs Filing:
+// - NO HEADER
+// - If With Previous Employer TRUE => "N"
+// - Else if Separation Date is within year OR before 12/31/year => "N"
+// - Else => "Y"
+function bir1604cDeriveSubsFiling_(meta, year) {
+  const withPrev = String(meta.withPrevEmployerRaw || "").trim().toUpperCase() === "TRUE";
+  if (withPrev) return "N";
+
+  const sep = bir1604cParseDateStrict_(meta.separationDateRaw, "Separation Date");
+  if (sep) {
+    const end = bir1604cEndOfYear_(year);
+    if (sep <= end) return "N";
+  }
+  return "Y";
+}
+
+// Employment From:
+// - If Start Date <= Jan 1 => 01/01/year
+// - Else actual Start Date
+function bir1604cDeriveEmploymentFrom_(meta, year) {
+  const jan1 = bir1604cStartOfYear_(year);
+  const start = bir1604cParseDateStrict_(meta.startDateRaw, "Start Date");
+  if (!start) throw new Error("Start Date missing in Masterfile for at least one employee.");
+  return bir1604cFormatDate_((start <= jan1) ? jan1 : start);
+}
+// Employment To:
+// - Separation Date within year OR before 12/31/year => sep
+// - Else 12/31/year
+function bir1604cDeriveEmploymentTo_(meta, year) {
+  const end = bir1604cEndOfYear_(year);
+  const sep = bir1604cParseDateStrict_(meta.separationDateRaw, "Separation Date");
+  if (sep && sep <= end) return bir1604cFormatDate_(sep);
+  return bir1604cFormatDate_(end);
+}
+
+// Reason for Separation:
+// - Only output reason if actually separated within/at year-end
+// - Else blank
+// Reason for Separation (UPDATED PER YOUR RULE):
+// - If Separation Date exists => output Reason for Separation
+// - If Separation Date exists but Reason is blank => default "T"
+// - If NO Separation Date => default "NA"
+function bir1604cDeriveReasonSeparation_(meta, year) {
+  const sep = bir1604cParseDateStrict_(meta.separationDateRaw, "Separation Date");
+
+  // No separation date => NA
+  if (!sep) return "NA";
+
+  // Has separation date => use reason, else default T
+  const reason = String(meta.reasonSeparationRaw || "").trim();
+  return reason ? reason : "T";
+}
+
+
+
+
+function bir1604cDeriveWorkingDaysPerYear_(meta) {
+  const n = Number(meta.workingDaysPerYear || 0);
+  return (isFinite(n) && n > 0) ? n : 261;
+}
+
+// Schedule 2 SMW fields (Basic Pay is in MASTERFILE)
+function bir1604cComputeSmwFields_(meta) {
+  const wdpy = bir1604cDeriveWorkingDaysPerYear_(meta);
+  const payBasis = String(meta.payBasis || "").trim().toUpperCase();
+  const basicPay = Number(meta.basicPay || 0);
+  if (!isFinite(basicPay)) throw new Error("Invalid Basic Pay in Masterfile for at least one employee.");
+
+  let perDay, perMonth, perYear;
+
+  if (payBasis === "DAILY") {
+    perDay = basicPay;
+    perYear = perDay * wdpy;
+    perMonth = perYear / 12;
+  } else {
+    // treat Basic Pay as monthly
+    perMonth = basicPay;
+    perYear = perMonth * 12;
+    perDay = perYear / wdpy;
+  }
+
+  return {
+    perDay: perDay,
+    perMonth: perMonth,
+    perYear: perYear,
+    factorUsed: wdpy
+  };
+}
+function bir1604cS1DetailCsv_(r) {
+  return [
+    r.scheduleNum,
+    r.ftype,
+    r.tinEmpyr,
+    r.branchEmpyr,
+    r.returnPeriod,
+    r.seqNum,
+    r.empTin,
+    r.empBranch,
+    bir1604cCsvEscape_(r.lastName, true),
+    bir1604cCsvEscape_(r.firstName, true),
+    bir1604cCsvEscape_(r.middleName, true),
+    r.regionNum,
+
+    bir1604cFmt2_(r.prevNonTaxGrossCompIncome),
+    bir1604cFmt2_(r.prevNonTaxBasicSmw),
+    bir1604cFmt2_(r.prevNonTax13thMonth),
+    bir1604cFmt2_(r.prevNonTaxDeMinimis),
+    bir1604cFmt2_(r.prevNonTaxSssEtc),
+    bir1604cFmt2_(r.prevNonTaxSalaries),
+    bir1604cFmt2_(r.prevTotalNonTaxCompIncome),
+    bir1604cFmt2_(r.prevTaxableBasicSalary),
+    bir1604cFmt2_(r.prevTaxable13thMonth),
+    bir1604cFmt2_(r.prevTaxableSalaries),
+    bir1604cFmt2_(r.prevTotalTaxable),
+
+    r.employmentFrom,
+    r.employmentTo,
+
+    bir1604cFmt2_(r.presNonTaxGrossCompIncome),
+    bir1604cFmt2_(r.nonTaxBasicSal),
+    bir1604cFmt2_(r.presNonTax13thMonth),
+    bir1604cFmt2_(r.presNonTaxDeMinimis),
+    bir1604cFmt2_(r.presNonTaxSssEtc),
+    bir1604cFmt2_(r.presNonTaxSalaries),
+    bir1604cFmt2_(r.presTotalNonTaxCompIncome),
+
+    bir1604cFmt2_(r.taxBasicSal),
+    bir1604cFmt2_(r.presTaxable13thMonth),
+    bir1604cFmt2_(r.presTaxableSalaries),
+    bir1604cFmt2_(r.presTotalComp),
+
+    bir1604cFmt2_(r.grossCompIncome),
+    bir1604cFmt2_(r.netTaxableCompIncome),
+    bir1604cFmt2_(r.taxDue),
+    bir1604cFmt2_(r.prevTaxWthld),
+    bir1604cFmt2_(r.presTaxWthld),
+    bir1604cFmt2_(r.amtWthldDec),
+    bir1604cFmt2_(r.overWthld),
+    bir1604cFmt2_(r.actualAmtWthld),
+
+    bir1604cCsvEscape_(r.nationality, false),
+    r.employmentStatus,
+    r.reasonSeparation,
+    r.subsFiling,
+    bir1604cFmt2_(r.taxCreditPera),
+  ];
+}
+
+function bir1604cS1ControlCsv_(employerTin, returnPeriod, t) {
+  return [
+    "C1",
+    BIR1604C_V1.DETAIL_FTYPE,
+    bir1604cPadTin9_(employerTin),
+    "0000",
+    returnPeriod,
+
+    bir1604cFmt2_(t.prevNonTaxGrossCompIncome),
+    bir1604cFmt2_(t.prevNonTaxBasicSmw),
+    bir1604cFmt2_(t.prevNonTax13thMonth),
+    bir1604cFmt2_(t.prevNonTaxDeMinimis),
+    bir1604cFmt2_(t.prevNonTaxSssEtc),
+    bir1604cFmt2_(t.prevNonTaxSalaries),
+    bir1604cFmt2_(t.prevTotalNonTaxCompIncome),
+    bir1604cFmt2_(t.prevTaxableBasicSalary),
+    bir1604cFmt2_(t.prevTaxable13thMonth),
+    bir1604cFmt2_(t.prevTaxableSalaries),
+    bir1604cFmt2_(t.prevTotalTaxable),
+
+    bir1604cFmt2_(t.presNonTaxGrossCompIncome),
+    bir1604cFmt2_(t.nonTaxBasicSal),
+    bir1604cFmt2_(t.presNonTax13thMonth),
+    bir1604cFmt2_(t.presNonTaxDeMinimis),
+    bir1604cFmt2_(t.presNonTaxSssEtc),
+    bir1604cFmt2_(t.presNonTaxSalaries),
+    bir1604cFmt2_(t.presTotalNonTaxCompIncome),
+
+    bir1604cFmt2_(t.taxBasicSal),
+    bir1604cFmt2_(t.presTaxable13thMonth),
+    bir1604cFmt2_(t.presTaxableSalaries),
+    bir1604cFmt2_(t.presTotalComp),
+
+    bir1604cFmt2_(t.grossCompIncome),
+    bir1604cFmt2_(t.netTaxableCompIncome),
+    bir1604cFmt2_(t.taxDue),
+    bir1604cFmt2_(t.prevTaxWthld),
+    bir1604cFmt2_(t.presTaxWthld),
+    bir1604cFmt2_(t.amtWthldDec),
+    bir1604cFmt2_(t.overWthld),
+    bir1604cFmt2_(t.actualAmtWthld),
+
+    bir1604cFmt2_(t.taxCreditPera),
+  ];
+}
+
+function bir1604cS2DetailCsv_(r) {
+  return [
+    r.scheduleNum,
+    r.ftype,
+    r.tinEmpyr,
+    r.branchEmpyr,
+    r.returnPeriod,
+    r.seqNum,
+    r.empTin,
+    r.empBranch,
+    bir1604cCsvEscape_(r.lastName, true),
+    bir1604cCsvEscape_(r.firstName, true),
+    bir1604cCsvEscape_(r.middleName, true),
+    r.regionNum,
+
+    // PREV (money -> 2 decimals)
+    bir1604cFmt2_(r.prevNonTaxGrossCompIncome),
+    bir1604cFmt2_(r.prevNonTaxBasicSmw),
+    bir1604cFmt2_(r.prevNonTaxHolidayPay),
+    bir1604cFmt2_(r.prevNonTaxOvertimePay),
+    bir1604cFmt2_(r.prevNonTaxNightDiff),
+    bir1604cFmt2_(r.prevNonTaxHazardPay),
+    bir1604cFmt2_(r.prevNonTax13thMonth),
+    bir1604cFmt2_(r.prevNonTaxDeMinimis),
+    bir1604cFmt2_(r.prevNonTaxSssEtc),
+    bir1604cFmt2_(r.prevNonTaxSalaries),
+    bir1604cFmt2_(r.prevTotalNonTaxCompIncome),
+    bir1604cFmt2_(r.prevTaxable13thMonth),
+    bir1604cFmt2_(r.prevTaxableSalaries),
+    bir1604cFmt2_(r.prevTotalTaxable),
+
+    r.employmentFrom,
+    r.employmentTo,
+
+    // PRESENT (money -> 2 decimals)
+    bir1604cFmt2_(r.presNonTaxGrossCompIncome),
+    bir1604cFmt2_(r.presNonTaxBasicSmwDay),
+    bir1604cFmt2_(r.presNonTaxBasicSmwMonth),
+    bir1604cFmt2_(r.presNonTaxBasicSmwYear),
+
+    // Factor used (keep whole number)
+    bir1604cFmt0_(r.factorUsed),
+
+    // PRESENT non-tax comps (money -> 2 decimals)
+    bir1604cFmt2_(r.presNonTaxHolidayPay),
+    bir1604cFmt2_(r.presNonTaxOvertimePay),
+    bir1604cFmt2_(r.presNonTaxNightDiff),
+    bir1604cFmt2_(r.presNonTaxHazardPay),
+    bir1604cFmt2_(r.presNonTax13thMonth),
+    bir1604cFmt2_(r.presNonTaxDeMinimis),
+    bir1604cFmt2_(r.presNonTaxSssEtc),
+    bir1604cFmt2_(r.presNonTaxSalaries),
+    bir1604cFmt2_(r.presTotalNonTaxCompIncome),
+
+    // PRESENT taxable (money -> 2 decimals)
+    bir1604cFmt2_(r.presTaxable13thMonth),
+    bir1604cFmt2_(r.presTaxableSalaries),
+    bir1604cFmt2_(r.presTotalComp),
+
+    // TOTALS (money -> 2 decimals)
+    bir1604cFmt2_(r.grossCompIncome),
+    bir1604cFmt2_(r.netTaxableCompIncome),
+    bir1604cFmt2_(r.taxDue),
+    bir1604cFmt2_(r.prevTaxWthld),
+    bir1604cFmt2_(r.presTaxWthld),
+    bir1604cFmt2_(r.amtWthldDec),
+    bir1604cFmt2_(r.overWthld),
+    bir1604cFmt2_(r.actualAmtWthld),
+
+    bir1604cCsvEscape_(r.nationality, false),
+    r.employmentStatus,
+    r.reasonSeparation,
+    r.subsFiling,
+
+    // LAST fields (money -> 2 decimals)
+    bir1604cFmt2_(r.taxCreditPera),
+    bir1604cFmt2_(r.nonTaxBasicSal),
+  ];
+}
+
+
+function bir1604cS2ControlCsv_(employerTin, returnPeriod, t) {
+  return [
+    "C2",
+    BIR1604C_V1.DETAIL_FTYPE,
+    bir1604cPadTin9_(employerTin),
+    "0000",
+    returnPeriod,
+
+    // PREV (money -> 2 decimals)
+    bir1604cFmt2_(t.prevNonTaxGrossCompIncome),
+    bir1604cFmt2_(t.prevNonTaxBasicSmw),
+    bir1604cFmt2_(t.prevNonTaxHolidayPay),
+    bir1604cFmt2_(t.prevNonTaxOvertimePay),
+    bir1604cFmt2_(t.prevNonTaxNightDiff),
+    bir1604cFmt2_(t.prevNonTaxHazardPay),
+    bir1604cFmt2_(t.prevNonTax13thMonth),
+    bir1604cFmt2_(t.prevNonTaxDeMinimis),
+    bir1604cFmt2_(t.prevNonTaxSssEtc),
+    bir1604cFmt2_(t.prevNonTaxSalaries),
+    bir1604cFmt2_(t.prevTotalNonTaxCompIncome),
+    bir1604cFmt2_(t.prevTaxable13thMonth),
+    bir1604cFmt2_(t.prevTaxableSalaries),
+    bir1604cFmt2_(t.prevTotalTaxable),
+
+    // PRESENT (money -> 2 decimals)
+    bir1604cFmt2_(t.presNonTaxGrossCompIncome),
+    bir1604cFmt2_(t.presNonTaxBasicSmwDay),
+    bir1604cFmt2_(t.presNonTaxBasicSmwMonth),
+    bir1604cFmt2_(t.presNonTaxBasicSmwYear),
+    bir1604cFmt2_(t.presNonTaxHolidayPay),
+    bir1604cFmt2_(t.presNonTaxOvertimePay),
+    bir1604cFmt2_(t.presNonTaxNightDiff),
+    bir1604cFmt2_(t.presNonTaxHazardPay),
+    bir1604cFmt2_(t.presNonTax13thMonth),
+    bir1604cFmt2_(t.presNonTaxDeMinimis),
+    bir1604cFmt2_(t.presNonTaxSssEtc),
+    bir1604cFmt2_(t.presNonTaxSalaries),
+    bir1604cFmt2_(t.presTotalNonTaxCompIncome),
+
+    // PRESENT taxable (money -> 2 decimals)
+    bir1604cFmt2_(t.presTaxable13thMonth),
+    bir1604cFmt2_(t.presTaxableSalaries),
+    bir1604cFmt2_(t.presTotalComp),
+
+    // TOTALS (money -> 2 decimals)
+    bir1604cFmt2_(t.grossCompIncome),
+    bir1604cFmt2_(t.netTaxableCompIncome),
+    bir1604cFmt2_(t.taxDue),
+    bir1604cFmt2_(t.prevTaxWthld),
+    bir1604cFmt2_(t.presTaxWthld),
+    bir1604cFmt2_(t.amtWthldDec),
+    bir1604cFmt2_(t.overWthld),
+    bir1604cFmt2_(t.actualAmtWthld),
+
+    // LAST fields (money -> 2 decimals)
+    bir1604cFmt2_(t.taxCreditPera),
+    bir1604cFmt2_(t.nonTaxBasicSal),
+  ];
+}
+
+function bir1604cDebugField31_NonTaxOther(year) {
+  const cfg = bir2316GetSettings_();
+
+  const annual = bir1604cReadAnnualization_(year);
+  if (typeof _buildFinalAnnFacts_ !== "function") {
+    throw new Error("_buildFinalAnnFacts_ not found.");
+  }
+  const facts = _buildFinalAnnFacts_(year, cfg);
+  const histHeaders = (facts && facts.headers) ? facts.headers : [];
+  const groupCols = (facts && facts.groupCols) ? facts.groupCols : null;
+  if (!histHeaders.length || !groupCols) throw new Error("FinalAnn facts missing headers/groupCols.");
+
+  const names = (groupCols.NONTAX_OTHER || []).map(i => String(histHeaders[i] || "").trim());
+  const present = [];
+  const missingInAnnual = [];
+
+  names.forEach(name => {
+    const up = String(name || "").trim().toUpperCase();
+    const idx = annual.headerUpperToIndex[up];
+    if (idx == null) {
+      missingInAnnual.push(name);
+      return;
+    }
+    // take first data row just to see raw values/type
+    const sampleRaw = annual.byEmpId.size ? annual.byEmpId.values().next().value[idx] : null;
+    present.push({
+      header: name,
+      annualColIndex1Based: idx + 1,
+      sampleType: typeof sampleRaw,
+      sampleRaw: sampleRaw
+    });
+  });
+
+  // Write to a sheet so you don't rely on truncated logs
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const shName = "_1604C_DEBUG_FIELD31";
+  const sh = ss.getSheetByName(shName) || ss.insertSheet(shName);
+  sh.clearContents();
+
+  sh.getRange(1, 1).setValue("NONTAX_OTHER component headers from _buildFinalAnnFacts_()");
+  sh.getRange(2, 1).setValue("Total components:");
+  sh.getRange(2, 2).setValue(names.length);
+
+  sh.getRange(4, 1).setValue("MISSING in Annualization sheet (header not found):");
+  if (missingInAnnual.length) {
+    sh.getRange(5, 1, missingInAnnual.length, 1).setValues(missingInAnnual.map(x => [x]));
+  } else {
+    sh.getRange(5, 1).setValue("(none)");
+  }
+
+  sh.getRange(4, 3).setValue("PRESENT in Annualization sheet (with sample value/type):");
+  sh.getRange(5, 3, 1, 4).setValues([["Header", "Annual Col #", "Sample Type", "Sample Raw"]]);
+
+  if (present.length) {
+    sh.getRange(6, 3, present.length, 4).setValues(
+      present.map(p => [p.header, p.annualColIndex1Based, p.sampleType, String(p.sampleRaw)])
+    );
+  } else {
+    sh.getRange(6, 3).setValue("(none)");
+  }
+
+  return { totalComponents: names.length, missingInAnnual: missingInAnnual.length, presentInAnnual: present.length };
+}
+
+function bir1604cDebugField34_AllEmployees(year) {
+  year = Number(year || 0);
+  if (!year || year < 2000) throw new Error("Invalid year.");
+
+  const cfg = bir2316GetSettings_();
+  const annual = bir1604cReadAnnualization_(year);
+
+  if (typeof _buildFinalAnnFacts_ !== "function") {
+    throw new Error("_buildFinalAnnFacts_ not found.");
+  }
+
+  const facts = _buildFinalAnnFacts_(year, cfg);
+  const histHeaders = (facts && facts.headers) ? facts.headers : [];
+  const groupCols = (facts && facts.groupCols) ? facts.groupCols : null;
+  if (!histHeaders.length || !groupCols) {
+    throw new Error("FinalAnn facts missing headers/groupCols.");
+  }
+
+  // OTHER13 component header names (13th month & other benefits)
+  const other13Names = (groupCols.OTHER13 || []).map(i => String(histHeaders[i] || "").trim());
+
+  // Field 28 header (must exist per bir1604cReadAnnualization_ required columns)
+  const idxField28 = annual.headerUpperToIndex["NON-TAX 13TH + OTHER (≤90K)"];
+  if (idxField28 == null) {
+    throw new Error('Annualization missing required column: "NON-TAX 13TH + OTHER (≤90K)"');
+  }
+
+  // Masterfile meta for schedule + name
+  const mfMeta = bir1604cReadMasterfileMeta_();
+
+  const rowsOut = [];
+  annual.order.forEach(empId => {
+    const row = annual.byEmpId.get(empId);
+    if (!row) return;
+
+    const meta = mfMeta.get(empId);
+    if (!meta) return;
+
+    const sched = (String(meta.mwe || "").toUpperCase() === "TRUE") ? "S2" : "S1";
+    const empName = (String(meta.lastName || "") + ", " + String(meta.firstName || "")).trim();
+
+    // OTHER13_SUM + breakdown
+    let other13Sum = 0;
+    const breakdownParts = [];
+
+    other13Names.forEach(name => {
+      const up = String(name || "").trim().toUpperCase();
+      const idx = annual.headerUpperToIndex[up];
+      if (idx == null) return; // component not present in annualization output
+      const v = Number(row[idx] || 0);
+      const val = isFinite(v) ? v : 0;
+      other13Sum += val;
+      breakdownParts.push(name + "=" + val);
+    });
+
+    const field28 = Number(row[idxField28] || 0);
+    const field28Val = isFinite(field28) ? field28 : 0;
+
+    // FIELD 34 rule: ALL OTHER13 components - FIELD 28
+    const field34 = Number(other13Sum || 0) - Number(field28Val || 0);
+
+    rowsOut.push([
+      empId,
+      empName,
+      sched,
+      other13Sum,
+      field28Val,
+      field34,
+      breakdownParts.join(" | ")
+    ]);
+  });
+
+  // Write output
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const shName = "_1604C_DEBUG_FIELD34";
+  const sh = ss.getSheetByName(shName) || ss.insertSheet(shName);
+  sh.clearContents();
+
+  const header = [[
+    "Employee ID",
+    "Employee Name (Masterfile)",
+    "Schedule (S1/S2)",
+    "OTHER13_SUM (all 13th & other benefits components)",
+    "FIELD_28 (NON-TAX 13TH + OTHER (≤90K))",
+    "FIELD_34 = OTHER13_SUM - FIELD_28",
+    "Breakdown (component=value)"
+  ]];
+
+  sh.getRange(1, 1, 1, header[0].length).setValues(header);
+
+  if (rowsOut.length) {
+    sh.getRange(2, 1, rowsOut.length, header[0].length).setValues(rowsOut);
+  } else {
+    sh.getRange(2, 1).setValue("(no rows)");
+  }
+
+  return { year: year, employees: rowsOut.length, sheet: shName };
+}
+
+function bir1604cDebugField27_AllEmployees(year) {
+  year = Number(year || 0);
+  if (!year || year < 2000) throw new Error("Invalid year.");
+
+  const cfg = bir2316GetSettings_();
+  const annual = bir1604cReadAnnualization_(year);
+
+  if (typeof _buildFinalAnnFacts_ !== "function") {
+    throw new Error("_buildFinalAnnFacts_ not found.");
+  }
+
+  const facts = _buildFinalAnnFacts_(year, cfg);
+  const histHeaders = (facts && facts.headers) ? facts.headers : [];
+  const groupCols = (facts && facts.groupCols) ? facts.groupCols : null;
+  if (!histHeaders.length || !groupCols) {
+    throw new Error("FinalAnn facts missing headers/groupCols.");
+  }
+
+  const basicNames = (groupCols.BASIC || []).map(i => String(histHeaders[i] || "").trim());
+  const mfMeta = bir1604cReadMasterfileMeta_();
+
+  const rowsOut = [];
+  annual.order.forEach(empId => {
+    const row = annual.byEmpId.get(empId);
+    if (!row) return;
+
+    const meta = mfMeta.get(empId);
+    if (!meta) return;
+
+    const sched = (String(meta.mwe || "").toUpperCase() === "TRUE") ? "S2" : "S1";
+    const empName = (String(meta.lastName || "") + ", " + String(meta.firstName || "")).trim();
+
+    let basicSum = 0;
+    const breakdownParts = [];
+
+    basicNames.forEach(name => {
+      const up = String(name || "").trim().toUpperCase();
+      const idx = annual.headerUpperToIndex[up];
+      if (idx == null) return;
+      const v = Number(row[idx] || 0);
+      const val = isFinite(v) ? v : 0;
+      basicSum += val;
+      breakdownParts.push(name + "=" + val);
+    });
+
+    // FIELD 27 = BASIC_SUM
+    rowsOut.push([
+      empId,
+      empName,
+      sched,
+      basicSum,
+      breakdownParts.join(" | ")
+    ]);
+  });
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const shName = "_1604C_DEBUG_FIELD27";
+  const sh = ss.getSheetByName(shName) || ss.insertSheet(shName);
+  sh.clearContents();
+
+  const header = [[
+    "Employee ID",
+    "Employee Name (Masterfile)",
+    "Schedule (S1/S2)",
+    "FIELD_27 (BASIC_SUM)",
+    "Breakdown (component=value)"
+  ]];
+  sh.getRange(1, 1, 1, header[0].length).setValues(header);
+
+  if (rowsOut.length) {
+    sh.getRange(2, 1, rowsOut.length, header[0].length).setValues(rowsOut);
+  } else {
+    sh.getRange(2, 1).setValue("(no rows)");
+  }
+
+  return { year: year, employees: rowsOut.length, sheet: shName };
+}
+
+
+function bir1604cDebugField33_AllEmployees(year) {
+  year = Number(year || 0);
+  if (!year || year < 2000) throw new Error("Invalid year.");
+
+  const cfg = bir2316GetSettings_();
+  const annual = bir1604cReadAnnualization_(year);
+
+  if (typeof _buildFinalAnnFacts_ !== "function") {
+    throw new Error("_buildFinalAnnFacts_ not found.");
+  }
+
+  const facts = _buildFinalAnnFacts_(year, cfg);
+  const histHeaders = (facts && facts.headers) ? facts.headers : [];
+  const groupCols = (facts && facts.groupCols) ? facts.groupCols : null;
+  if (!histHeaders.length || !groupCols) {
+    throw new Error("FinalAnn facts missing headers/groupCols.");
+  }
+
+  const basicNames = (groupCols.BASIC || []).map(i => String(histHeaders[i] || "").trim());
+
+  // Required EE share headers (already enforced by bir1604cReadAnnualization_)
+  const idxSssMc = annual.headerUpperToIndex["SSS EE MC (YTD)"];
+  const idxSssMpf = annual.headerUpperToIndex["SSS EE MPF (YTD)"];
+  const idxPh = annual.headerUpperToIndex["PHILHEALTH EE (YTD)"];
+  const idxPi = annual.headerUpperToIndex["PAG-IBIG EE (YTD)"];
+
+  if (idxSssMc == null) throw new Error('Annualization missing: "SSS EE MC (YTD)"');
+  if (idxSssMpf == null) throw new Error('Annualization missing: "SSS EE MPF (YTD)"');
+  if (idxPh == null) throw new Error('Annualization missing: "PHILHEALTH EE (YTD)"');
+  if (idxPi == null) throw new Error('Annualization missing: "PAG-IBIG EE (YTD)"');
+
+  const mfMeta = bir1604cReadMasterfileMeta_();
+
+  const rowsOut = [];
+  annual.order.forEach(empId => {
+    const row = annual.byEmpId.get(empId);
+    if (!row) return;
+
+    const meta = mfMeta.get(empId);
+    if (!meta) return;
+
+    const sched = (String(meta.mwe || "").toUpperCase() === "TRUE") ? "S2" : "S1";
+    const empName = (String(meta.lastName || "") + ", " + String(meta.firstName || "")).trim();
+
+    // BASIC_SUM
+    let basicSum = 0;
+    const basicBreakdown = [];
+
+    basicNames.forEach(name => {
+      const up = String(name || "").trim().toUpperCase();
+      const idx = annual.headerUpperToIndex[up];
+      if (idx == null) return;
+      const v = Number(row[idx] || 0);
+      const val = isFinite(v) ? v : 0;
+      basicSum += val;
+      basicBreakdown.push(name + "=" + val);
+    });
+
+    const sssMc = Number(row[idxSssMc] || 0);
+    const sssMpf = Number(row[idxSssMpf] || 0);
+    const ph = Number(row[idxPh] || 0);
+    const pi = Number(row[idxPi] || 0);
+
+    const eeShare =
+      (isFinite(sssMc) ? sssMc : 0) +
+      (isFinite(sssMpf) ? sssMpf : 0) +
+      (isFinite(ph) ? ph : 0) +
+      (isFinite(pi) ? pi : 0);
+
+    // FIELD 33 = TAX_BASIC_SAL = max(0, BASIC_SUM - EE_SHARE)
+    const field33 = Math.max(0, Number(basicSum || 0) - Number(eeShare || 0));
+
+    rowsOut.push([
+      empId,
+      empName,
+      sched,
+      basicSum,
+      eeShare,
+      field33,
+      "SSS_MC=" + (isFinite(sssMc) ? sssMc : 0) +
+        " | SSS_MPF=" + (isFinite(sssMpf) ? sssMpf : 0) +
+        " | PH=" + (isFinite(ph) ? ph : 0) +
+        " | PI=" + (isFinite(pi) ? pi : 0),
+      basicBreakdown.join(" | ")
+    ]);
+  });
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const shName = "_1604C_DEBUG_FIELD33";
+  const sh = ss.getSheetByName(shName) || ss.insertSheet(shName);
+  sh.clearContents();
+
+  const header = [[
+    "Employee ID",
+    "Employee Name (Masterfile)",
+    "Schedule (S1/S2)",
+    "BASIC_SUM (from BASIC components)",
+    "EE_SHARE (SSS_MC+SSS_MPF+PH+PI)",
+    "FIELD_33 = max(0, BASIC_SUM - EE_SHARE)",
+    "EE Share Breakdown",
+    "BASIC Breakdown (component=value)"
+  ]];
+  sh.getRange(1, 1, 1, header[0].length).setValues(header);
+
+  if (rowsOut.length) {
+    sh.getRange(2, 1, rowsOut.length, header[0].length).setValues(rowsOut);
+  } else {
+    sh.getRange(2, 1).setValue("(no rows)");
+  }
+
+  return { year: year, employees: rowsOut.length, sheet: shName };
+}

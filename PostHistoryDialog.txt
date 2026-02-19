@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top" />
+  <meta charset="utf-8" />
+
+  <?!= include_('UiTheme'); ?>
+
+  <style>
+    /* Layout-only overrides (no global body/button styling) */
+    .subtitle { font-size:12px; color:var(--muted); margin-top:-4px; }
+
+    .grid {
+      display:grid;
+      grid-template-columns: 1fr 1fr;
+      gap:12px;
+    }
+    @media (max-width: 860px){
+      .grid { grid-template-columns: 1fr; }
+    }
+
+    .panel {
+      border:1px solid var(--border);
+      border-radius: var(--radius);
+      background: var(--surface);
+      overflow:hidden;
+      min-height: 220px;
+      display:flex;
+      flex-direction:column;
+    }
+
+    .panel-head{
+      display:flex;
+      align-items:flex-start;
+      justify-content:space-between;
+      gap:10px;
+      padding:10px 12px;
+      background: var(--surface-2);
+      border-bottom:1px solid var(--border);
+    }
+    .panel-title{
+      margin:0;
+      font-size:13px;
+      font-weight:700;
+      color:var(--text);
+      line-height:1.2;
+    }
+    .panel-sub{
+      font-size:11px;
+      color:var(--muted);
+      margin-top:2px;
+    }
+
+    .select-all{
+      display:flex;
+      align-items:center;
+      gap:8px;
+      font-size:12px;
+      color:var(--muted);
+      user-select:none;
+      white-space:nowrap;
+      margin-top:2px;
+    }
+    .select-all input{ width:auto; }
+
+    .list{
+      padding:6px 10px;
+      overflow:auto;
+      max-height: 260px;
+    }
+
+    .row-item{
+      display:flex;
+      align-items:center;
+      gap:10px;
+      padding:8px 8px;
+      border-radius: 10px;
+      cursor:pointer;
+      transition: background var(--t) var(--ease);
+    }
+    .row-item:hover{ background:#f6fafe; }
+
+    .row-item input{ width:auto; margin:0; }
+
+    .sheet-name{
+      flex:1;
+      min-width: 0;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      font-size:12px;
+      color:var(--text);
+    }
+
+    .pill{
+      font-size:10px;
+      font-weight:700;
+      letter-spacing:.3px;
+      text-transform:uppercase;
+      padding:2px 8px;
+      border-radius: 999px;
+      border:1px solid var(--border);
+      background: var(--surface-2);
+      color: var(--muted);
+      white-space:nowrap;
+    }
+    .pill--posted{
+      background:#e6f4ea;
+      border-color:#cde7d8;
+      color:#137333;
+    }
+    .pill--unposted{
+      background:#e8f0fe;
+      border-color:#d2e3fc;
+      color:#1967d2;
+    }
+
+    .empty{
+      padding:10px 6px;
+      font-size:12px;
+      color:#9aa0a6;
+    }
+
+    .counts{
+      padding:8px 12px;
+      border-top:1px solid var(--border);
+      background: #fff;
+      font-size:12px;
+      color:var(--muted);
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      gap:10px;
+    }
+
+    /* Status bar blends with theme */
+    #status { margin-top: 10px; }
+
+    /* Make footer always visible and consistent */
+    .ui-footer .left {
+      margin-right:auto;
+      color:var(--muted);
+      font-size:12px;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+      max-width: 65%;
+    }
+
+/* ✅ Brand logo INSIDE modal (sticky bottom, does not overlay scrollbar) */
+.brand-sticky-bottom{
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;  /* lower-right */
+  padding: 8px 0 2px;
+  background: #fff;
+}
+
+
+  </style>
+</head>
+
+<body class="ui-page">
+<h1>Post/Unpost to Payroll History</h1>
+
+  <div class="card">
+    
+    <div class="subtitle">
+      Select payroll computation runs to post to <b>PAYROLL_HISTORY</b> or unpost from it.
+    </div>
+
+    <div id="loading" class="text-muted" style="margin-top:8px;">Loading payroll computation sheets…</div>
+
+    <div id="content" style="display:none; margin-top:10px;">
+      <div class="grid">
+
+        <!-- Unposted -->
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Unposted payroll runs</div>
+              <div class="panel-sub">Ready to post to history</div>
+            </div>
+
+            <label class="select-all">
+              <input type="checkbox" id="postSelectAll" onchange="toggleSelectAll('post', this.checked)" />
+              <span>Select all</span>
+            </label>
+          </div>
+
+          <div id="postList" class="list"></div>
+
+          <div class="counts">
+            <span><b id="postCount">0</b> unposted run(s)</span>
+          </div>
+        </div>
+
+        <!-- Posted -->
+        <div class="panel">
+          <div class="panel-head">
+            <div>
+              <div class="panel-title">Posted payroll runs</div>
+              <div class="panel-sub">Can be unposted (rows removed from history)</div>
+            </div>
+
+            <label class="select-all">
+              <input type="checkbox" id="unpostSelectAll" onchange="toggleSelectAll('unpost', this.checked)" />
+              <span>Select all</span>
+            </label>
+          </div>
+
+          <div id="unpostList" class="list"></div>
+
+          <div class="counts">
+            <span><b id="unpostCount">0</b> posted run(s)</span>
+          </div>
+        </div>
+
+      </div>
+
+      <div id="status"></div>
+    </div>
+  </div>
+
+  <div class="ui-footer">
+    <div class="left" id="footerStatus"></div>
+    <button class="secondary" type="button" onclick="google.script.host.close()">Cancel</button>
+    <button class="primary" id="applyBtn" type="button" onclick="applyChanges()">Apply</button>
+  </div>
+
+  <div class="brand-sticky-bottom">
+  <?!= include_('BrandWatermarkInline'); ?>
+</div>
+
+  <script>
+    function init() {
+      google.script.run
+        .withSuccessHandler(renderSheets)
+        .withFailureHandler(function (err) {
+          document.getElementById("loading").textContent =
+            "Error loading sheets: " + (err && err.message ? err.message : err);
+        })
+        .listPayrollSheetsForHistory();
+    }
+
+    function renderSheets(data) {
+      document.getElementById("loading").style.display = "none";
+      document.getElementById("content").style.display = "block";
+
+      var postList = document.getElementById("postList");
+      var unpostList = document.getElementById("unpostList");
+      postList.innerHTML = "";
+      unpostList.innerHTML = "";
+
+      var unpostedCount = 0;
+      var postedCount = 0;
+
+      if (!data || !data.length) {
+        postList.innerHTML = '<div class="empty">No payroll computation runs found.</div>';
+        unpostList.innerHTML = "";
+        document.getElementById("postCount").textContent = "0";
+        document.getElementById("unpostCount").textContent = "0";
+        return;
+      }
+
+      data.forEach(function (row) {
+        var item = document.createElement("label");
+        item.className = "row-item";
+
+        var cb = document.createElement("input");
+        cb.type = "checkbox";
+        cb.value = row.name;
+
+        var nameSpan = document.createElement("span");
+        nameSpan.className = "sheet-name";
+        nameSpan.textContent = row.name;
+
+        var pill = document.createElement("span");
+        pill.className = "pill";
+
+        if (row.isPosted) {
+          pill.classList.add("pill--posted");
+          pill.textContent = "posted";
+          cb.className = "unpost";
+          item.appendChild(cb);
+          item.appendChild(nameSpan);
+          item.appendChild(pill);
+          unpostList.appendChild(item);
+          postedCount++;
+        } else {
+          pill.classList.add("pill--unposted");
+          pill.textContent = "unposted";
+          cb.className = "post";
+          item.appendChild(cb);
+          item.appendChild(nameSpan);
+          item.appendChild(pill);
+          postList.appendChild(item);
+          unpostedCount++;
+        }
+      });
+
+      if (!unpostedCount) postList.innerHTML = '<div class="empty">No unposted payroll runs.</div>';
+      if (!postedCount) unpostList.innerHTML = '<div class="empty">No posted payroll runs.</div>';
+
+      document.getElementById("postCount").textContent = unpostedCount;
+      document.getElementById("unpostCount").textContent = postedCount;
+
+      document.getElementById("footerStatus").textContent = "";
+      document.getElementById("status").textContent = "";
+    }
+
+    function toggleSelectAll(type, checked) {
+      var selector = type === "post" ? "input.post" : "input.unpost";
+      document.querySelectorAll(selector).forEach(function (cb) {
+        cb.checked = checked;
+      });
+    }
+
+    function applyChanges() {
+      var applyBtn = document.getElementById("applyBtn");
+      UI.setBusy(applyBtn, true, "Applying");
+
+      var footerStatus = document.getElementById("footerStatus");
+      footerStatus.textContent = "Applying changes…";
+
+      var toPost = [];
+      var toUnpost = [];
+
+      document.querySelectorAll('input.post:checked').forEach(function (cb) { toPost.push(cb.value); });
+      document.querySelectorAll('input.unpost:checked').forEach(function (cb) { toUnpost.push(cb.value); });
+
+      google.script.run
+        .withSuccessHandler(function (result) {
+          google.script.run.showPostHistorySummary(result);
+          google.script.host.close();
+        })
+        .withFailureHandler(function (err) {
+          UI.setBusy(applyBtn, false);
+          footerStatus.textContent = "Error: " + (err && err.message ? err.message : err);
+        })
+        .applyPostHistoryAction({ toPost: toPost, toUnpost: toUnpost });
+    }
+
+    window.onload = init;
+  </script>
+
+
+</body>
+</html>

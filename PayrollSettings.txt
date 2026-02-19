@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body { font-family: "Segoe UI", Roboto, sans-serif; margin: 20px; }
+    h3 { margin-top: 0; }
+    label { font-size: 13px; font-weight: 600; display: block; margin-top: 10px; }
+    input, select {
+      width: 100%; padding: 6px 8px; border: 1px solid #ccc;
+      border-radius: 4px; box-sizing: border-box; font-size: 13px;
+    }
+    button {
+      margin-top: 12px; padding: 7px 14px; border: none; border-radius: 4px;
+      cursor: pointer; font-size: 13px;
+    }
+    #reloadSheets { background-color: #1a73e8; color: #fff; }
+    #reloadSheets:hover { background-color: #0f5dd6; }
+    #test { background-color: #1a73e8; color: #fff; }
+    #test:hover { background-color: #0f5dd6; }
+    #save { background-color: #0b8043; color: #fff; }
+    #save:hover { background-color: #066b36; }
+    #close { background-color: #777; color: #fff; float: right; }
+    #close:hover { background-color: #555; }
+    #status { margin-top: 10px; font-size: 12px; color: #444; white-space: pre-line; }
+  </style>
+  <?!= include_('UiTheme'); ?>
+<style>
+  .ui-page button {
+    display: inline-block !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+  }
+
+  /* ✅ Brand logo INSIDE modal (sticky bottom, does not overlay scrollbar) */
+.brand-sticky-bottom{
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;  /* lower-right */
+  padding: 8px 0 2px;
+  background: #fff;
+}
+
+</style>
+
+
+  
+</head>
+<body class="ui-page">
+  
+
+  <h3>Payroll Settings</h3>
+
+  <label>Employee Masterfile URL / ID</label>
+  <!-- 🔁 auto-load sheets when URL changes -->
+  <input type="text" id="masterUrl"
+         placeholder="Paste Google Sheets URL or file ID here"
+         onchange="reloadSheetsAuto_()">
+
+  <button id="reloadSheets" onclick="loadSheets()">Reload Sheets</button>
+
+  <label>Masterfile Sheet Name</label>
+  <select id="sheetName">
+    <option value="">(Load sheets first)</option>
+  </select>
+
+  <div class="actions">
+  <button id="test" onclick="testConnection()">Test Connection</button>
+  <button id="save" onclick="saveSettings()">Save</button>
+  <button id="close" onclick="google.script.host.close()">Close</button>
+</div>
+
+<style>
+  .actions { margin-top:16px; display:flex; gap:8px; justify-content:flex-end; }
+  #close { float:none; }
+</style>
+
+  <div id="status"></div>
+
+  <div class="brand-sticky-bottom">
+  <?!= include_('BrandWatermarkInline'); ?>
+</div>
+
+
+  <script>
+    function setStatus(msg) {
+      document.getElementById('status').textContent = msg || '';
+    }
+
+    // Load existing settings on open
+    window.onload = function () {
+      google.script.run
+        .withSuccessHandler(cfg => {
+          if (!cfg) return;
+          if (cfg.masterIdOrUrl) {
+            const inp = document.getElementById('masterUrl');
+            inp.value = cfg.masterIdOrUrl;
+          }
+          if (cfg.masterSheetName) {
+            document.getElementById('sheetName').dataset.current = cfg.masterSheetName;
+          }
+          // auto-load sheets using stored URL (if any)
+          if (cfg.masterIdOrUrl) {
+            loadSheets(true);
+          }
+        })
+        .getCurrentPayrollSettings();
+    };
+
+    // Called when URL field changes (paste / edit)
+    function reloadSheetsAuto_() {
+      const url = document.getElementById('masterUrl').value.trim();
+      if (!url) return;
+      loadSheets(true);
+    }
+
+    // fromAuto = true → quieter status text
+    function loadSheets(fromAuto) {
+      const url = document.getElementById('masterUrl').value.trim();
+      if (!url) {
+        setStatus('⚠️ Paste the Masterfile URL or ID first.');
+        return;
+      }
+
+      setStatus(fromAuto ? 'Loading sheets…' : '⏳ Loading sheets…');
+
+      google.script.run
+        .withSuccessHandler(res => {
+          const select = document.getElementById('sheetName');
+          select.innerHTML = '';
+          if (!res || !res.sheets || !res.sheets.length) {
+            select.innerHTML = '<option value="">(No sheets found)</option>';
+            setStatus('No sheets found in that file.');
+            return;
+          }
+
+          const current = select.dataset.current || '';
+          res.sheets.forEach(name => {
+            const opt = document.createElement('option');
+            opt.value = name;
+            opt.textContent = name;
+            if (name === current) opt.selected = true;
+            select.appendChild(opt);
+          });
+
+          setStatus('✅ Sheets loaded. Select the master tab, then Test Connection.');
+        })
+        .withFailureHandler(err => {
+          setStatus('❌ ' + (err && err.message ? err.message : err));
+        })
+        .listSheetsForFile(url);
+    }
+
+    function testConnection() {
+      const masterIdOrUrl   = document.getElementById('masterUrl').value.trim();
+      const masterSheetName = document.getElementById('sheetName').value.trim();
+
+      if (!masterIdOrUrl || !masterSheetName) {
+        setStatus('⚠️ Provide both Masterfile URL/ID and choose a Sheet Name.');
+        return;
+      }
+
+      setStatus('⏳ Testing connection…');
+
+      google.script.run
+        .withSuccessHandler(res => {
+          if (res && res.fileName) {
+            setStatus(
+              '✅ Connection OK.\nMasterfile: ' + res.fileName +
+              '\nSheet: ' + res.sheetName
+            );
+          } else {
+            setStatus('✅ Connection OK.');
+          }
+        })
+        .withFailureHandler(err => {
+          setStatus('❌ ' + (err && err.message ? err.message : err));
+        })
+        .testPayrollSettings({ masterIdOrUrl, masterSheetName });
+    }
+
+    function saveSettings() {
+      const masterIdOrUrl   = document.getElementById('masterUrl').value.trim();
+      const masterSheetName = document.getElementById('sheetName').value.trim();
+
+      if (!masterIdOrUrl || !masterSheetName) {
+        setStatus('⚠️ Provide both Masterfile URL/ID and choose a Sheet Name.');
+        return;
+      }
+
+      setStatus('💾 Saving settings & refreshing rates…');
+
+      google.script.run
+        .withSuccessHandler(() => {
+          setStatus('✅ Settings saved and RATE_LOOKUP refreshed.');
+        })
+        .withFailureHandler(err => {
+          setStatus('❌ ' + (err && err.message ? err.message : err));
+        })
+        .savePayrollSettings({ masterIdOrUrl, masterSheetName });
+    }
+  </script>
+  
+
+</body>
+</html>

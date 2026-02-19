@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+  /* Dialog-specific layout (built on UiTheme) */
+  .titlebar { margin-bottom: 4px; }
+
+  .field { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+
+  .section-title {
+    margin: 0 0 8px;
+    font-size: 12px;
+    font-weight: 650;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .3px;
+  }
+
+  .chk-list { display: flex; flex-direction: column; gap: 6px; }
+
+  /* Critical fix: override UiTheme input width:100% for checkboxes */
+  .chk-row input[type="checkbox"] {
+    width: auto !important;
+    padding: 0 !important;
+    margin: 2px 0 0 0;
+  }
+
+  .chk-row {
+    display: grid;
+    grid-template-columns: 18px 1fr;
+    gap: 10px;
+    align-items: start;
+    padding: 8px 10px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+  }
+  .chk-row:hover { background: var(--surface-2); }
+
+  .chk-row span {
+    font-size: 12px;
+    color: var(--text);
+    line-height: 1.25;
+  }
+
+  /* ✅ Brand logo INSIDE modal (sticky bottom, does not overlay scrollbar) */
+.brand-sticky-bottom{
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;  /* lower-right */
+  padding: 8px 0 2px;
+  background: #fff;
+}
+
+
+  /* Keep status consistent; UiTheme already styles #status */
+  #status:empty { display: none; }
+</style>
+
+  <?!= include_('UiTheme'); ?>
+</head>
+<body class="ui-page">
+  <div class="titlebar">
+    <h2>BIR 1601-C</h2>
+  </div>
+
+  <div class="card stack">
+    <div class="field">
+      <label for="month">PAYROLL MONTH</label>
+      <input type="month" id="month">
+    </div>
+  </div>
+
+  <div class="card stack">
+    <div class="section-title">EXPORT</div>
+
+    <div class="chk-list">
+      <div class="chk-row">
+        <input type="checkbox" id="downloadExcel">
+        <span>Download as Excel (.xlsx)</span>
+      </div>
+
+      <div class="chk-row">
+        <input type="checkbox" id="includeRegister">
+        <span>Also generate Payroll Register for this Payroll Month</span>
+      </div>
+    </div>
+
+    <div id="status" class="status"></div>
+  </div>
+
+  <div class="ui-footer">
+    <button type="button" class="secondary" onclick="google.script.host.close()">Close</button>
+    <button type="button" class="primary" onclick="onGenerate()">Generate</button>
+  </div>
+
+  <div class="brand-sticky-bottom">
+  <?!= include_('BrandWatermarkInline'); ?>
+</div>
+
+  <script>
+    function setStatus(msg) {
+      document.getElementById('status').textContent = msg || '';
+    }
+
+    function onGenerate() {
+      setStatus('Generating…');
+
+      var form = {
+        month: document.getElementById('month').value.trim(),
+        downloadExcel: document.getElementById('downloadExcel').checked,
+        includeRegister: document.getElementById('includeRegister').checked
+      };
+
+      google.script.run
+        .withSuccessHandler(function (resp) {
+          if (!resp) {
+            setStatus('❌ Error: No response from server.');
+            return;
+          }
+          if (resp.ok === false) {
+             setStatus('❌ ' + (resp.message || 'Error generating report.'));
+             return;
+          }
+
+          setStatus('✅ BIR 1601-C Generated!\nMonth: ' + (resp.month || '') +
+                    (resp.sheetName ? '\nSheet: ' + resp.sheetName : ''));
+
+          if (resp.download && resp.download.contentBase64) {
+            var a = document.createElement('a');
+            a.href = 'data:' + resp.download.mimeType + ';base64,' + resp.download.contentBase64;
+            a.download = resp.download.fileName || '1601C.xlsx';
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+          }
+        })
+        .withFailureHandler(function (err) {
+          setStatus('❌ ' + (err && err.message ? err.message : err));
+        })
+        .generateBir1601CReport(form);
+    }
+  </script>
+
+
+</body>
+
+</html>

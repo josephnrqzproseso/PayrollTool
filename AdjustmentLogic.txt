@@ -1,0 +1,1643 @@
+/****************************************************
+ * SMART ADJUSTMENTS + TYPE MANAGER (v7.6 — Unified)
+ * --------------------------------------------------
+ * - Type Manager: Add/Delete in hidden "Setup" sheet
+ * - Auto ID / Rate fill from RATE_LOOKUP
+ * - Auto CLEAR right-hand dependent (gray) fields when
+ *   Employee Name is cleared (all sheets)
+ * - Category auto-fill in Variable_Adjustments
+ * - Rebuild Inputs / Rate Lookup / Initialize
+ ****************************************************/
+
+function loadAdjustmentMenu() {
+  const ui = SpreadsheetApp.getUi();
+
+  // Group: Setup / Admin
+  const setupMenu = ui.createMenu('🧩 Setup')
+    .addItem('Type Manager', 'openAdjustmentsAdmin')
+    .addItem('Payroll Settings', 'openPayrollSettings');
+
+  // Group: Maintenance
+  const maintenanceMenu = ui.createMenu('🔧 Maintenance')
+    .addItem('Refresh Employee Rates', 'refreshRateLookup')
+    .addItem('Rebuild Inputs Summary', 'rebuildInputsSummary');
+
+  ui.createMenu('Adjustments')
+    .addSubMenu(setupMenu)
+    .addSubMenu(maintenanceMenu)
+    .addSeparator()
+    .addItem('ℹ️ About / License', 'showAboutLicenseDialog')
+    .addItem('💬 Send Feedback', 'showFeedbackDialog')
+    .addToUi();
+
+  // keep UX snappy without toast spam
+  try {
+    setupAdjustmentsDropdown_(true);
+    refreshPayrollCategories(true);
+  } catch (_) {}
+}
+
+
+/** ================== ADJUSTMENT TYPES (Sheet: ADJUSTMENT_TYPES) ================== **/
+
+const ADJ_TYPES_SHEET_ = 'ADJUSTMENT_TYPES';
+
+/**
+ * Ensure hidden ADJUSTMENT_TYPES sheet exists and has required headers.
+ * Required headers: Name | Category
+ */
+/**
+ * Ensure hidden ADJUSTMENT_TYPES sheet exists and has required headers.
+ * Required headers: Adjustment Name | Category
+ */
+function _ensureAdjTypesSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  const desired = ['Adjustment Name', 'Category'];
+
+  let sh = ss.getSheetByName(ADJ_TYPES_SHEET_);
+
+  if (!sh) {
+    sh = ss.insertSheet(ADJ_TYPES_SHEET_);
+    try { sh.hideSheet(); } catch (_) {}
+    sh.getRange(1, 1, 1, 2).setValues([desired]);
+    return sh;
+  }
+
+  // Ensure headers exist (do not assume correct)
+  const hdr = sh.getRange(1, 1, 1, 2).getValues()[0].map(v => String(v || '').trim());
+  if (hdr[0] !== desired[0] || hdr[1] !== desired[1]) {
+    sh.getRange(1, 1, 1, 2).setValues([desired]);
+  }
+
+  try { sh.hideSheet(); } catch (_) {}
+  return sh;
+}
+
+
+/**
+ * Returns [{ name: string, cat: string }, ...] in stable (row) order.
+ */
+function _getAdjTypes_() {
+  const sh = _ensureAdjTypesSheet_();
+  const lr = sh.getLastRow();
+  if (lr < 2) return [];
+
+  const vals = sh.getRange(2, 1, lr - 1, 2).getValues();
+
+  // sanitize + de-dupe by name (case-insensitive), keep first occurrence (stable)
+  const out = [];
+  const seen = new Set();
+  for (const r of vals) {
+    const name = String(r[0] || '').trim();
+    const cat  = String(r[1] || '').trim();
+    if (!name || !cat) continue;
+
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    out.push({ name, cat });
+  }
+  return out;
+}
+
+function _setAdjTypes_(types) {
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(30000);
+  try {
+    const sh = _ensureAdjTypesSheet_();
+
+    // Clear body only
+    const lr = sh.getLastRow();
+    if (lr > 1) sh.getRange(2, 1, lr - 1, 2).clearContent();
+
+    const rows = (types || [])
+      .map(it => {
+        const name = String((it && (it.name ?? it.Name)) || '').trim();
+        const cat  = String((it && (it.cat  ?? it.Category ?? it.category)) || '').trim();
+        return [name, cat];
+      })
+      .filter(r => r[0] && r[1]);
+
+    if (rows.length) sh.getRange(2, 1, rows.length, 2).setValues(rows);
+
+    try { sh.hideSheet(); } catch (_) {}
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Convenience: map lower(desc) => cat */
+function _getAdjTypeMap_() {
+  const map = new Map();
+  _getAdjTypes_().forEach(it => map.set(it.name.trim().toLowerCase(), it.cat.trim()));
+  return map;
+}
+
+/**
+ * OPTIONAL (one-time): if you previously stored types in DocumentProperties,
+ * run this manually once, then you can ignore/remove the old property-based code.
+ */
+function migrateAdjTypesFromDocPropsToSheet_() {
+  const LEGACY_KEY = 'ADJUSTMENT_TYPES_JSON';
+  const dp = PropertiesService.getDocumentProperties();
+  const raw = dp.getProperty(LEGACY_KEY);
+  if (!raw) return false;
+
+  let arr;
+  try { arr = JSON.parse(raw); } catch (_) { arr = []; }
+  if (!Array.isArray(arr) || !arr.length) return false;
+
+  const out = [];
+  const seen = new Set();
+  for (const it of arr) {
+    const name = String(it && it.name || '').trim();
+    const cat  = String(it && it.cat  || '').trim();
+    if (!name || !cat) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ name, cat });
+  }
+
+  _setAdjTypes_(out);
+  dp.deleteProperty(LEGACY_KEY); // remove legacy store
+  return true;
+}
+
+
+
+/** ================== TYPE MANAGER ================== **/
+function openAdjustmentsAdmin() {
+
+  setupAdjustmentsDropdown_(true);
+  refreshPayrollCategories(true);
+
+  const html = HtmlService.createTemplateFromFile('AdjustmentsAdmin')
+  .evaluate()
+    .setWidth(550)
+    .setHeight(550);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Adjustments — Type Manager');
+}
+
+function getAdjustmentTypes() {
+  // UI expects 2-column rows: [[name, cat], ...]
+  return _getAdjTypes_().map(it => [it.name, it.cat]);
+}
+
+
+function addAdjustmentType(payload) {
+  const name = String(payload && payload.name || '').trim();
+  const cat  = String(payload && payload.cat  || '').trim();
+  if (!name || !cat) throw new Error('Missing name or category.');
+
+  const cur = _getAdjTypes_();
+  const exists = cur.some(it => it.name.trim().toLowerCase() === name.toLowerCase());
+  if (exists) throw new Error('Type already exists.');
+
+  cur.push({ name, cat });
+  _setAdjTypes_(cur);
+
+  // refresh validations + categories
+  try {
+    setupAdjustmentsDropdown_(true);
+    refreshPayrollCategories(true);
+  } catch (err) {
+    Logger.log('⚠️ Dropdown refresh failed: ' + err.message);
+  }
+  return true;
+}
+
+
+function deleteAdjustmentType(name) {
+  const target = String(name || '').trim().toLowerCase();
+  if (!target) throw new Error('Type not found.');
+
+  const cur = _getAdjTypes_();
+  const next = cur.filter(it => it.name.trim().toLowerCase() !== target);
+  if (next.length === cur.length) throw new Error('Type not found.');
+
+  _setAdjTypes_(next);
+
+  try {
+    setupAdjustmentsDropdown_(true);
+    refreshPayrollCategories(true);
+  } catch (err) {
+    Logger.log('⚠️ Dropdown refresh failed: ' + err.message);
+  }
+  return true;
+}
+
+function editAdjustmentType(payload) {
+  const oldName = String(payload && payload.oldName || '').trim();
+  const newName = String(payload && payload.newName || '').trim();
+  const newCat  = String(payload && payload.newCat  || '').trim();
+
+  if (!oldName || !newName || !newCat) throw new Error('Missing fields.');
+
+  const cur = _getAdjTypes_();
+  const oldKey = oldName.toLowerCase();
+  const newKey = newName.toLowerCase();
+
+  const idx = cur.findIndex(it => it.name.trim().toLowerCase() === oldKey);
+  if (idx === -1) throw new Error(`Type "${oldName}" not found.`);
+
+  // prevent duplicate if renaming
+  if (oldKey !== newKey) {
+    const dup = cur.some(it => it.name.trim().toLowerCase() === newKey);
+    if (dup) throw new Error('Type already exists.');
+  }
+
+  cur[idx] = { name: newName, cat: newCat };
+  _setAdjTypes_(cur);
+
+  try {
+    setupAdjustmentsDropdown_(true);
+    refreshPayrollCategories(true);
+  } catch (err) {
+    Logger.log('⚠️ Dropdown refresh failed: ' + err.message);
+  }
+  return true;
+}
+
+
+
+/** ================== DROPDOWN & CATEGORY ================== **/
+function setupAdjustmentsDropdown_(silent) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Variable_Adjustments') || ss.getSheetByName('Inputs');
+  if (!sh) return;
+
+  const hdr = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(String);
+  const adjIdx = (hdr.indexOf('Description') + 1) || (hdr.indexOf('Adjustment Name') + 1);
+  const catIdx = hdr.indexOf('Payroll Category') + 1;
+
+  // Build list from Document Properties
+  const types = _getAdjTypes_().map(it => it.name);
+  if (adjIdx > 0) {
+    if (types.length) {
+      const rule = SpreadsheetApp.newDataValidation()
+        .requireValueInList(types, true)   // show dropdown
+        .setAllowInvalid(false)
+        .build();
+      sh.getRange(2, adjIdx, sh.getMaxRows() - 1, 1).setDataValidation(rule);
+    } else {
+      // no types yet — remove validation
+      sh.getRange(2, adjIdx, sh.getMaxRows() - 1, 1).clearDataValidations();
+    }
+  }
+
+  if (catIdx > 0) sh.hideColumns(catIdx);
+
+  if (!silent) SpreadsheetApp.getActive().toast('✅ Adjustment types dropdown updated.');
+}
+
+
+function refreshPayrollCategories(silent) {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName('Variable_Adjustments') || ss.getSheetByName('Inputs');
+  if (!sh) return;
+
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(String);
+  const adjIdx = (headers.indexOf('Description') + 1) || (headers.indexOf('Adjustment Name') + 1);
+  const catIdx = headers.indexOf('Payroll Category') + 1;
+  if (!adjIdx || !catIdx) return;
+
+  const lr = sh.getLastRow();
+  if (lr < 2) return;
+
+  const map = _getAdjTypeMap_();
+
+  const names = sh.getRange(2, adjIdx, lr - 1, 1).getValues().map(r => String(r[0]).trim());
+  const cats  = names.map(n => [map.get(String(n).trim().toLowerCase()) || '']);
+  sh.getRange(2, catIdx, lr - 1, 1).setValues(cats);
+
+  if (!silent) SpreadsheetApp.getActive().toast('✅ Payroll Categories refreshed.');
+}
+
+
+/** ================== EDIT LOGIC (AUTO-FILL & AUTO-CLEAR) ================== **/
+function handleAdjustmentEdit(e) {
+  try {
+    if (!e || !e.range) return;
+
+    const sh        = e.range.getSheet();
+    const sheetName = sh.getName();
+    const range     = e.range;
+    const numRows   = range.getNumRows();
+    const numCols   = range.getNumColumns();
+    const changedCol = range.getColumn();
+
+    // 🧠 RATE_LOOKUP change → resync gray columns
+    if (sheetName === 'RATE_LOOKUP') {
+      autoRefreshGrayColumns_();
+      return;
+    }
+
+    // Only handle these sheets here
+    const isHandledSheet = ['Overtime', 'Absences_Tardiness', 'Variable_Adjustments', 'Attendance'].includes(sheetName);
+    if (!isHandledSheet) return;
+
+    const headers = sh.getRange(1, 1, 1, sh.getLastColumn())
+      .getValues()[0]
+      .map(String);
+
+    // use your fuzzy header helper so it works even if you rename/case-change
+    const idxName  = findHeaderFuzzy_(headers, ['Employee Name']);
+    const idxId    = findHeaderFuzzy_(headers, ['Employee ID']);
+    const idxAmt   = findHeaderFuzzy_(headers, ['Amount']);
+    const idxHours = findHeaderFuzzy_(headers, ['Hours']);
+    const idxUnit  = findHeaderFuzzy_(headers, ['Unit', 'Value']);
+    const idxRate  = findHeaderFuzzy_(headers, ['Hourly Rate', 'Rate']);
+    const idxType  = findHeaderFuzzy_(headers, ['OT Type', 'Type (Absence/Tardiness)', 'Type']);
+    const idxDays = findHeaderFuzzy_(headers, ['Days Worked', 'Days']);
+
+
+    const colName = idxName >= 0 ? idxName + 1 : 0;
+    const colId   = idxId   >= 0 ? idxId   + 1 : 0;
+    const colAmt  = idxAmt  >= 0 ? idxAmt  + 1 : 0;
+    const colHrs  = idxHours>= 0 ? idxHours+ 1 : 0;
+    const colUnit = idxUnit >= 0 ? idxUnit + 1 : 0;
+    const colRate = idxRate >= 0 ? idxRate + 1 : 0;
+    const colType = idxType >= 0 ? idxType + 1 : 0;
+    const colDays = idxDays >= 0 ? idxDays + 1 : 0;
+
+
+    if (sheetName === 'Overtime') {
+      handleOvertimeEditSmart_(sh, range, {
+        colName, colId, colType, colHrs, colRate, colAmt,
+      });
+      return;
+    }
+
+    if (sheetName === 'Absences_Tardiness') {
+      handleAbsTarEditSmart_(sh, range, {
+        colName, colId, colType, colUnit, colRate, colAmt,
+      });
+      return;
+    }
+
+    if (sheetName === 'Variable_Adjustments') {
+      handleVarAdjEditSmart_(e, sh, range, {
+        colName, colId,
+      });
+      return;
+    }
+
+    if (sheetName === 'Attendance') {
+  handleAttendanceEditSmart_(sh, range, { colName, colId, colDays });
+  return;
+}
+
+
+  } catch (err) {
+    Logger.log('onEdit error: ' + err.message);
+  }
+}
+
+function handleOvertimeEditSmart_(sh, range, cols) {
+  const { colName, colId, colType, colHrs, colRate, colAmt } = cols;
+  if (!colName || !colId) return;
+
+  const numRows    = range.getNumRows();
+  const changedCol = range.getColumn();
+  const startRow   = range.getRow();
+
+  const rateMap = buildRateLookupMap_();
+
+  // 🔹 EMPLOYEE NAME edited (single OR bulk) → ID + Rate + Amount in one shot
+  if (changedCol === colName) {
+    const names   = range.getValues().map(r => String(r[0] || '').trim());
+    const hrsArr  = colHrs  > 0 ? sh.getRange(startRow, colHrs,  numRows, 1).getValues().map(r => Number(r[0] || 0)) : new Array(numRows).fill(0);
+    const typeArr = colType > 0 ? sh.getRange(startRow, colType, numRows, 1).getValues().map(r => String(r[0] || '').trim()) : new Array(numRows).fill('');
+
+    const idOut   = [];
+    const rateOut = [];
+    const amtOut  = [];
+
+    for (let i = 0; i < numRows; i++) {
+      const empName = names[i];
+
+      if (!empName) {
+        // bulk delete → clear gray fields + amount
+        idOut.push(['']);
+        rateOut.push(['']);
+        amtOut.push(['']);
+        continue;
+      }
+
+      const info   = rateMap[empName.toLowerCase()] || {};
+      const hourly = info.hourly || 0;
+      const hrs    = hrsArr[i];
+      const type   = typeArr[i];
+
+      let amt = '';
+      if (hourly && hrs && type) {
+        const mult = getOtMultiplier_(type);
+        amt = roundHalfUp_(hourly * hrs * mult, 2);
+      }
+
+      idOut.push([info.id || '']);
+      rateOut.push([hourly || '']);
+      amtOut.push([amt]);
+    }
+
+    if (colId   > 0) sh.getRange(startRow, colId,   numRows, 1).setValues(idOut);
+    if (colRate > 0) sh.getRange(startRow, colRate, numRows, 1).setValues(rateOut);
+    if (colAmt  > 0) sh.getRange(startRow, colAmt,  numRows, 1).setValues(amtOut);
+
+    safeAutoRebuildInputs_('Overtime', true);
+    return;
+  }
+
+  // 🔹 HOURS / OT TYPE / RATE edited → recompute or clear Amount (still instant)
+  if ([colType, colHrs, colRate].includes(changedCol)) {
+    const rateVals = colRate > 0 ? sh.getRange(startRow, colRate, numRows, 1).getValues().map(r => Number(r[0] || 0)) : new Array(numRows).fill(0);
+    const hrsVals  = colHrs  > 0 ? sh.getRange(startRow, colHrs,  numRows, 1).getValues().map(r => Number(r[0] || 0)) : new Array(numRows).fill(0);
+    const typeVals = colType > 0 ? sh.getRange(startRow, colType, numRows, 1).getValues().map(r => String(r[0] || '').trim()) : new Array(numRows).fill('');
+
+    const amtOut = [];
+
+    for (let i = 0; i < numRows; i++) {
+      const rate = rateVals[i];
+      const hrs  = hrsVals[i];
+      const type = typeVals[i];
+
+      if (rate && hrs && type) {
+        const mult = getOtMultiplier_(type);
+        amtOut.push([roundHalfUp_(rate * hrs * mult, 2)]);
+      } else {
+        // 🔴 delete Hours or OT Type → delete Amount instantly
+        amtOut.push(['']);
+      }
+    }
+
+    if (colAmt > 0) sh.getRange(startRow, colAmt, numRows, 1).setValues(amtOut);
+
+    safeAutoRebuildInputs_('Overtime', true);
+  }
+}
+
+
+function handleAbsTarEditSmart_(sh, range, cols) {
+  const { colName, colId, colType, colUnit, colRate, colAmt } = cols;
+  if (!colName || !colId) return;
+
+  const numRows    = range.getNumRows();
+  const changedCol = range.getColumn();
+  const startRow   = range.getRow();
+
+  const rateMap = buildRateLookupMap_();
+
+  // helper: recompute all amounts in one go
+  function recomputeAmountsBatch_() {
+    if (colUnit <= 0 || colRate <= 0 || colAmt <= 0) return;
+
+    const unitsArr = sh.getRange(startRow, colUnit, numRows, 1).getValues().map(r => Number(r[0] || 0));
+    const rateArr  = sh.getRange(startRow, colRate,  numRows, 1).getValues().map(r => Number(r[0] || 0));
+    const amtOut   = [];
+
+    for (let i = 0; i < numRows; i++) {
+      const units = unitsArr[i];
+      const rate  = rateArr[i];
+      if (!units || !rate) {
+        amtOut.push(['']);
+      } else {
+        amtOut.push([roundHalfUp_(-1 * units * rate, 2)]);
+      }
+    }
+
+    sh.getRange(startRow, colAmt, numRows, 1).setValues(amtOut);
+  }
+
+  // 🔹 EMPLOYEE NAME edited (single OR bulk)
+  if (changedCol === colName) {
+    const names   = range.getValues().map(r => String(r[0] || '').trim());
+    const typeArr = colType > 0 ? sh.getRange(startRow, colType, numRows, 1).getValues().map(r => String(r[0] || '').trim().toLowerCase()) : new Array(numRows).fill('');
+
+    const idOut   = [];
+    const rateOut = [];
+
+    for (let i = 0; i < numRows; i++) {
+      const empName = names[i];
+
+      if (!empName) {
+        // bulk delete → clear ID, Rate, Amount
+        idOut.push(['']);
+        rateOut.push(['']);
+        continue;
+      }
+
+      const info = rateMap[empName.toLowerCase()] || {};
+      idOut.push([info.id || '']);
+
+      const typeVal = typeArr[i];
+      if (typeVal) {
+        const useDaily = (typeVal === 'absence');
+        const rate     = useDaily ? (info.daily || 0) : (info.hourly || 0);
+        rateOut.push([rate || '']);
+      } else {
+        rateOut.push(['']);
+      }
+    }
+
+    if (colId   > 0) sh.getRange(startRow, colId,   numRows, 1).setValues(idOut);
+    if (colRate > 0) sh.getRange(startRow, colRate, numRows, 1).setValues(rateOut);
+
+    recomputeAmountsBatch_();
+    safeAutoRebuildInputs_('Absences_Tardiness', true);
+    return;
+  }
+
+  // 🔹 TYPE edited → set Rate from daily/hourly & recompute all affected rows
+  if (changedCol === colType) {
+    const names   = colName > 0 ? sh.getRange(startRow, colName, numRows, 1).getValues().map(r => String(r[0] || '').trim()) : new Array(numRows).fill('');
+    const typeArr = sh.getRange(startRow, colType, numRows, 1).getValues().map(r => String(r[0] || '').trim().toLowerCase());
+
+    const rateOut = [];
+
+    for (let i = 0; i < numRows; i++) {
+      const empName = names[i];
+      const typeVal = typeArr[i];
+
+      if (!empName || !typeVal) {
+        rateOut.push(['']);
+        continue;
+      }
+
+      const info = rateMap[empName.toLowerCase()] || {};
+      const useDaily = (typeVal === 'absence');
+      const rate     = useDaily ? (info.daily || 0) : (info.hourly || 0);
+      rateOut.push([rate || '']);
+    }
+
+    if (colRate > 0) sh.getRange(startRow, colRate, numRows, 1).setValues(rateOut);
+
+    recomputeAmountsBatch_();
+    safeAutoRebuildInputs_('Absences_Tardiness', true);
+    return;
+  }
+
+  // 🔹 VALUE (Unit) or Rate changed → recompute / clear Amount in batch
+  if ([colUnit, colRate].includes(changedCol)) {
+    recomputeAmountsBatch_();
+    safeAutoRebuildInputs_('Absences_Tardiness', true);
+  }
+}
+
+function handleVarAdjEditSmart_(e, sh, range, cols) {
+  const { colName, colId } = cols;
+  const numRows    = range.getNumRows();
+  const numCols    = range.getNumColumns();
+  const changedCol = range.getColumn();
+  const startRow   = range.getRow();
+
+  // 🔹 Bulk paste / delete on Employee Name → fill/clear IDs in batch
+  if (changedCol === colName && numCols === 1 && numRows > 1) {
+    const rateMap = buildRateLookupMap_();
+    const vals = range.getValues().map(r => String(r[0] || '').trim());
+    const outIds = [];
+
+    for (let i = 0; i < numRows; i++) {
+      const empName = vals[i];
+      if (!empName) {
+        outIds.push(['']);
+        continue;
+      }
+      const info = rateMap[empName.toLowerCase()] || {};
+      outIds.push([info.id || '']);
+    }
+
+    if (colId > 0) sh.getRange(startRow, colId, numRows, 1).setValues(outIds);
+    safeAutoRebuildInputs_('Variable_Adjustments', true);
+    return;
+  }
+
+  // 🔹 Single-cell behavior → reuse your existing detailed handler
+  if (numRows === 1 && numCols === 1) {
+    handleVarAdjEdit_(e);
+  }
+}
+
+function handleAttendanceEditSmart_(sh, range, cols) {
+  const { colName, colId, colDays } = cols;
+  if (!colName || !colId) return;
+
+  const numRows    = range.getNumRows();
+  const numCols    = range.getNumColumns();
+  const changedCol = range.getColumn();
+  const startRow   = range.getRow();
+
+  // Bulk paste / delete on Employee Name → fill/clear IDs in batch
+  if (changedCol === colName && numCols === 1 && numRows > 1) {
+    const rateMap = buildRateLookupMap_();
+    const vals = range.getValues().map(r => String(r[0] || '').trim());
+    const outIds = [];
+    const outDaysClear = [];
+
+    for (let i = 0; i < numRows; i++) {
+      const empName = vals[i];
+      if (!empName) {
+        outIds.push(['']);
+        outDaysClear.push(['']);
+        continue;
+      }
+      const info = rateMap[empName.toLowerCase()] || {};
+      outIds.push([info.id || '']);
+      outDaysClear.push([null]); // do not overwrite days on normal paste
+    }
+
+    if (colId > 0) sh.getRange(startRow, colId, numRows, 1).setValues(outIds);
+
+    // If names were cleared, also clear Days Worked (if column exists)
+    if (colDays > 0) {
+      const anyClears = vals.some(v => !v);
+      if (anyClears) {
+        const daysOut = vals.map(v => [v ? sh.getRange(startRow, colDays + 0, 1, 1).getValue() : '']); // safe placeholder
+        // Replace placeholder with clear-only array
+        const cleared = vals.map(v => [v ? null : '']);
+        sh.getRange(startRow, colDays, numRows, 1).setValues(cleared);
+      }
+    }
+    return;
+  }
+
+  // Single-cell edit (Employee Name) → fill/clear ID (+ clear Days if name cleared)
+  if (numRows === 1 && numCols === 1 && changedCol === colName) {
+    const empName = String(range.getValue() || '').trim();
+    if (!empName) {
+      if (colId > 0) sh.getRange(startRow, colId).setValue('');
+      if (colDays > 0) sh.getRange(startRow, colDays).setValue('');
+      return;
+    }
+    const rateMap = buildRateLookupMap_();
+    const info = rateMap[empName.toLowerCase()] || {};
+    if (colId > 0) sh.getRange(startRow, colId).setValue(info.id || '');
+    return;
+  }
+}
+
+
+/** 🧩 Only rebuild Inputs if relevant sheet changes */
+/** =========================================================
+ * SMART AUTO-REFRESH + CLEAN INPUTS SUMMARY WITH TIMESTAMP
+ * ========================================================= */
+
+function safeAutoRebuildInputs_(sheetName, conditionMet) {
+  if (!conditionMet) return;
+  if (!['Overtime','Absences_Tardiness','Variable_Adjustments'].includes(sheetName)) return;
+
+  try {
+    const now = Date.now();
+    const props = PropertiesService.getDocumentProperties();
+    const last = Number(props.getProperty('LAST_INPUTS_REBUILD') || 0);
+
+    // skip if last rebuild < 5 seconds ago
+    if (now - last < 5000) return;
+
+    rebuildInputsSummary();
+    props.setProperty('LAST_INPUTS_REBUILD', now);
+  } catch (err) {
+    Logger.log('safeAutoRebuildInputs_ error: ' + err.message);
+  }
+}
+
+
+/** ----- Overtime ----- **/
+function handleOvertimeEdit_(e) {
+  const sh = e.range.getSheet();
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(String);
+
+  const colName = headers.indexOf('Employee Name') + 1;     // A
+  const colId   = headers.indexOf('Employee ID') + 1;       // B
+  const colType = headers.indexOf('OT Type') + 1;           // C
+  const colHrs  = headers.indexOf('Hours') + 1;             // D
+  const colRate = headers.indexOf('Hourly Rate') + 1;       // E
+  const colAmt  = headers.indexOf('Amount') + 1;            // F
+
+  const r = e.range.getRow();
+  const c = e.range.getColumn();
+
+  // Employee Name edited
+  if (c === colName) {
+    const val = String(e.value || '').trim();
+    if (!val) {
+      // 🔴 CLEAR ALL dependent (gray/right) fields including Name itself row segment
+      sh.getRange(r, colId).clearContent();
+      sh.getRange(r, colType).clearContent();
+      sh.getRange(r, colHrs).clearContent();
+      sh.getRange(r, colRate).clearContent();
+      sh.getRange(r, colAmt).clearContent();
+      return;
+    }
+    // Fill ID + hourly rate
+    fillIdAndRatesByName_(val, sh.getRange(r, colId), sh.getRange(r, colRate), { mode: 'hourly' });
+  }
+
+  // OT Type or Hours or Rate changed → recompute Amount
+  if ([colType, colHrs, colRate].includes(c)) {
+    const rate = Number(sh.getRange(r, colRate).getValue() || 0);
+    const hrs  = Number(sh.getRange(r, colHrs).getValue() || 0);
+    const type = String(sh.getRange(r, colType).getValue() || '').trim();
+    if (!rate || !hrs || !type) {
+      sh.getRange(r, colAmt).clearContent();
+      return;
+    }
+    const mult = getOtMultiplier_(type);
+    sh.getRange(r, colAmt).setValue(roundHalfUp_(rate * hrs * mult, 2));
+  }
+}
+
+
+
+/** ----- Variable Adjustments & Inputs ----- **/
+function handleVarAdjEdit_(e) {
+  const sh = e.range.getSheet();
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0].map(String);
+
+  const colName = headers.indexOf('Employee Name') + 1;                
+  const colId   = headers.indexOf('Employee ID') + 1;                  
+  const colAdj  = (headers.indexOf('Description') + 1) || (headers.indexOf('Adjustment Name') + 1);
+  const colAmt  = headers.indexOf('Amount') + 1;                       
+  const colCat  = headers.indexOf('Payroll Category') + 1;             
+
+  const r = e.range.getRow();
+  const c = e.range.getColumn();
+
+  // 🧹 If Employee Name cleared → clear gray fields
+  if (c === colName && (!e.value || String(e.value).trim() === '')) {
+    [colId, colAdj, colAmt, colCat].forEach(idx => {
+      if (idx > 0) sh.getRange(r, idx).clearContent();
+    });
+    safeAutoRebuildInputs_('Variable_Adjustments', true);
+    return;
+  }
+
+  // 🆔 Fill Employee ID when name entered
+  if (c === colName && e.value) {
+    fillIdAndRatesByName_(e.value, colId ? sh.getRange(r, colId) : null, null, null);
+    safeAutoRebuildInputs_('Variable_Adjustments', true);
+    return;
+  }
+
+  // 🧩 Adjustment name changed → auto-fill category
+  if (c === colAdj && e.value) {
+        const map = _getAdjTypeMap_();
+    const desc = String(e.value).trim();
+    const cat  = map.get(desc.toLowerCase()) || '';
+    if (colCat && cat) sh.getRange(r, colCat).setValue(cat);
+    safeAutoRebuildInputs_('Variable_Adjustments', true);
+    return;
+  }
+
+  // 💰 Amount or Category changed → rebuild Inputs
+  if ([colAmt, colCat].includes(c)) {
+    safeAutoRebuildInputs_('Variable_Adjustments', true);
+    return;
+  }
+}
+
+
+
+/** =========================================================
+ * CLEANED-UP INPUTS REBUILDER
+ *  - keeps formatting
+ *  - removes blanks/zeros
+ *  - stamps “Last Updated” date/time
+ * ========================================================= */
+/**
+ * Auto-rebuilds Inputs summary based on Overtime, Absences_Tardiness, and Variable_Adjustments
+ * --------------------------------------------------------------
+ * - Preserves formatting (clears only contents)
+ * - Auto-assigns Payroll Category:
+ *     • Overtime → Taxable Earning
+ *     • Absences_Tardiness → Basic Pay Related
+ *     • Variable_Adjustments → looks up category from "Adjustment Types" sheet
+ * - Filters out blanks / zeroes
+ * - Sorts alphabetically by Employee Name
+ * - Adds “Last Updated” timestamp in G1
+ */
+function rebuildInputsSummary() {
+  const ss = SpreadsheetApp.getActive();
+  const out = ss.getSheetByName('Inputs') || ss.insertSheet('Inputs');
+
+  const header = ['Employee ID', 'Employee Name', 'Description', 'Amount', 'Payroll Category'];
+  const lastCol = header.length;
+  const lr = out.getLastRow();
+  if (lr > 1) out.getRange(2, 1, lr - 1, lastCol).clearContent();
+
+  // ensure header present
+  const curHeader = out.getRange(1, 1, 1, lastCol).getValues()[0];
+  if (JSON.stringify(curHeader) !== JSON.stringify(header)) {
+    out.getRange(1, 1, 1, lastCol).setValues([header]).setFontWeight('bold');
+  }
+
+  // 🔹 Load Adjustment Type map (for Variable_Adjustments) from Document Properties
+const typeMap = _getAdjTypeMap_();
+
+
+
+  const rows = [];
+
+  const collect = (sheetName, mapFn) => {
+    const sh = ss.getSheetByName(sheetName);
+    if (!sh || sh.getLastRow() < 2) return;
+    const vals = sh.getRange(2, 1, sh.getLastRow() - 1, sh.getLastColumn()).getValues();
+    vals.forEach(r => {
+      const row = mapFn(r);
+      if (row) rows.push(row);
+    });
+  };
+
+  // 🔸 OVERTIME → Taxable Earning
+  // 🔸 OVERTIME → Taxable Earning (unified description)
+collect('Overtime', r => {
+  const [empName, empId, type, hours, , amt] = r;
+  if (!empName || !empId || !amt) return null;
+  const amount = Number(amt) || 0;
+  if (Math.abs(amount) < 0.01) return null;
+  return [empId, empName, 'Overtime', amount, 'Taxable Earning'];
+});
+
+
+  // 🔸 ABSENCES_TARDINESS → Basic Pay Related
+  collect('Absences_Tardiness', r => {
+    const [empName, empId, type, units, , amt] = r;
+    if (!empName || !empId || !type || !amt) return null;
+    const amount = Number(amt) || 0;
+    if (Math.abs(amount) < 0.01) return null;
+    return [empId, empName, String(type).trim(), amount, 'Basic Pay Related'];
+  });
+
+  // 🔸 VARIABLE_ADJUSTMENTS → depends on “Adjustment Types”
+  // 🔸 VARIABLE_ADJUSTMENTS → depends on “ADJUSTMENT_TYPES”
+collect('Variable_Adjustments', r => {
+  const [empName, empId, desc, amt, catCol] = r; // ✅ correct column order
+  if (!empName || !desc) return null;
+  const amount = Number(amt) || 0;
+  if (Math.abs(amount) < 0.01) return null;
+
+    const key = String(desc).trim().toLowerCase();
+  const cat = typeMap.get(key) || String(catCol || 'Taxable Earning').trim();
+
+
+  return [empId || '', empName, String(desc).trim(), amount, cat];
+});
+
+
+  // ✅ Clean, sort, and write
+  if (rows.length) {
+    rows.sort((a, b) => String(a[1]).localeCompare(String(b[1])));
+    out.getRange(2, 1, rows.length, lastCol).setValues(rows);
+    out.getRange(2, 4, rows.length, 1).setNumberFormat('#,##0.00');
+  }
+
+  // 🕒 Timestamp in G1
+  const stampCell = out.getRange('G1');
+  const timestamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'MMM d, yyyy HH:mm:ss');
+  stampCell.setValue('Last Updated: ' + timestamp).setFontSize(10).setFontColor('#666');
+
+  SpreadsheetApp.getActive().toast(`✅ Inputs summary rebuilt (${rows.length} records).`);
+}
+
+
+
+function setupAdjustmentsUI() {
+  const ss = SpreadsheetApp.getActive();
+
+  // NO MORE ensureSettings_();  ✅ settings are now in Script Properties
+  ensureOtRates_();
+  ensureRateLookup_();
+  ensureOvertimeSheet_();
+  ensureAbsencesTardinessSheet_();
+  ensureVariableAdjustmentsSheet_();
+ensureAttendanceSheet_();
+ensureInputsSheet_();
+
+
+  const cfg = readSettings_();
+  if (!cfg.masterIdOrUrl || !cfg.masterSheetName) {
+    SpreadsheetApp.getActive().toast(
+      '⚠️ Set Payroll Settings first (Adjustments → Payroll Settings…).'
+    );
+    return;
+  }
+
+  refreshRateLookup();
+  setupAdjustmentsDropdown_(true);
+  refreshPayrollCategories(true);
+  rebuildInputsSummary();
+
+  SpreadsheetApp.getActive().toast('✅ Adjustment system initialized.');
+}
+
+/** ================== SHEET CREATORS (NO DUPS) ================== **/
+function ensureSettings_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName('PAYROLL_SETTINGS');
+  if (!sh) sh = ss.insertSheet('PAYROLL_SETTINGS');
+  const header = ['Setting','Value','Notes'];
+  const data = [
+    ['Employee Masterfile ID / Link','','Paste spreadsheet ID or full URL'],
+    ['Masterfile Sheet Name','Masterfile import','Tab name with employee data'],
+  ];
+  sh.clear();
+  sh.getRange(1,1,1,3).setValues([header]).setFontWeight('bold');
+  sh.getRange(2,1,data.length,3).setValues(data);
+  sh.autoResizeColumns(1,3);
+}
+
+function ensureOtRates_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName('OT_RATES');
+  if (!sh) sh = ss.insertSheet('OT_RATES');
+  const header = ['Overtime Type','Rate','OT_Code'];
+  const rates = [
+    ['REGULAR DAY OVERTIME PAY',1.25,'Ord-OT'],
+    ['REGULAR DAY NIGHT DIFFERENTIAL PAY',0.10,'Ord-ND'],
+    ['REGULAR DAY OVERTIME NIGHT DIFFERENTIAL PAY',1.38,'Ord-ND-OT'],
+    ['REGULAR HOLIDAY PAY',1.00,'LH'],
+  ];
+  sh.clear();
+  sh.getRange(1,1,1,3).setValues([header]).setFontWeight('bold');
+  sh.getRange(2,1,rates.length,3).setValues(rates);
+}
+
+function ensureRateLookup_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName('RATE_LOOKUP');
+  if (!sh) sh = ss.insertSheet('RATE_LOOKUP');
+  sh.clear();
+  sh.getRange(1,1,1,6).setValues([['Employee ID','Employee Name','Monthly Salary','Working Days','Daily Rate','Hourly Rate']]).setFontWeight('bold');
+}
+
+function ensureOvertimeSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName('Overtime');
+  if (!sh) sh = ss.insertSheet('Overtime');
+  const header = ['Employee Name','Employee ID','OT Type','Hours','Hourly Rate','Amount'];
+  sh.clear();
+  sh.getRange(1,1,1,header.length).setValues([header]).setFontWeight('bold');
+  sh.getRange('D2:D').setNumberFormat('0.00');
+  sh.getRange('E2:F').setNumberFormat('#,##0.00');
+
+  // Data validation for OT Type
+  const rates = ss.getSheetByName('OT_RATES');
+  if (rates && rates.getLastRow() > 1) {
+    const rule = SpreadsheetApp.newDataValidation()
+      .requireValueInRange(rates.getRange(2,1,rates.getLastRow()-1,1), true)
+      .setAllowInvalid(false).build();
+    sh.getRange('C2:C').setDataValidation(rule);
+  }
+}
+
+function ensureAbsencesTardinessSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName('Absences_Tardiness');
+  if (!sh) sh = ss.insertSheet('Absences_Tardiness');
+  const header = ['Employee Name','Employee ID','Type (Absence/Tardiness)','Unit','Rate','Amount'];
+  sh.clear();
+  sh.getRange(1,1,1,header.length).setValues([header]).setFontWeight('bold');
+  sh.getRange('D2:D').setNumberFormat('0.00');
+  sh.getRange('E2:F').setNumberFormat('#,##0.00');
+
+  const rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(['Absence','Tardiness'], true)
+    .setAllowInvalid(false).build();
+  sh.getRange('C2:C').setDataValidation(rule);
+}
+
+function ensureVariableAdjustmentsSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName('Variable_Adjustments');
+  if (!sh) sh = ss.insertSheet('Variable_Adjustments');
+
+  // Works with either "Description" or "Adjustment Name"
+  const header = ['Employee Name','Employee ID','Description','Amount','Payroll Category'];
+  sh.clear();
+  sh.getRange(1,1,1,header.length).setValues([header]).setFontWeight('bold');
+  sh.getRange('D2:D').setNumberFormat('#,##0.00');
+}
+
+function ensureAttendanceSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName('Attendance');
+  if (!sh) sh = ss.insertSheet('Attendance');
+
+  const header = ['Employee Name','Employee ID','Days Worked'];
+  sh.clear();
+  sh.getRange(1,1,1,header.length).setValues([header]).setFontWeight('bold');
+  sh.getRange('C2:C').setNumberFormat('0.00');
+}
+
+
+function ensureInputsSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName('Inputs');
+  if (!sh) sh = ss.insertSheet('Inputs');
+  const header = ['Employee ID','Employee Name','Description','Amount','Payroll Category'];
+  sh.clear();
+  sh.getRange(1,1,1,header.length).setValues([header]).setFontWeight('bold');
+  sh.getRange('D2:D').setNumberFormat('#,##0.00');
+}
+
+
+/** ================== RATES & SETTINGS ================== **/
+function refreshRateLookup() {
+  const cfg = readSettings_();
+  if (!cfg.masterIdOrUrl || !cfg.masterSheetName) {
+  throw new Error('Set Payroll Settings first (Adjustments → Payroll Settings…).');
+}
+
+
+  const id = parseFileId_(cfg.masterIdOrUrl);
+  const mss = SpreadsheetApp.openById(id);
+  const sh = mss.getSheetByName(cfg.masterSheetName);
+  if (!sh) throw new Error(`Sheet "${cfg.masterSheetName}" not found in Masterfile.`);
+
+  const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+  const lr = sh.getLastRow();
+
+  const defaultWdy = Number(PropertiesService.getDocumentProperties().getProperty('WORKING_DAYS_PER_YEAR') || 261) || 261;
+
+
+  const idx = {
+  name: findHeaderFuzzy_(headers, ['Employee Name']),
+  id:   findHeaderFuzzy_(headers, ['Employee ID']),
+  sal:  findHeaderFuzzy_(headers, ['Salary','Basic Pay','Basic']),
+  wdy:  findHeaderFuzzy_(headers, ['Working Days','Working Days Per Year']),
+  pb:   findHeaderFuzzy_(headers, ['Pay Basis','PAY BASIS'])
+};
+
+  ['name','id','sal'].forEach(k => { if (idx[k] === -1) throw new Error(`Missing header: ${k}`); });
+
+  const data = sh.getRange(2,1,lr-1,sh.getLastColumn()).getValues();
+
+const rows = data.map(r => {
+  const nm = String(r[idx.name] || '').trim();
+  if (!nm) return null;
+
+  const eid = String(r[idx.id] || '').trim();
+
+  // PAY BASIS (default MONTHLY if missing/blank)
+  const payBasis = (idx.pb >= 0 ? String(r[idx.pb] || '') : 'MONTHLY').trim().toUpperCase();
+
+  // Basic Pay from Masterfile (meaning depends on PAY BASIS)
+  const basicPay = Number(r[idx.sal] || 0);
+
+  // Working Days (default to 261 when blank/0)
+  const wdyRaw = (idx.wdy >= 0) ? Number(r[idx.wdy]) : NaN;
+  const wdy = (wdyRaw && wdyRaw > 0) ? wdyRaw : defaultWdy;
+
+  let monthly = 0;
+  let daily = 0;
+
+  if (payBasis === 'DAILY') {
+    // Masterfile Basic Pay is DAILY rate
+    daily = basicPay;
+    monthly = roundHalfUp_(daily * (wdy / 12), 2); // monthly equivalent
+  } else {
+    // Masterfile Basic Pay is MONTHLY rate
+    monthly = basicPay;
+    daily = roundHalfUp_(monthly / (wdy / 12), 2);
+  }
+
+  const hourly = roundHalfUp_(daily / 8, 2);
+
+  return [eid, nm, monthly, wdy, daily, hourly];
+}).filter(Boolean);
+
+
+  const out = SpreadsheetApp.getActive().getSheetByName('RATE_LOOKUP');
+  out.clear();
+  out.getRange(1,1,1,6).setValues([['Employee ID','Employee Name','Monthly Salary','Working Days','Daily Rate','Hourly Rate']]).setFontWeight('bold');
+  if (rows.length) {
+    out.getRange(2,1,rows.length,6).setValues(rows);
+    out.getRange(2,3,rows.length,4).setNumberFormat('#,##0.00');
+  }
+
+  setupDataValidations_();
+  SpreadsheetApp.getActive().toast('✅ RATE_LOOKUP refreshed.');
+
+  // 👇 Run the gray-column resync whenever RATE_LOOKUP is rebuilt by script
+try { autoRefreshGrayColumns_(); } 
+catch (err) { Logger.log('autoRefresh after rate refresh: ' + err.message); }
+
+
+}
+
+function setupDataValidations_() {
+  const ss = SpreadsheetApp.getActive();
+  const rl = ss.getSheetByName('RATE_LOOKUP');
+  if (!rl || rl.getLastRow() < 2) return;
+
+  const namesRange = rl.getRange(2, 2, rl.getLastRow() - 1, 1);
+  const nameRule = SpreadsheetApp.newDataValidation()
+    .requireValueInRange(namesRange, true)
+    .setAllowInvalid(false)
+    .build();
+
+['Overtime','Absences_Tardiness','Variable_Adjustments'].forEach(s => {
+  const sh = ss.getSheetByName(s);
+  if (!sh) return;
+  sh.getRange('A2:A').setDataValidation(nameRule);
+});
+// Attendance: only DAILY pay-basis employees
+try {
+  const att = ss.getSheetByName('Attendance');
+  if (!att) return;
+
+  const cfg = readSettings_();
+  if (!cfg.masterIdOrUrl || !cfg.masterSheetName) {
+    // no master configured → remove Attendance validation so user can still type
+    att.getRange('A2:A').clearDataValidations();
+    return;
+  }
+
+  const masterId = parseFileId_(cfg.masterIdOrUrl);
+  const mss = SpreadsheetApp.openById(masterId);
+  const msh = mss.getSheetByName(cfg.masterSheetName);
+  if (!msh) throw new Error(`Sheet "${cfg.masterSheetName}" not found in Masterfile.`);
+
+  const mh = msh.getRange(1, 1, 1, msh.getLastColumn()).getValues()[0].map(String);
+  const iName = findHeaderFuzzy_(mh, ['Employee Name']);
+  const iPB   = findHeaderFuzzy_(mh, ['Pay Basis','PAY BASIS']);
+  if (iName === -1 || iPB === -1) {
+    // missing columns → remove Attendance validation so user can still type
+    att.getRange('A2:A').clearDataValidations();
+    return;
+  }
+
+  const lr = msh.getLastRow();
+  if (lr < 2) {
+    att.getRange('A2:A').clearDataValidations();
+    return;
+  }
+
+  const data = msh.getRange(2, 1, lr - 1, msh.getLastColumn()).getValues();
+
+  const seen = new Set();
+  const dailyNames = [];
+  for (const r of data) {
+    const nm = String(r[iName] || '').trim();
+    const pb = String(r[iPB] || '').trim().toUpperCase();
+    if (!nm) continue;
+    if (pb !== 'DAILY') continue;
+
+    const key = nm.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    dailyNames.push(nm);
+  }
+
+  if (dailyNames.length) {
+    const dailyRule = SpreadsheetApp.newDataValidation()
+      .requireValueInList(dailyNames, true)
+      .setAllowInvalid(false)
+      .build();
+    att.getRange('A2:A').setDataValidation(dailyRule);
+  } else {
+    // no DAILY employees → remove dropdown (or keep empty list = annoying)
+    att.getRange('A2:A').clearDataValidations();
+  }
+} catch (err) {
+  Logger.log('Attendance DAILY dropdown error: ' + err.message);
+}
+
+
+}
+
+/** ================== HELPERS ================== **/
+
+
+function parseFileId_(s) {
+  const str = String(s || '').trim();
+  const m = str.match(/\/d\/([a-zA-Z0-9-_]+)/);
+  return m ? m[1] : str;
+}
+
+function findHeaderFuzzy_(headers, keys) {
+  const H = headers.map(h => String(h||'').trim().toLowerCase());
+  for (const k of keys.map(x => String(x).toLowerCase())) {
+    const i = H.indexOf(k);
+    if (i !== -1) return i;
+  }
+  for (let i=0;i<H.length;i++) {
+    if (keys.some(k => H[i].includes(String(k).toLowerCase()))) return i;
+  }
+  return -1;
+}
+
+function roundHalfUp_(v, d) {
+  const p = Math.pow(10, d || 0);
+  return Math.round((Number(v) + Number.EPSILON) * p) / p;
+}
+
+function getRateFor_(empName, mode) {
+  const rl = SpreadsheetApp.getActive().getSheetByName('RATE_LOOKUP');
+  if (!rl || rl.getLastRow() < 2) return null;
+  const vals = rl.getRange(2, 1, rl.getLastRow()-1, rl.getLastColumn()).getValues();
+  const row = vals.find(r => String(r[1]).trim().toLowerCase() === String(empName).trim().toLowerCase());
+  if (!row) return null;
+  return (mode === 'hourly') ? row[5] : row[4];
+}
+
+function fillIdAndRatesByName_(name, idCell, rateCell, opt) {
+  const rl = SpreadsheetApp.getActive().getSheetByName('RATE_LOOKUP');
+  if (!rl || rl.getLastRow() < 2) return;
+  const vals = rl.getRange(2, 1, rl.getLastRow()-1, rl.getLastColumn()).getValues();
+  const row = vals.find(r => String(r[1]).trim().toLowerCase() === String(name).trim().toLowerCase());
+  if (!row) return;
+  if (idCell) idCell.setValue(row[0]);
+  if (rateCell && opt?.mode) rateCell.setValue(opt.mode === 'hourly' ? row[5] : row[4]);
+}
+
+function getOtMultiplier_(type) {
+  const sh = SpreadsheetApp.getActive().getSheetByName('OT_RATES');
+  if (!sh || sh.getLastRow() < 2) return 1;
+  const data = sh.getRange(2, 1, sh.getLastRow() - 1, 2).getValues();
+  const row = data.find(r => String(r[0]).trim().toLowerCase() === String(type).trim().toLowerCase());
+  return row ? Number(row[1] || 1) : 1;
+}
+
+
+
+/****************************************************
+ * AUTO-REFRESH GRAY COLUMNS AFTER RATE_LOOKUP UPDATE
+ * --------------------------------------------------
+ * - Re-syncs Employee IDs and Rates (hourly/daily)
+ * - Also recomputes Amounts where applicable
+ ****************************************************/
+/****************************************************
+ * AUTO-REFRESH GRAY COLUMNS AFTER RATE_LOOKUP UPDATE
+ * --------------------------------------------------
+ * - Re-syncs Employee IDs and Rates (hourly/daily)
+ * - Recomputes Amounts for Overtime & Absences/Tardiness
+ * - Works even if only Employee ID (not name) matches
+ ****************************************************/
+function autoRefreshGrayColumns_() {
+  try {
+    const ss = SpreadsheetApp.getActive();
+    const rl = ss.getSheetByName('RATE_LOOKUP');
+    if (!rl || rl.getLastRow() < 2) return;
+
+    // build dual lookup maps
+    const rates = rl.getRange(2, 1, rl.getLastRow() - 1, rl.getLastColumn()).getValues();
+    const byName = new Map();
+    const byId   = new Map();
+    rates.forEach(r => {
+      const id = String(r[0] || '').trim();
+      const nm = String(r[1] || '').trim();
+      const daily  = Number(r[4] || 0);
+      const hourly = Number(r[5] || 0);
+      if (nm) byName.set(nm.toLowerCase(), [id, daily, hourly]);
+      if (id) byId.set(id.toLowerCase(),   [id, daily, hourly]);
+    });
+
+    /**********************  OVERTIME  ************************/
+    const ot = ss.getSheetByName('Overtime');
+    if (ot && ot.getLastRow() > 1) {
+      const vals = ot.getRange(2, 1, ot.getLastRow() - 1, ot.getLastColumn()).getValues();
+      const newIDs = [], newRates = [], newAmts = [];
+      vals.forEach(r => {
+        const empName = String(r[0] || '').trim().toLowerCase();
+        const empId   = String(r[1] || '').trim().toLowerCase();
+        const type    = String(r[2] || '').trim();
+        const hrs     = Number(r[3] || 0);
+        const info = byName.get(empName) || byId.get(empId);
+        if (info) {
+          const [id,,hourly] = info;
+          const mult = getOtMultiplier_(type);
+          const amt  = (hrs && hourly && mult) ? roundHalfUp_(hourly * hrs * mult, 2) : '';
+          newIDs.push([id]);
+          newRates.push([hourly]);
+          newAmts.push([amt]);
+        } else {
+          newIDs.push(['']); newRates.push(['']); newAmts.push(['']);
+        }
+      });
+      ot.getRange(2, 2, newIDs.length, 1).setValues(newIDs);   // ID
+      ot.getRange(2, 5, newRates.length, 1).setValues(newRates); // Hourly Rate
+      ot.getRange(2, 6, newAmts.length, 1).setValues(newAmts);   // Amount
+    }
+
+    /**************  ABSENCES / TARDINESS  *******************/
+    const at = ss.getSheetByName('Absences_Tardiness');
+    if (at && at.getLastRow() > 1) {
+      const vals = at.getRange(2, 1, at.getLastRow() - 1, at.getLastColumn()).getValues();
+      const newIDs = [], newRates = [], newAmts = [];
+      vals.forEach(r => {
+        const empName = String(r[0] || '').trim().toLowerCase();
+        const empId   = String(r[1] || '').trim().toLowerCase();
+        const type    = String(r[2] || '').trim().toLowerCase();
+        const unit    = Number(r[3] || 0);
+        const info = byName.get(empName) || byId.get(empId);
+        if (info) {
+          const [id, daily, hourly] = info;
+          const rate = (type === 'absence') ? daily : hourly;
+          const amt  = (unit && rate) ? roundHalfUp_(-1 * unit * rate, 2) : '';
+          newIDs.push([id]);
+          newRates.push([rate]);
+          newAmts.push([amt]);
+        } else {
+          newIDs.push(['']); newRates.push(['']); newAmts.push(['']);
+        }
+      });
+      at.getRange(2, 2, newIDs.length, 1).setValues(newIDs);   // ID
+      at.getRange(2, 5, newRates.length, 1).setValues(newRates); // Rate
+      at.getRange(2, 6, newAmts.length, 1).setValues(newAmts);   // Amount
+    }
+
+    /**************  VARIABLE ADJUSTMENTS  *******************/
+    const va = ss.getSheetByName('Variable_Adjustments');
+    if (va && va.getLastRow() > 1) {
+      const vals = va.getRange(2, 1, va.getLastRow() - 1, va.getLastColumn()).getValues();
+      const newIDs = vals.map(r => {
+        const empName = String(r[0] || '').trim().toLowerCase();
+        const empId   = String(r[1] || '').trim().toLowerCase();
+        const info = byName.get(empName) || byId.get(empId);
+        return [info ? info[0] : ''];
+      });
+      va.getRange(2, 2, newIDs.length, 1).setValues(newIDs);
+    }
+
+/**************  ATTENDANCE  *******************/
+const att = ss.getSheetByName('Attendance');
+if (att && att.getLastRow() > 1) {
+  const vals = att.getRange(2, 1, att.getLastRow() - 1, att.getLastColumn()).getValues();
+  const newIDs = vals.map(r => {
+    const empName = String(r[0] || '').trim().toLowerCase();
+    const empId   = String(r[1] || '').trim().toLowerCase();
+    const info = byName.get(empName) || byId.get(empId);
+    return [info ? info[0] : ''];
+  });
+  att.getRange(2, 2, newIDs.length, 1).setValues(newIDs);
+}
+
+
+    SpreadsheetApp.getActive().toast('✅ Gray columns refreshed from RATE_LOOKUP.');
+
+    safeAutoRebuildInputs_('Overtime', true);
+    safeAutoRebuildInputs_('Absences_Tardiness', true);
+    safeAutoRebuildInputs_('Variable_Adjustments', true);
+
+  } catch (err) {
+    Logger.log('autoRefreshGrayColumns_ error: ' + err.message);
+  }
+}
+
+
+
+/** =========================================================
+ * AUTO-CHECK MASTERFILE SALARY & WORKING DAYS (every hour)
+ *  - Detects any change in Salary or Working Days columns
+ *  - Runs refreshRateLookup_() automatically
+ * ========================================================= */
+function autoCheckRates_() {
+  try {
+    const cfg = readSettings_();
+    if (!cfg.masterIdOrUrl || !cfg.masterSheetName) return;
+
+    const id = parseFileId_(cfg.masterIdOrUrl);
+    const master = SpreadsheetApp.openById(id);
+    const sh = master.getSheetByName(cfg.masterSheetName);
+    if (!sh) return;
+
+    const headers = sh.getRange(1,1,1,sh.getLastColumn()).getValues()[0].map(String);
+    const idxSalary = findHeaderFuzzy_(headers, ['Salary','Basic Pay','Basic']);
+const idxDays   = findHeaderFuzzy_(headers, ['Working Days','Working Days Per Year']);
+const idxPb     = findHeaderFuzzy_(headers, ['Pay Basis','PAY BASIS']);
+if (idxSalary === -1 && idxDays === -1 && idxPb === -1) return;
+
+
+    // collect salary + working-days columns
+    const lr = sh.getLastRow();
+    const data = sh.getRange(
+      2,
+      Math.min(idxSalary, idxDays) + 1,
+      lr - 1,
+      Math.max(idxSalary, idxDays) - Math.min(idxSalary, idxDays) + 1
+    ).getValues();
+
+    // isolate only relevant columns
+    const salaryCol = idxSalary >= 0 ? data.map(r => r[idxSalary - Math.min(idxSalary, idxDays)]) : [];
+    const wdayCol   = idxDays   >= 0 ? data.map(r => r[idxDays   - Math.min(idxSalary, idxDays)]) : [];
+
+    // build checksum of both
+    const payBasisCol = idxPb >= 0 ? sh.getRange(2, idxPb + 1, lr - 1, 1).getValues() : [];
+const payload = { salary: salaryCol, wdays: wdayCol, payBasis: payBasisCol };
+
+    const checksum = Utilities.base64Encode(
+      Utilities.computeDigest(
+        Utilities.DigestAlgorithm.MD5,
+        JSON.stringify(payload)
+      )
+    );
+
+    const props = PropertiesService.getDocumentProperties();
+    const last = props.getProperty('RATES_CHECKSUM');
+    if (checksum !== last) {
+      Logger.log('🔁 Salary or Working Days changed in Masterfile → refreshing RATE_LOOKUP...');
+      refreshRateLookup();
+      props.setProperty('RATES_CHECKSUM', checksum);
+    }
+  } catch (err) {
+    Logger.log('autoCheckRates_ error: ' + err.message);
+  }
+}
+
+/**
+ * Build a lookup map from RATE_LOOKUP:
+ *  name (lowercase) → { id, daily, hourly }
+ */
+function buildRateLookupMap_() {
+  const ss = SpreadsheetApp.getActive();
+  const rl = ss.getSheetByName('RATE_LOOKUP');
+  const map = {};
+  if (!rl || rl.getLastRow() < 2) return map;
+
+  const vals = rl.getRange(2, 1, rl.getLastRow() - 1, rl.getLastColumn()).getValues();
+  vals.forEach(r => {
+    const nm = String(r[1] || '').trim().toLowerCase();
+    if (!nm) return;
+    map[nm] = {
+      id:     r[0],
+      daily:  Number(r[4] || 0),
+      hourly: Number(r[5] || 0),
+    };
+  });
+  return map;
+}
+
+/** =============== PAYROLL SETTINGS (Script Properties) =============== **/
+
+// Keys in Script Properties
+const SETTINGS_KEYS_ = {
+  MASTER_URL:  'MASTERFILE_ID_OR_URL',
+  MASTER_SHEET: 'MASTERFILE_SHEET_NAME',
+};
+
+/**
+ * Read settings from Script Properties (used by refreshRateLookup_, autoCheckRates_, etc.)
+ */
+function readSettings_() {
+  const props = PropertiesService.getDocumentProperties();
+  return {
+    masterIdOrUrl: props.getProperty(SETTINGS_KEYS_.MASTER_URL)  || '',
+    masterSheetName: props.getProperty(SETTINGS_KEYS_.MASTER_SHEET) || '',
+  };
+}
+
+/**
+ * Open settings dialog from menu.
+ */
+function openPayrollSettings() {
+  const html = HtmlService.createTemplateFromFile('PayrollSettings')
+  .evaluate()
+    .setWidth(500)
+    .setHeight(640);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Payroll Settings');
+}
+
+/**
+ * For UI: return current settings (if any).
+ */
+function getCurrentPayrollSettings() {
+  return readSettings_();
+}
+
+/**
+ * For UI: given a URL/ID, list available sheet names in that file.
+ */
+function listSheetsForFile(idOrUrl) {
+  const id = parseFileId_(idOrUrl);
+  let ss;
+  try {
+    ss = SpreadsheetApp.openById(id);
+  } catch (err) {
+    throw new Error('Cannot open file. Check the URL/ID and your access.');
+  }
+  const sheets = ss.getSheets().map(s => s.getName());
+  return { sheets, normalizedId: id };
+}
+
+/**
+ * Test connection + header requirements only.
+ * Does NOT save anything. Shows a toast with file & sheet name.
+ */
+function testPayrollSettings(payload) {
+  const masterIdOrUrl   = String(payload && payload.masterIdOrUrl || '').trim();
+  const masterSheetName = String(payload && payload.masterSheetName || '').trim();
+  if (!masterIdOrUrl || !masterSheetName) {
+    throw new Error('Please provide both Masterfile URL/ID and Sheet Name.');
+  }
+
+  const id = parseFileId_(masterIdOrUrl);
+  let master;
+  try {
+    master = SpreadsheetApp.openById(id);
+  } catch (err) {
+    throw new Error('Cannot open file. Check the URL/ID and your access.');
+  }
+
+  const sh = master.getSheetByName(masterSheetName);
+  if (!sh) {
+    throw new Error('Sheet "' + masterSheetName + '" not found in that file.');
+  }
+
+  // Header check (same as before)
+  const headers = sh.getRange(1, 1, 1, sh.getLastColumn())
+    .getValues()[0].map(String);
+  const idxName = findHeaderFuzzy_(headers, ['Employee Name']);
+  const idxId   = findHeaderFuzzy_(headers, ['Employee ID']);
+  const idxSal  = findHeaderFuzzy_(headers, ['Salary','Basic Pay','Basic']);
+
+  if (idxName === -1 || idxId === -1 || idxSal === -1) {
+    throw new Error(
+      'Masterfile sheet must contain columns for "Employee Name", "Employee ID" and "Salary/Basic Pay".'
+    );
+  }
+
+  const msg = '✅ Connection OK — ' + master.getName() + ' / ' + masterSheetName;
+  SpreadsheetApp.getActive().toast(msg);
+
+  return {
+    ok: true,
+    fileName: master.getName(),
+    sheetName: masterSheetName,
+    normalizedId: id,
+  };
+}
+
+/**
+ * Save settings to Script Properties + refresh RATE_LOOKUP.
+ * Can be called after a successful test.
+ */
+function savePayrollSettings(payload) {
+  const masterIdOrUrl   = String(payload && payload.masterIdOrUrl || '').trim();
+  const masterSheetName = String(payload && payload.masterSheetName || '').trim();
+  if (!masterIdOrUrl || !masterSheetName) {
+    throw new Error('Please provide both Masterfile URL/ID and Sheet Name.');
+  }
+
+  const id = parseFileId_(masterIdOrUrl);
+  const props = PropertiesService.getDocumentProperties();
+  props.setProperty(SETTINGS_KEYS_.MASTER_URL, id);
+  props.setProperty(SETTINGS_KEYS_.MASTER_SHEET, masterSheetName);
+  props.deleteProperty('RATES_CHECKSUM'); // force re-check
+
+  // Refresh rates using the new settings
+  refreshRateLookup();
+
+  let fileName = '';
+  try {
+    fileName = SpreadsheetApp.openById(id).getName();
+  } catch (err) {}
+
+  SpreadsheetApp.getActive().toast(
+    '✅ Payroll settings saved for ' +
+    (fileName || 'Masterfile') + ' / ' + masterSheetName
+  );
+
+  return { ok: true };
+}
+
+/**
+ * Mirror Type Manager (DocumentProperties) into a sheet readable by PayrollCore.
+ * PayrollCore _buildComponentMap_ reads ADJUSTMENT_TYPES with headers: Name, Category.
+ */
+function _syncAdjTypesToSheet_(types) {
+  const ss = SpreadsheetApp.getActive();
+  const sheetName = 'ADJUSTMENT_TYPES';
+
+  let sh = ss.getSheetByName(sheetName);
+  if (!sh) {
+    sh = ss.insertSheet(sheetName);
+    sh.hideSheet(); // keep it out of sight
+  }
+
+  sh.clearContents();
+
+  // Required headers for PayrollCore: ['Name','Category']
+  sh.getRange(1, 1, 1, 2).setValues([['Name', 'Category']]);
+
+  const rows = (types || [])
+    .map(t => [
+      String(t?.name ?? t?.Name ?? '').trim(),
+      String(t?.category ?? t?.Category ?? '').trim(),
+    ])
+    .filter(r => r[0] && r[1]);
+
+  if (rows.length) {
+    sh.getRange(2, 1, rows.length, 2).setValues(rows);
+  }
+}
+
+
+function showAboutLicenseDialog() {
+  const html = HtmlService.createTemplateFromFile('AboutLicenseDialog');
+  const out = html.evaluate()
+    .setWidth(560)
+    .setHeight(520);
+  SpreadsheetApp.getUi().showModalDialog(out, 'About / License');
+}

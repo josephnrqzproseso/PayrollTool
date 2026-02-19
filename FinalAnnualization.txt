@@ -1,0 +1,1432 @@
+/**************************************************
+ * FINAL ANNUALIZATION MODULE (NO PROJECTIONS)
+ * ---------------------------------------------
+ * - Uses PAYROLL_HISTORY only.
+ * - CONTRACT TYPE = "EMPLOYEE" only.
+ * - PREVIEW + SHEET: one column per actual PAYROLL_HISTORY
+ *   component header (Basic, Allowances, etc.), but we
+ *   classify them internally for tax logic.
+ **************************************************/
+
+function showFinalAnnualizationDialog() {
+  const html = HtmlService.createTemplateFromFile('FinalAnnualizationDialog')
+  .evaluate()
+    .setWidth(1100)
+    .setHeight(650);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Final Annualization');
+}
+
+/**
+ * Normalize any payroll category text from mappings / config sheets
+ * into one of the internal keys we use:
+ *   BASIC, TAXABLE, DEMINIMIS, NONTAX_OTHER, OTHER13
+ *
+ * Accepts variations in spacing, case, and "AND" vs "&".
+ */
+function _canonicalPayrollCategoryKey_(raw) {
+  if (!raw) return '';
+
+  let s = String(raw).replace(/\u00A0/g, ' ').trim().toUpperCase();
+  s = s.replace(/\s+/g, ' ');
+  s = s.replace(/&/g, 'AND');
+
+  // BASIC PAY RELATED
+  if (s.indexOf('BASIC') !== -1) return 'BASIC';
+
+  // IMPORTANT: allow "DE MINIMIS" to map even if the category text does not contain "NON-TAX"
+  // (common mapping label: "DE MINIMIS")
+  if (s.indexOf('MINIMIS') !== -1) return 'DEMINIMIS';
+
+  // NON-TAXABLE MUST BE CHECKED BEFORE TAXABLE
+  if (s.indexOf('NON-TAX') !== -1 || s.indexOf('NONTAX') !== -1 || s.indexOf('NON TAX') !== -1) {
+    return 'NONTAX_OTHER';
+  }
+
+  // TAXABLE EARNING (match "TAXABLE" but not "NON-TAXABLE")
+  if (/\bTAXABLE\b/.test(s)) return 'TAXABLE';
+
+  // 13th month / other benefits (make this more permissive to avoid missing mappings)
+  if (s.indexOf('13') !== -1 && (s.indexOf('MONTH') !== -1 || s.indexOf('TH') !== -1)) {
+    return 'OTHER13';
+  }
+
+  return '';
+}
+
+function _normComponentKey_(v) {
+  return String(v || '')
+    .replace(/\u00A0/g, ' ')     // NBSP -> space
+    .trim()
+    .toUpperCase()
+    .replace(/&/g, 'AND')
+    .replace(/[^\w\s]/g, ' ')   // remove punctuation
+    .replace(/\s+/g, ' ')       // collapse spaces
+    .trim();
+}
+
+
+function _componentMapGet_(componentMap, rawKey) {
+  const k = _normComponentKey_(rawKey);
+  if (!k) return '';
+
+  let v = '';
+  if (componentMap && typeof componentMap.get === 'function') v = componentMap.get(k);
+  else if (componentMap && componentMap[k]) v = componentMap[k];
+
+  // unwrap {category: "..."} records
+  if (v && typeof v === 'object') {
+    return String(v.category || '').trim();
+  }
+  return String(v || '').trim();
+}
+
+
+
+function _toNumber_(v) {
+  if (v === null || v === undefined) return 0;
+
+  if (typeof v === 'number') return isFinite(v) ? v : 0;
+
+  if (typeof v === 'string') {
+    let s = v.replace(/\u00A0/g, ' ').trim(); // normalize NBSP
+    if (!s) return 0;
+
+    // Handle (1,234.56) => -1234.56
+    let neg = false;
+    if (/^\(.*\)$/.test(s)) {
+      neg = true;
+      s = s.slice(1, -1).trim();
+    }
+
+    // Remove common currency tokens and separators
+    s = s.replace(/PHP/gi, '');
+    s = s.replace(/[₱$]/g, '');
+    s = s.replace(/,/g, '');
+    s = s.trim();
+
+    // Strip anything that's not digit, dot, or minus
+    s = s.replace(/[^0-9.\-]/g, '');
+    if (!s || s === '-' || s === '.') return 0;
+
+    const n = Number(s);
+    if (!isFinite(n)) return 0;
+
+    return neg ? -Math.abs(n) : n;
+  }
+
+  return 0;
+}
+
+
+/**
+ * Build plain YTD facts from PAYROLL_HISTORY for a calendar year.
+ * PATTERNED AFTER _buildPreAnnFacts_ (Pre-Annualization) BUT:
+ * - No projections
+ * - No frequency / remaining-cutoff logic
+ * - Adds ytdComponents + groupCols so we can create one column per
+ *   PAYROLL_HISTORY component in the FinalAnnualization sheet.
+ */
+/**
+ * Build plain YTD facts from PAYROLL_HISTORY for a calendar year.
+ * FINAL VERSION:
+ * - Uses _buildPreAnnFacts_ to get all YTD category totals
+ *   (same source as Pre-Annualization).
+ * - Reads PAYROLL_HISTORY again only to:
+ *     - get headers,
+ *     - classify columns (BASIC / TAXABLE / OTHER13 / etc.),
+ *     - build ytdComponents per header per employee
+ *       (so Final sheet still has one column per actual component).
+ * - NO projections. Pure YTD.
+ */
+function _buildFinalAnnFacts_(year, cfg) {
+  const ss   = SpreadsheetApp.getActiveSpreadsheet();
+  const hist = ss.getSheetByName('PAYROLL_HISTORY');
+
+  const empty = {
+    facts: new Map(),
+    headers: [],
+    colType: [],
+    groupCols: { BASIC: [], TAXABLE: [], DEMINIMIS: [], NONTAX_OTHER: [], OTHER13: [] }
+  };
+
+  if (!hist || hist.getLastRow() < 2) return empty;
+
+  const data    = hist.getDataRange().getValues();
+  const headers = data[0].map(h => String(h || '').trim());
+  const rows    = data.slice(1);
+
+  const idxEmpId   = headers.findIndex(h => /^Employee ID$/i.test(h));
+  const idxEmpName = headers.findIndex(h => /^Employee Name$/i.test(h));
+  const idxPeriod  = headers.findIndex(h => /^Period$/i.test(h));
+  const idxMonth   = headers.findIndex(h => /^Payroll Month$/i.test(h));
+
+  if (idxEmpId === -1) return Object.assign({}, empty, { headers });
+
+  const componentMap = _buildComponentMap_(cfg);
+
+  // Classify each PAYROLL_HISTORY column ONCE
+  const colType = headers.map(name => {
+    const up = String(name || '').trim().toUpperCase();
+
+    // META / NON-AMOUNT columns
+    if (_isHistoryMetaColumn_(up)) return null;
+
+    // Derived totals in PAYROLL_HISTORY (avoid double counting)
+    if (_isHistoryDerivedTotalColumn_(up)) return null;
+
+    // Gov contributions / WTax
+    if (/^SSS EE( MC)?$/i.test(name))          return 'SSS_EE_MC';
+    if (/^SSS EE MPF$/i.test(name))            return 'SSS_EE_MPF';
+    if (/^PHILHEALTH EE$/i.test(name))         return 'PH_EE';
+    if (/^(PAG-IBIG|HDMF) EE$/i.test(up))      return 'PI_EE';
+    if (/^(WITHHOLDING TAX|WTAX)/i.test(name)) return 'WTAX';
+
+    // Exclude known employer-side contributions (not part of gross comp)
+    if (_isEmployerContributionColumn_(up)) return null;
+
+    // Exclude known pure deductions/loans (not part of gross comp categories)
+    if (_isDeductionLikeColumn_(up)) return null;
+
+    // Category from mappings (Masterfile + Recurring + Type Manager)
+    const catRaw = _classifyComponent_(name, componentMap) || '';
+
+    // Canonicalize mapping -> internal buckets
+    let key = _canonicalPayrollCategoryKey_(catRaw);
+
+    // If mapping miss, do a controlled fallback inference from header (so you don't lose columns)
+    if (!key) key = _inferCategoryFromHeader_(up);
+
+    if (key === 'BASIC')        return 'BASIC';
+    if (key === 'TAXABLE')      return 'TAXABLE';
+    if (key === 'DEMINIMIS')    return 'DEMINIMIS';
+    if (key === 'NONTAX_OTHER') return 'NONTAX_OTHER';
+    if (key === 'OTHER13')      return 'OTHER13';
+
+    // Backward compatibility
+    const cu = String(catRaw || '').toUpperCase();
+    if (cu.indexOf('NON-TAXABLE EARNING') !== -1 || cu.indexOf('NON TAXABLE EARNING') !== -1) {
+      return 'NONTAX_OTHER';
+    }
+
+    return null;
+  });
+
+  const groupCols = { BASIC: [], TAXABLE: [], DEMINIMIS: [], NONTAX_OTHER: [], OTHER13: [] };
+  colType.forEach((t, idx) => {
+    if (!t) return;
+    if (groupCols[t]) groupCols[t].push(idx);
+  });
+
+  // Build facts per employee, pure from PAYROLL_HISTORY
+  const finalFacts = new Map();
+
+  rows.forEach(r => {
+    const { rowYear } = _deriveYearMonthFromRow_(r, idxMonth, idxPeriod);
+    if (rowYear !== year) return;
+
+    const empId = String(r[idxEmpId] || '').trim();
+    if (!empId) return;
+
+    const empNameFromHist = idxEmpName > -1 ? String(r[idxEmpName] || '').trim() : '';
+
+    let rec = finalFacts.get(empId);
+    if (!rec) {
+      rec = {
+        empId,
+        empName: empNameFromHist || '',
+        ytdComponents: {},
+
+        // category totals (from PAYROLL_HISTORY only)
+        totalBasic: 0,
+        totalTaxable: 0,
+        totalDem: 0,
+        totalNonTaxOther: 0,
+        totalOther13: 0,
+
+        // contributions + WTax (from PAYROLL_HISTORY only)
+        ytdSssEeMc: 0,
+        ytdSssEeMpf: 0,
+        ytdPhEe: 0,
+        ytdPiEe: 0,
+        ytdWtax: 0
+      };
+      finalFacts.set(empId, rec);
+    } else if (!rec.empName && empNameFromHist) {
+      rec.empName = empNameFromHist;
+    }
+
+    for (let c = 0; c < r.length; c++) {
+      const v = _toNumber_(r[c]);
+      if (v === 0) continue;
+
+      // Always keep per-component YTD for displayed columns
+      rec.ytdComponents[c] = (rec.ytdComponents[c] || 0) + v;
+
+      // Add to correct totals based on classified column type
+      const t = colType[c];
+      if (!t) continue;
+
+      if (t === 'BASIC')        rec.totalBasic       += v;
+      else if (t === 'TAXABLE') rec.totalTaxable     += v;
+      else if (t === 'DEMINIMIS')    rec.totalDem         += v;
+      else if (t === 'NONTAX_OTHER') rec.totalNonTaxOther += v;
+      else if (t === 'OTHER13')      rec.totalOther13     += v;
+
+      else if (t === 'SSS_EE_MC')  rec.ytdSssEeMc  += Math.abs(v);
+else if (t === 'SSS_EE_MPF') rec.ytdSssEeMpf += Math.abs(v);
+else if (t === 'PH_EE')      rec.ytdPhEe     += Math.abs(v);
+else if (t === 'PI_EE')      rec.ytdPiEe     += Math.abs(v);
+else if (t === 'WTAX')       rec.ytdWtax     += Math.abs(v); // optional; usually also stored negative
+
+    }
+  });
+
+  return { facts: finalFacts, headers, colType, groupCols };
+}
+
+/********** Column helpers **********/
+
+function _isHistoryMetaColumn_(up) {
+  return (
+    up === 'EMPLOYEE ID' ||
+    up === 'EMPLOYEE NAME' ||
+    up === 'CLIENT' ||
+    up === 'PAYROLL GROUP' ||
+    up === 'COST CENTER' ||
+    up === 'PERIOD' ||
+    up === 'FROM' ||
+    up === 'TO' ||
+    up === 'CREDITING DATE' ||
+    up === 'PAYROLL MONTH'
+  );
+}
+
+function _isHistoryDerivedTotalColumn_(up) {
+  // These are totals computed by payroll; do NOT treat as components
+  return (
+    up === 'GROSS PAY' ||
+    up === 'TAXABLE INCOME' ||
+    up === 'NET PAY' ||
+    up === 'SSS EE' ||
+    up === 'SSS ER'
+  );
+}
+
+function _isEmployerContributionColumn_(up) {
+  return (
+    /^SSS ER\b/.test(up) ||
+    up === 'SSS EC' ||
+    /^PHILHEALTH ER\b/.test(up) ||
+    /^(PAG-IBIG|HDMF) ER\b/.test(up)
+  );
+}
+
+function _isDeductionLikeColumn_(up) {
+  // Keep this narrow; mapping should handle anything else.
+  return (
+    /\bLOAN\b/.test(up) ||
+    /\bCASH ADVANCE\b/.test(up) ||
+    /\bDEDUCTION\b/.test(up)
+  );
+}
+
+function _inferCategoryFromHeader_(up) {
+  // Controlled fallback only when mappings miss.
+  // Keeps you from “losing” columns if someone forgot to map them.
+  if (/^(TARDINESS|ABSENCE)$/.test(up)) return 'BASIC';
+  if (up.indexOf('BASIC') !== -1) return 'BASIC';
+  if (up.indexOf('MINIMIS') !== -1) return 'DEMINIMIS';
+  if (up.indexOf('NON-TAX') !== -1 || up.indexOf('NONTAX') !== -1 || up.indexOf('NON TAX') !== -1) return 'NONTAX_OTHER';
+  if (/\bTAXABLE\b/.test(up)) return 'TAXABLE';
+  if (up.indexOf('13') !== -1 && (up.indexOf('MONTH') !== -1 || up.indexOf('TH') !== -1)) return 'OTHER13';
+  return '';
+}
+
+function _isOvertimeHeader_(h) {
+  const up = String(h || '').trim().toUpperCase();
+  if (!up) return false;
+
+  // Prefer explicit "OVERTIME" to avoid false positives
+  if (up.indexOf('OVERTIME') !== -1) return true;
+
+  // Allow common OT labels, but keep narrow (requires PAY/HOUR/HRS)
+  if (/\bOT\b/.test(up) && (up.indexOf('PAY') !== -1 || up.indexOf('HOUR') !== -1 || up.indexOf('HRS') !== -1)) {
+    return true;
+  }
+
+  return false;
+}
+
+function _sumTaxableOvertimeFromHistory_(headers, colType, rec) {
+  let sum = 0;
+  for (let i = 0; i < (headers || []).length; i++) {
+    if (!colType || colType[i] !== 'TAXABLE') continue;
+    if (!_isOvertimeHeader_(headers[i])) continue;
+
+    const v = (rec && rec.ytdComponents) ? (rec.ytdComponents[i] || 0) : 0;
+    if (v) sum += v;
+  }
+  return sum;
+}
+
+
+/**
+ * Read previous employer info from PREANN_PREV_EMPLOYER.
+ */
+function _loadFinalPrevEmployerMap_() {
+  const store = _readPrevEmployerStore_();
+  const map = new Map();
+
+  Object.keys(store).forEach(empId => {
+    const r = store[empId] || {};
+
+    const taxable = Number(r.taxable || 0) || 0;
+
+    map.set(String(empId).trim(), {
+      tin: _sanitizeTin_(r.tin),
+      registeredName: String(r.registeredName || '').trim(),
+      address: String(r.address || '').trim(),
+      zip: _sanitizeZip_(r.zip),
+
+      // existing (used in computation)
+      taxable: taxable,
+      wtax: Number(r.wtax || 0) || 0,
+
+      // NEW (previous employer breakdown for Alphalist)
+      prevNonTaxGrossCompIncome: Number(r.prevNonTaxGrossCompIncome || 0) || 0,
+      prevNonTaxBasicSmw:        Number(r.prevNonTaxBasicSmw || 0) || 0,
+      prevNonTaxHolidayPay:      Number(r.prevNonTaxHolidayPay || 0) || 0,
+      prevNonTaxOvertimePay:     Number(r.prevNonTaxOvertimePay || 0) || 0,
+      prevNonTaxNightDiff:       Number(r.prevNonTaxNightDiff || 0) || 0,
+      prevNonTaxHazardPay:       Number(r.prevNonTaxHazardPay || 0) || 0,
+      prevNonTax13thMonth:       Number(r.prevNonTax13thMonth || 0) || 0,
+      prevNonTaxDeMinimis:       Number(r.prevNonTaxDeMinimis || 0) || 0,
+      prevNonTaxSssEtc:          Number(r.prevNonTaxSssEtc || 0) || 0,
+      prevNonTaxSalaries:        Number(r.prevNonTaxSalaries || 0) || 0,
+      prevTotalNonTaxCompIncome: Number(r.prevTotalNonTaxCompIncome || 0) || 0,
+
+      prevTaxableBasicSalary:    Number(r.prevTaxableBasicSalary || 0) || 0,
+      prevTaxable13thMonth:      Number(r.prevTaxable13thMonth || 0) || 0,
+      prevTaxableSalaries:       Number(r.prevTaxableSalaries || 0) || 0,
+
+      // IMPORTANT: derived (taxable == prevTotalTaxable)
+      prevTotalTaxable: taxable
+    });
+  });
+
+  return map;
+}
+
+/**
+ * FINAL Annualization preview (no projections).
+ * Returns:
+ * {
+ *   componentHeaders: [ 'Basic Pay', 'Allowance 1', ... ],
+ *   rows: [ { empId, ..., componentValues:[...], ... }, ... ]
+ * }
+ */
+function getFinalAnnualizationPreview(form) {
+  try {
+    const parsed = _parseYearMonthFromForm_(form);
+    const year = parsed.year;
+
+    const ss  = SpreadsheetApp.getActiveSpreadsheet();
+    const cfg = _readSettings_();
+
+    const { facts, headers, groupCols, colType } = _buildFinalAnnFacts_(year, cfg);
+
+    const prevMap = _loadFinalPrevEmployerMap_();
+    const birTable = _loadBirTable_(_mustGetSheet_(ss, 'BIR_TABLE'));
+
+    // Masterfile meta (Payroll Group, tracking, contract type, status)
+    const { sourceSS } = _openLinkedFiles_(cfg, ss);
+    const master    = _mustGetSheet_(sourceSS, cfg.MASTER_SHEET_NAME);
+    const mVals     = master.getDataRange().getValues();
+    const mHdrs     = mVals[0].map(h => String(h || '').trim());
+    const mRows     = mVals.slice(1);
+
+    const idxEmp      = mHdrs.findIndex(h => /^Employee ID$/i.test(h));
+    const idxName     = mHdrs.findIndex(h => /^Employee Name$/i.test(h));
+    const idxGrp      = mHdrs.findIndex(h => /^Payroll Group$/i.test(h));
+    const idxTc1      = 3;
+    const idxTc2      = 4;
+    const tc1Label    = mHdrs[3] || 'Tracking Category 1';
+    const tc2Label    = mHdrs[4] || 'Tracking Category 2';
+    const idxContract = mHdrs.findIndex(h => /^Contract Type$/i.test(h));
+    const idxStatus   = mHdrs.findIndex(h =>
+      /^Status$/i.test(h) || /Employment Status/i.test(h)
+    );
+
+        // --- MWE (Minimum Wage Earner) lookup ---
+    const norm_ = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+    const findIdxAny_ = (names) => {
+      const wants = (names || []).map(norm_);
+      for (let i = 0; i < mHdrs.length; i++) {
+        const hn = norm_(mHdrs[i]);
+        if (!hn) continue;
+        if (wants.indexOf(hn) >= 0) return i;
+      }
+      return -1;
+    };
+
+    const idxMwe = findIdxAny_(["MWE", "Minimum Wage Earner"]);
+
+    const mweTrue_ = (v) => {
+      const s = String(v || '').trim().toUpperCase();
+      return (s === 'TRUE' || s === 'YES' || s === 'Y' || s === '1');
+    };
+
+
+    const metaById = new Map();
+    mRows.forEach(r => {
+      const id = String(r[idxEmp] || '').trim();
+      if (!id) return;
+            metaById.set(id, {
+        name:         idxName     > -1 ? String(r[idxName]     || '').trim() : '',
+        group:        idxGrp      > -1 ? String(r[idxGrp]      || '').trim() : '',
+        trackingCat1: idxTc1      > -1 ? String(r[idxTc1]      || '').trim() : '',
+        trackingCat2: idxTc2      > -1 ? String(r[idxTc2]      || '').trim() : '',
+        contractType: idxContract > -1 ? String(r[idxContract] || '').trim() : '',
+        status:       idxStatus   > -1 ? String(r[idxStatus]   || '').trim() : '',
+        mwe:          (idxMwe     > -1) ? mweTrue_(r[idxMwe]) : false
+      });
+
+    });
+
+    // Non-tax component columns (repeat block): De Minimis + Non-tax Other
+    const nonTaxComponentCols = []
+      .concat(groupCols.DEMINIMIS || [])
+      .concat(groupCols.NONTAX_OTHER || []);
+
+    const nonTaxComponentHeaders = nonTaxComponentCols.map(idx => headers[idx]);
+
+
+    // ORDER of component columns: Basic → De Minimis → Non-tax Other → Taxable → 13th
+    const componentCols = []
+      .concat(groupCols.BASIC || [])
+      .concat(groupCols.DEMINIMIS || [])
+      .concat(groupCols.NONTAX_OTHER || [])
+      .concat(groupCols.TAXABLE || [])
+      .concat(groupCols.OTHER13 || []);
+
+    const componentHeaders = componentCols.map(idx => headers[idx]);
+
+    const rowsForUi = [];
+
+    facts.forEach((rec, empId) => {
+      const meta = metaById.get(empId) || {};
+      const contractUpper = String(meta.contractType || '').trim().toUpperCase();
+      if (!contractUpper || contractUpper !== 'EMPLOYEE') return;
+
+      const totalBasic       = rec.totalBasic || 0;
+      const totalTaxable     = rec.totalTaxable || 0;
+      const totalDem         = rec.totalDem || 0;
+      const totalNonTaxOther = rec.totalNonTaxOther || 0;
+      const totalOther13     = rec.totalOther13 || 0;
+
+            const grossCompPresent =
+        totalBasic +
+        totalTaxable +
+        totalDem +
+        totalNonTaxOther +
+        totalOther13;
+
+      const nonTax13thOtherAnnual =
+        Math.min(OTHER_BENEFITS_EXEMPT_YTD, Math.max(0, totalOther13));
+
+      const sssEeMc  = rec.ytdSssEeMc || 0;
+      const sssEeMpf = rec.ytdSssEeMpf || 0;
+      const phEe     = rec.ytdPhEe || 0;
+      const piEe     = rec.ytdPiEe || 0;
+
+      // TOTAL NON-TAXABLE COMPENSATION = De minimis + Other non-tax +
+// non-tax 13th/other (≤90k) + all EE contributions
+let totalNonTaxComp =
+  totalDem +
+  totalNonTaxOther +
+  nonTax13thOtherAnnual +
+  sssEeMc +
+  sssEeMpf +
+  phEe +
+  piEe;
+
+// Taxable compensation – present employer = Gross – total non-taxable compensation
+let taxableCompPresent =
+  grossCompPresent - totalNonTaxComp;
+
+// ✅ MWE rule: BASIC PAY + OVERTIME are NON-TAXABLE
+// IMPORTANT: "MWE NON-TAX BASIC PAY" must be BASIC LESS EE CONTRIBUTIONS
+const isMwe = !!meta.mwe;
+if (isMwe) {
+  const eeContribYtd = (sssEeMc + sssEeMpf + phEe + piEe);
+  const mweNonTaxBasic = Math.max(0, (totalBasic || 0) - eeContribYtd);
+
+  // OT is shifted only if it was classified as TAXABLE
+  const mweNonTaxOvertime = _sumTaxableOvertimeFromHistory_(headers, colType, rec);
+
+  // Add BASIC (less EE contrib) + OT into non-tax.
+  // EE contribs are already in totalNonTaxComp, so BasicLess + Contribs = full Basic in breakdown.
+  totalNonTaxComp += (mweNonTaxBasic + mweNonTaxOvertime);
+
+  taxableCompPresent = Math.max(0, grossCompPresent - totalNonTaxComp);
+}
+
+
+      const prev = prevMap.get(empId) || {
+        tin: '',
+        registeredName: '',
+        address: '',
+        zip: '',
+        taxable: 0,
+        wtax: 0
+      };
+
+      const taxablePrev = Number(prev.taxable || 0);
+      const wtaxPrev    = Number(prev.wtax || 0);
+
+      const totalTaxableComp = taxableCompPresent + taxablePrev;
+      const taxDueAnnual = isMwe ? 0 : _computeAnnualTaxFromBir_(totalTaxableComp, birTable);
+
+
+
+      const wtaxPresent = rec.ytdWtax || 0;
+      const totalWtax   = wtaxPresent + wtaxPrev;
+      const variance    = taxDueAnnual - totalWtax;
+
+      // values for each actual PAYROLL_HISTORY component column
+      const componentValues = componentCols.map(ci => rec.ytdComponents[ci] || 0);
+            // values for the non-tax repeat block
+      const nonTaxComponentValues = nonTaxComponentCols.map(ci => rec.ytdComponents[ci] || 0);
+
+
+            rowsForUi.push({
+        empId,
+        empName: meta.name || rec.empName || '',
+        group: meta.group || '',
+        trackingCat1: meta.trackingCat1 || '',
+        trackingCat2: meta.trackingCat2 || '',
+        trackingCat1Label: tc1Label,
+        trackingCat2Label: tc2Label,
+
+        componentValues,
+
+        grossCompPresent,
+                nonTaxComponentValues,
+
+        nonTax13thOtherAnnual,
+        totalNonTaxComp,
+        sssEeMc,
+        sssEeMpf,
+        phEe,
+        piEe,
+        taxableCompPresent,
+
+        taxablePrev,
+        wtaxPrev,
+
+        totalTaxableComp,
+        taxDueAnnual,
+        wtaxPresent,
+        totalWtax,
+        variance
+      });
+    });
+
+    return {
+      componentHeaders,
+      nonTaxComponentHeaders,  
+      rows: rowsForUi
+    };
+  } catch (e) {
+    Logger.log('FinalAnnualizationPreview ERROR: ' + (e.stack || e));
+    throw new Error('FinalAnnualizationPreview ERROR: ' + e.message);
+  }
+}
+
+/**
+ * Create FinalAnnualization_<YYYY> sheet.
+ * - Base columns: ID, Name, Group, TC1, TC2
+ * - Followed by: one column per actual PAYROLL_HISTORY component
+ *   (Basic, Allowances, etc.) ordered by category grouping
+ * - Then summary columns (gross, taxable present, prev, tax due, WTax, variance).
+ */
+function createFinalAnnualizationSheet(form) {
+  try {
+    const parsed = _parseYearMonthFromForm_(form);
+    const year = parsed.year;
+
+    const ss  = SpreadsheetApp.getActiveSpreadsheet();
+    const cfg = _readSettings_();
+
+    const { facts, headers, groupCols, colType } = _buildFinalAnnFacts_(year, cfg);
+    const prevMap = _loadFinalPrevEmployerMap_();
+    const birTable = _loadBirTable_(_mustGetSheet_(ss, 'BIR_TABLE'));
+
+    const { sourceSS } = _openLinkedFiles_(cfg, ss);
+    const master    = _mustGetSheet_(sourceSS, cfg.MASTER_SHEET_NAME);
+    const mVals     = master.getDataRange().getValues();
+    const mHdrs     = mVals[0].map(h => String(h || '').trim());
+    const mRows     = mVals.slice(1);
+
+    const idxEmp      = mHdrs.findIndex(h => /^Employee ID$/i.test(h));
+    const idxName     = mHdrs.findIndex(h => /^Employee Name$/i.test(h));
+    const idxGrp      = mHdrs.findIndex(h => /^Payroll Group$/i.test(h));
+    const idxTc1      = 3;
+    const idxTc2      = 4;
+    const tc1Label    = mHdrs[3] || 'Tracking Category 1';
+    const tc2Label    = mHdrs[4] || 'Tracking Category 2';
+    const idxContract = mHdrs.findIndex(h => /^Contract Type$/i.test(h));
+    const idxStatus   = mHdrs.findIndex(h =>
+      /^Status$/i.test(h) || /Employment Status/i.test(h)
+    );
+
+    const norm_ = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+const findIdxAny_ = (names) => {
+  const wants = (names || []).map(norm_);
+  for (let i = 0; i < mHdrs.length; i++) {
+    const hn = norm_(mHdrs[i]);
+    if (!hn) continue;
+    if (wants.indexOf(hn) >= 0) return i;
+  }
+  return -1;
+};
+
+const idxWithPrev = findIdxAny_(["With Previous Employer", "With Prev Employer", "Previous Employer", "Has Previous Employer"]);
+const idxSepDate  = findIdxAny_(["Separation Date", "Employment To", "End Date", "Date Separated", "Termination Date"]);
+
+const idxMwe      = findIdxAny_(["MWE", "Minimum Wage Earner"]);
+
+const mweTrue_ = (v) => {
+  const s = String(v || '').trim().toUpperCase();
+  return (s === 'TRUE' || s === 'YES' || s === 'Y' || s === '1');
+};
+
+
+    const metaById = new Map();
+    mRows.forEach(r => {
+      const id = String(r[idxEmp] || '').trim();
+      if (!id) return;
+      metaById.set(id, {
+        name:         idxName     > -1 ? String(r[idxName]     || '').trim() : '',
+        group:        idxGrp      > -1 ? String(r[idxGrp]      || '').trim() : '',
+        trackingCat1: idxTc1      > -1 ? String(r[idxTc1]      || '').trim() : '',
+        trackingCat2: idxTc2      > -1 ? String(r[idxTc2]      || '').trim() : '',
+        contractType: idxContract > -1 ? String(r[idxContract] || '').trim() : '',
+        status:       idxStatus   > -1 ? String(r[idxStatus]   || '').trim() : '',
+        withPrevEmployerRaw: (idxWithPrev > -1) ? String(r[idxWithPrev] || '').trim() : '',
+separationDateRaw:   (idxSepDate  > -1) ? String(r[idxSepDate]  || '').trim() : '',
+        mwe: (idxMwe > -1) ? mweTrue_(r[idxMwe]) : false,
+
+
+      });
+    });
+
+    const baseHeaders = [
+      'Employee ID',
+      'Employee Name',
+      'Payroll Group',
+      tc1Label,
+      tc2Label
+    ];
+    const baseCount = baseHeaders.length;
+
+    const allComponentCols = []
+      .concat(groupCols.BASIC || [])
+      .concat(groupCols.DEMINIMIS || [])
+      .concat(groupCols.NONTAX_OTHER || [])
+      .concat(groupCols.TAXABLE || [])
+      .concat(groupCols.OTHER13 || []);
+
+    const componentHeaders = allComponentCols.map(idx => headers[idx]);
+    const compCount = componentHeaders.length;
+
+        // Non-tax repeat block: De Minimis + Non-tax Other components
+    const nonTaxComponentCols = []
+      .concat(groupCols.DEMINIMIS || [])
+      .concat(groupCols.NONTAX_OTHER || []);
+
+    // Prefix to avoid duplicate header names in the sheet
+    const nonTaxComponentHeaders = nonTaxComponentCols.map(idx => '[NON-TAX] ' + headers[idx]);
+    const nonTaxCompCount = nonTaxComponentHeaders.length;
+
+
+const summaryHeaders = []
+  .concat(['Gross Compensation Income – Present Employer'])
+  .concat(nonTaxComponentHeaders) // inserted block
+  .concat([
+    'MWE NON-TAX BASIC PAY',
+    'MWE NON-TAX OVERTIME',
+    'Non-tax 13th + Other (≤90k)',
+    'SSS EE MC (YTD)',
+    'SSS EE MPF (YTD)',
+    'PhilHealth EE (YTD)',
+    'Pag-IBIG EE (YTD)',
+    'Total Non-taxable Compensation Income',
+    'Taxable Compensation Income – Present Employer',
+    'Taxable Compensation Income – Previous Employer',
+    'Total Taxable Compensation Income',
+    'Annual Tax Due',
+    'Taxes Withheld by Previous Employer',
+    'Tax Withheld – Present Employer (YTD)',
+    'Total Tax Withheld (Present + Previous)',
+    'Variance (Tax Due – Total WTax)',
+    '', // spacer
+    'Substituted Filing',
+    'Previous Employer TIN',
+    'Previous Employer Registered Name',
+    'Previous Employer Registered Address',
+    'Previous Employer ZIP Code'
+  ]);
+
+
+    const summaryCount = summaryHeaders.length;
+
+    const sheetHeaders = baseHeaders
+  .concat(componentHeaders)
+  .concat(summaryHeaders)
+  .map(h => String(h || '').toUpperCase());
+
+
+    const sheetName = 'Annualization - ' + year;
+    let sh = ss.getSheetByName(sheetName);
+    if (!sh) sh = ss.insertSheet(sheetName);
+    sh.clear();
+
+    sh.setHiddenGridlines(true);
+
+    sh.appendRow(sheetHeaders);
+
+    const outRows = [];
+
+    facts.forEach((rec, empId) => {
+      const meta = metaById.get(empId) || {};
+      const contractUpper = String(meta.contractType || '').trim().toUpperCase();
+      if (!contractUpper || contractUpper !== 'EMPLOYEE') return;
+
+      const totalBasic       = rec.totalBasic || 0;
+      const totalTaxable     = rec.totalTaxable || 0;
+      const totalDem         = rec.totalDem || 0;
+      const totalNonTaxOther = rec.totalNonTaxOther || 0;
+      const totalOther13     = rec.totalOther13 || 0;
+
+            const grossCompPresent =
+        totalBasic +
+        totalTaxable +
+        totalDem +
+        totalNonTaxOther +
+        totalOther13;
+
+      const nonTax13thOtherAnnual =
+        Math.min(OTHER_BENEFITS_EXEMPT_YTD, Math.max(0, totalOther13));
+
+      const sssEeMc  = rec.ytdSssEeMc || 0;
+      const sssEeMpf = rec.ytdSssEeMpf || 0;
+      const phEe     = rec.ytdPhEe || 0;
+      const piEe     = rec.ytdPiEe || 0;
+
+      let totalNonTaxComp =
+  totalDem +
+  totalNonTaxOther +
+  nonTax13thOtherAnnual +
+  sssEeMc +
+  sssEeMpf +
+  phEe +
+  piEe;
+
+let taxableCompPresent =
+  grossCompPresent - totalNonTaxComp;
+
+// ✅ MWE breakdown columns (so Total Non-tax matches visible parts)
+// MWE NON-TAX BASIC PAY must be BASIC LESS EE CONTRIBUTIONS
+const isMwe = !!meta.mwe;
+
+const eeContribYtd = (sssEeMc + sssEeMpf + phEe + piEe);
+const mweNonTaxBasic = isMwe ? Math.max(0, (totalBasic || 0) - eeContribYtd) : 0;
+
+// OT is shifted only if it was classified as TAXABLE
+const mweNonTaxOvertime = isMwe ? _sumTaxableOvertimeFromHistory_(headers, colType, rec) : 0;
+
+if (isMwe) {
+  totalNonTaxComp += (mweNonTaxBasic + mweNonTaxOvertime);
+  taxableCompPresent = Math.max(0, grossCompPresent - totalNonTaxComp);
+}
+
+
+
+
+      const prev = prevMap.get(empId) || {
+        tin: '',
+        registeredName: '',
+        address: '',
+        zip: '',
+        taxable: 0,
+        wtax: 0
+      };
+
+      const taxablePrev = Number(prev.taxable || 0);
+      const wtaxPrev    = Number(prev.wtax || 0);
+
+      const totalTaxableComp = taxableCompPresent + taxablePrev;
+            const taxDueAnnual = isMwe ? 0 : _computeAnnualTaxFromBir_(totalTaxableComp, birTable);
+
+
+
+      const wtaxPresent = rec.ytdWtax || 0;
+      const totalWtax   = wtaxPresent + wtaxPrev;
+      const variance    = taxDueAnnual - totalWtax;
+
+      const row = new Array(sheetHeaders.length).fill('');
+
+      row[0] = empId;
+      row[1] = meta.name || rec.empName || '';
+      row[2] = meta.group || '';
+      row[3] = meta.trackingCat1 || '';
+      row[4] = meta.trackingCat2 || '';
+
+      for (let i = 0; i < allComponentCols.length; i++) {
+        const histCol = allComponentCols[i];
+        const val = rec.ytdComponents[histCol] || 0;
+        row[baseCount + i] = val;
+      }
+
+            const sIndex = baseCount + compCount;
+
+      let k = 0;
+
+      // 1) Gross
+      row[sIndex + k++] = grossCompPresent;
+
+      // 2) Non-tax repeat components (De Minimis + Non-tax Other)
+for (let i = 0; i < nonTaxComponentCols.length; i++) {
+  const histCol = nonTaxComponentCols[i];
+  row[sIndex + k++] = rec.ytdComponents[histCol] || 0;
+}
+
+// ✅ 2b) MWE Basic + OT breakdown columns
+row[sIndex + k++] = mweNonTaxBasic;
+row[sIndex + k++] = mweNonTaxOvertime;
+
+// 3) Remaining summary numerics
+row[sIndex + k++] = nonTax13thOtherAnnual;
+
+      row[sIndex + k++] = sssEeMc;
+      row[sIndex + k++] = sssEeMpf;
+      row[sIndex + k++] = phEe;
+      row[sIndex + k++] = piEe;
+      row[sIndex + k++] = totalNonTaxComp;
+      row[sIndex + k++] = taxableCompPresent;
+
+      row[sIndex + k++] = taxablePrev;
+row[sIndex + k++] = totalTaxableComp;
+row[sIndex + k++] = taxDueAnnual;
+row[sIndex + k++] = wtaxPrev;     // after Annual Tax Due
+row[sIndex + k++] = wtaxPresent;  // after prev employer WTax
+row[sIndex + k++] = totalWtax;
+row[sIndex + k++] = variance;
+
+
+      // Spacer
+row[sIndex + k++] = '';
+
+// Substituted Filing (USE LOGIC IN ALPHALIST GENERATOR)
+row[sIndex + k++] = (typeof bir1604cDeriveSubsFiling_ === 'function')
+  ? bir1604cDeriveSubsFiling_(meta, year)
+  : '';
+
+// Prev employer info
+row[sIndex + k++] = _sanitizeTin_(prev.tin);
+row[sIndex + k++] = prev.registeredName || '';
+row[sIndex + k++] = prev.address || '';
+row[sIndex + k++] = prev.zip || '';
+
+
+
+      outRows.push(row);
+    });
+
+    if (outRows.length) {
+      sh.getRange(2, 1, outRows.length, outRows[0].length).setValues(outRows);
+    }
+
+    // formatting
+    sh.setFrozenRows(1);
+    sh.setFrozenColumns(2);
+
+    const headerRange = sh.getRange(1, 1, 1, sheetHeaders.length);
+    headerRange
+      .setWrap(true)
+      .setHorizontalAlignment('center')
+      .setVerticalAlignment('middle')
+      .setBackground('#1A237E')
+  .setFontColor('#FFFFFF')
+  .setFontWeight('bold');
+
+    const dataRows = outRows.length;
+if (dataRows > 0) {
+  // 1) Numeric columns: components + first 15 summary cols (Gross..Variance)
+  const firstAmountCol = baseCount + 1;                 // first component col (1-based)
+    const lastNumericCol = baseCount + compCount + (15 + nonTaxCompCount + 2);
+    // through "Variance" (summary #15)
+
+  const numericRange = sh.getRange(2, firstAmountCol, dataRows, lastNumericCol - firstAmountCol + 1);
+  numericRange
+    .setHorizontalAlignment('right')
+    .setNumberFormat('#,##0.00;[Red]-#,##0.00;""');
+
+    // Accounting format overrides for Previous Employer fields
+const acctFmt = '#,##0.00;(#,##0.00);""';
+
+// Find columns by header (robust even if component columns change)
+const hdrRow = sh.getRange(1, 1, 1, sheetHeaders.length).getValues()[0].map(h => String(h || '').trim());
+function _findCol_(name) {
+  const i = hdrRow.findIndex(h => h.toUpperCase() === String(name).toUpperCase());
+  return i >= 0 ? i + 1 : -1; // 1-based
+}
+
+const colTaxablePrev = _findCol_('TAXABLE COMPENSATION INCOME – PREVIOUS EMPLOYER');
+const colWtaxPrev    = _findCol_('TAXES WITHHELD BY PREVIOUS EMPLOYER');
+
+if (colTaxablePrev > 0) sh.getRange(2, colTaxablePrev, dataRows, 1).setNumberFormat(acctFmt);
+if (colWtaxPrev    > 0) sh.getRange(2, colWtaxPrev,    dataRows, 1).setNumberFormat(acctFmt);
+
+
+  // 2) Text columns: spacer + Previous Employer fields (TIN/Name/Address/ZIP)
+    const textStartCol = baseCount + compCount + (15 + nonTaxCompCount + 2) + 1;
+
+      // summary #16 spacer
+  const textColCount = 6;                               // spacer + 4 fields
+
+  const textRange = sh.getRange(2, textStartCol, dataRows, textColCount);
+  textRange
+    .setNumberFormat('@')                               // TEXT => no commas/decimals + preserves leading zeros
+    .setHorizontalAlignment('left');
+
+  // Base columns left-aligned
+  sh.getRange(2, 1, dataRows, baseCount).setHorizontalAlignment('left');
+
+  // Optional widths (adjust as desired)
+  sh.setColumnWidth(1, 90);
+  sh.setColumnWidth(2, 160);
+  sh.setColumnWidth(3, 120);
+  sh.setColumnWidth(4, 130);
+  sh.setColumnWidth(5, 130);
+}
+
+
+    return { sheetName };
+  } catch (e) {
+    Logger.log('FinalAnnualizationSheet ERROR: ' + (e.stack || e));
+    throw new Error('FinalAnnualizationSheet ERROR: ' + e.message);
+  }
+}
+
+/**************************************************
+ * PREVIOUS EMPLOYER HELPERS (USED BY DIALOG)
+ **************************************************/
+
+// ===== Previous Employer Store (Document Properties) =====
+const PREV_EMPLOYER_PROPS_KEY = 'PREV_EMPLOYER_MAP_V1';
+
+function _prevEmployerProps_() {
+  return PropertiesService.getDocumentProperties();
+}
+
+function _readPrevEmployerStore_() {
+  const raw = _prevEmployerProps_().getProperty(PREV_EMPLOYER_PROPS_KEY);
+  if (!raw) return {};
+  try {
+    const obj = JSON.parse(raw);
+    return (obj && typeof obj === 'object') ? obj : {};
+  } catch (e) {
+    return {};
+  }
+}
+
+function _writePrevEmployerStore_(obj) {
+  _prevEmployerProps_().setProperty(PREV_EMPLOYER_PROPS_KEY, JSON.stringify(obj || {}));
+}
+
+function _sanitizeTin_(tin) {
+  // requirement: no commas; preserve leading zeros by keeping as TEXT
+  return String(tin || '').replace(/,/g, '').trim();
+}
+
+function _sanitizeZip_(zip) {
+  return String(zip || '').replace(/,/g, '').trim();
+}
+
+
+function getFinalAnnEmployeeList() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const hist = ss.getSheetByName('PAYROLL_HISTORY');
+  const out = [];
+  if (!hist || hist.getLastRow() < 2) return out;
+
+  const data = hist.getDataRange().getValues();
+  const headers = data[0].map(h => String(h || '').trim());
+  const rows = data.slice(1);
+
+  const idxEmpId   = headers.findIndex(h => /^Employee ID$/i.test(h));
+  const idxEmpName = headers.findIndex(h => /^Employee Name$/i.test(h));
+  if (idxEmpId === -1) return out;
+
+  const seen = new Set();
+  rows.forEach(r => {
+    const empId = String(r[idxEmpId] || '').trim();
+    if (!empId || seen.has(empId)) return;
+    seen.add(empId);
+    const name = idxEmpName > -1 ? String(r[idxEmpName] || '').trim() : '';
+    out.push({ empId, empName: name });
+  });
+
+  out.sort((a, b) => {
+    const nA = (a.empName || '').toUpperCase();
+    const nB = (b.empName || '').toUpperCase();
+    if (nA < nB) return -1;
+    if (nA > nB) return 1;
+    const idA = (a.empId || '').toUpperCase();
+    const idB = (b.empId || '').toUpperCase();
+    if (idA < idB) return -1;
+    if (idA > idB) return 1;
+    return 0;
+  });
+
+  return out;
+}
+
+function getFinalAnnPrevEmployer(empId) {
+  empId = String(empId || '').trim();
+  if (!empId) return null;
+
+  const map = _loadFinalPrevEmployerMap_();
+  const rec = map.get(empId);
+  if (!rec) {
+return {
+  empId,
+  tin: '',
+  registeredName: '',
+  address: '',
+  zip: '',
+  taxable: 0,
+  wtax: 0,
+
+  prevNonTaxGrossCompIncome: 0,
+  prevNonTaxBasicSmw: 0,
+  prevNonTaxHolidayPay: 0,
+  prevNonTaxOvertimePay: 0,
+  prevNonTaxNightDiff: 0,
+  prevNonTaxHazardPay: 0,
+  prevNonTax13thMonth: 0,
+  prevNonTaxDeMinimis: 0,
+  prevNonTaxSssEtc: 0,
+  prevNonTaxSalaries: 0,
+  prevTotalNonTaxCompIncome: 0,
+
+  prevTaxableBasicSalary: 0,
+  prevTaxable13thMonth: 0,
+  prevTaxableSalaries: 0,
+
+  // derived
+  prevTotalTaxable: 0
+};
+
+  }
+  return Object.assign({ empId }, rec);
+}
+
+function getFinalAnnPrevEmployerAll() {
+  const map = _loadFinalPrevEmployerMap_();
+  const out = [];
+  map.forEach(function (rec, empId) {
+    out.push(Object.assign({ empId: empId }, rec));
+  });
+  return out;
+}
+
+
+/**
+ * Upsert PREANN_PREV_EMPLOYER with full header.
+ */
+function saveFinalAnnPrevEmployer(rec) {
+  if (!rec) return;
+  const empId = String(rec.empId || '').trim();
+  if (!empId) throw new Error('Employee ID is required.');
+
+  const store = _readPrevEmployerStore_();
+
+  const taxable = Number(rec.taxable || 0) || 0;
+
+store[empId] = {
+  empId,
+  tin: _sanitizeTin_(rec.tin),
+  registeredName: String(rec.registeredName || '').trim(),
+  address: String(rec.address || '').trim(),
+  zip: _sanitizeZip_(rec.zip),
+
+  // existing (used in computation)
+  taxable: taxable,
+  wtax: Number(rec.wtax || 0) || 0,
+
+  // NEW breakdown
+  prevNonTaxGrossCompIncome: Number(rec.prevNonTaxGrossCompIncome || 0) || 0,
+  prevNonTaxBasicSmw:        Number(rec.prevNonTaxBasicSmw || 0) || 0,
+  prevNonTaxHolidayPay:      Number(rec.prevNonTaxHolidayPay || 0) || 0,
+  prevNonTaxOvertimePay:     Number(rec.prevNonTaxOvertimePay || 0) || 0,
+  prevNonTaxNightDiff:       Number(rec.prevNonTaxNightDiff || 0) || 0,
+  prevNonTaxHazardPay:       Number(rec.prevNonTaxHazardPay || 0) || 0,
+  prevNonTax13thMonth:       Number(rec.prevNonTax13thMonth || 0) || 0,
+  prevNonTaxDeMinimis:       Number(rec.prevNonTaxDeMinimis || 0) || 0,
+  prevNonTaxSssEtc:          Number(rec.prevNonTaxSssEtc || 0) || 0,
+  prevNonTaxSalaries:        Number(rec.prevNonTaxSalaries || 0) || 0,
+  prevTotalNonTaxCompIncome: Number(rec.prevTotalNonTaxCompIncome || 0) || 0,
+
+  prevTaxableBasicSalary:    Number(rec.prevTaxableBasicSalary || 0) || 0,
+  prevTaxable13thMonth:      Number(rec.prevTaxable13thMonth || 0) || 0,
+  prevTaxableSalaries:       Number(rec.prevTaxableSalaries || 0) || 0,
+
+  // derived
+  prevTotalTaxable: taxable
+};
+
+
+  _writePrevEmployerStore_(store);
+  return { empId };
+}
+
+
+function saveFinalAnnPrevEmployerList(list) {
+  if (!Array.isArray(list)) return { updated: 0 };
+
+  const store = _readPrevEmployerStore_();
+  let count = 0;
+
+  list.forEach(rec => {
+    if (!rec) return;
+    const empId = String(rec.empId || '').trim();
+    if (!empId) return;
+
+    const taxable = Number(rec.taxable || 0) || 0;
+
+store[empId] = {
+  empId,
+  tin: _sanitizeTin_(rec.tin),
+  registeredName: String(rec.registeredName || '').trim(),
+  address: String(rec.address || '').trim(),
+  zip: _sanitizeZip_(rec.zip),
+
+  taxable: taxable,
+  wtax: Number(rec.wtax || 0) || 0,
+
+  prevNonTaxGrossCompIncome: Number(rec.prevNonTaxGrossCompIncome || 0) || 0,
+  prevNonTaxBasicSmw:        Number(rec.prevNonTaxBasicSmw || 0) || 0,
+  prevNonTaxHolidayPay:      Number(rec.prevNonTaxHolidayPay || 0) || 0,
+  prevNonTaxOvertimePay:     Number(rec.prevNonTaxOvertimePay || 0) || 0,
+  prevNonTaxNightDiff:       Number(rec.prevNonTaxNightDiff || 0) || 0,
+  prevNonTaxHazardPay:       Number(rec.prevNonTaxHazardPay || 0) || 0,
+  prevNonTax13thMonth:       Number(rec.prevNonTax13thMonth || 0) || 0,
+  prevNonTaxDeMinimis:       Number(rec.prevNonTaxDeMinimis || 0) || 0,
+  prevNonTaxSssEtc:          Number(rec.prevNonTaxSssEtc || 0) || 0,
+  prevNonTaxSalaries:        Number(rec.prevNonTaxSalaries || 0) || 0,
+  prevTotalNonTaxCompIncome: Number(rec.prevTotalNonTaxCompIncome || 0) || 0,
+
+  prevTaxableBasicSalary:    Number(rec.prevTaxableBasicSalary || 0) || 0,
+  prevTaxable13thMonth:      Number(rec.prevTaxable13thMonth || 0) || 0,
+  prevTaxableSalaries:       Number(rec.prevTaxableSalaries || 0) || 0,
+
+  prevTotalTaxable: taxable
+};
+
+    count++;
+  });
+
+  _writePrevEmployerStore_(store);
+  return { updated: count };
+}
+
+
+function debugFinalAnnColTypes() {
+  const ss  = SpreadsheetApp.getActiveSpreadsheet();
+  const cfg = _readSettings_();
+  const year = new Date().getFullYear(); // or hard-code the year
+
+  const result = _buildFinalAnnFacts_(year, cfg);
+  const headers = result.headers || [];
+  const colType = result.colType || [];
+
+  headers.forEach(function (h, i) {
+    Logger.log((i + 1) + ' | ' + h + ' -> ' + colType[i]);
+  });
+}
+
+/**
+ * DEBUG: Final Annualization
+ * - Shows how each PAYROLL_HISTORY column is classified (BASIC / TAXABLE / OTHER13 / etc.)
+ * - Shows per-employee YTD category totals, including totalOther13 and the
+ *   computed Non-tax 13th + Other (≤90k) exactly as the Final sheet does.
+ *
+ * Run this in the library project OR call it via a wrapper in the bound file.
+ * Check the execution Logs.
+ */
+function debugFinalAnnualization() {
+  const ss  = SpreadsheetApp.getActiveSpreadsheet();
+  const cfg = _readSettings_();
+  const year = 2026; // change if you need a specific year
+
+  const result = _buildFinalAnnFacts_(year, cfg);
+  const facts   = result.facts || new Map();
+  const headers = result.headers || [];
+  const colType = result.colType || [];
+  const groupCols = result.groupCols || {};
+
+  Logger.log('==============================');
+  Logger.log('FINAL ANNUALIZATION DEBUG, YEAR ' + year);
+  Logger.log('==============================');
+
+  // 1) Header → Type map (so you can see where BONUS, etc. are going)
+  Logger.log('--- HEADERS / COLUMN TYPES ---');
+  headers.forEach(function (h, i) {
+    Logger.log(
+      (i + 1) + ' | ' + h + ' | type=' + (colType[i] || '')
+    );
+  });
+
+  // 2) GroupCols indices (which columns are treated as OTHER13, etc.)
+  Logger.log('--- GROUP COLS ---');
+  ['BASIC', 'TAXABLE', 'DEMINIMIS', 'NONTAX_OTHER', 'OTHER13'].forEach(function (key) {
+    Logger.log(key + ': [' + (groupCols[key] || []).join(', ') + ']');
+  });
+
+  // 3) Per-employee summary – this matches the logic in getFinalAnnualizationPreview/createFinalAnnualizationSheet
+  Logger.log('--- PER-EMPLOYEE SUMMARY ---');
+  facts.forEach(function (rec, empId) {
+    const totalBasic       = rec.totalBasic       || 0;
+    const totalTaxable     = rec.totalTaxable     || 0;
+    const totalDem         = rec.totalDem         || 0;
+    const totalNonTaxOther = rec.totalNonTaxOther || 0;
+    const totalOther13     = rec.totalOther13     || 0;
+
+    // Same formula as in getFinalAnnualizationPreview/createFinalAnnualizationSheet
+    const nonTax13thOtherAnnual =
+      Math.min(OTHER_BENEFITS_EXEMPT_YTD, Math.max(0, totalOther13));
+
+    const sssEeMc  = rec.ytdSssEeMc  || 0;
+    const sssEeMpf = rec.ytdSssEeMpf || 0;
+    const phEe     = rec.ytdPhEe     || 0;
+    const piEe     = rec.ytdPiEe     || 0;
+    const wtax     = rec.ytdWtax     || 0;
+
+    const grossCompPresent =
+      totalBasic +
+      totalTaxable +
+      totalDem +
+      totalNonTaxOther +
+      totalOther13;
+
+    const totalNonTaxComp =
+      totalDem +
+      totalNonTaxOther +
+      nonTax13thOtherAnnual +
+      sssEeMc +
+      sssEeMpf +
+      phEe +
+      piEe;
+
+    const taxableCompPresent =
+      grossCompPresent - totalNonTaxComp;
+
+    Logger.log(
+      [
+        'EMP=' + empId,
+        'Name=' + (rec.empName || ''),
+        'Basic=' + totalBasic,
+        'Taxable=' + totalTaxable,
+        'Dem=' + totalDem,
+        'NonTaxOther=' + totalNonTaxOther,
+        'Other13=' + totalOther13,
+        'NonTax13th<=90k=' + nonTax13thOtherAnnual,
+        'Gross=' + grossCompPresent,
+        'TotalNonTax=' + totalNonTaxComp,
+        'TaxablePresent=' + taxableCompPresent,
+        'SSS_EE_MC=' + sssEeMc,
+        'SSS_EE_MPF=' + sssEeMpf,
+        'PH_EE=' + phEe,
+        'PI_EE=' + piEe,
+        'WTax YTD=' + wtax
+      ].join(' | ')
+    );
+  });
+}
+
+function debugFinalAnnNonTaxHeaderTrace() {
+  const ss  = SpreadsheetApp.getActiveSpreadsheet();
+  const cfg = _readSettings_();
+
+  const year = 2026; // <-- set year you are testing
+  const hist = ss.getSheetByName('PAYROLL_HISTORY');
+  if (!hist || hist.getLastRow() < 2) throw new Error('No PAYROLL_HISTORY data.');
+
+  const headers = hist.getRange(1,1,1,hist.getLastColumn()).getValues()[0].map(h => String(h||'').trim());
+
+  const componentMap = _buildComponentMap_(cfg);
+
+  Logger.log('==== DEBUG NON-TAX TRACE, YEAR ' + year + ' ====');
+  Logger.log('Header count=' + headers.length);
+
+  headers.forEach((name, i) => {
+    const catRaw = _classifyComponent_(name, componentMap) || '';
+    const key = _canonicalPayrollCategoryKey_(catRaw);
+    if (key === 'DEMINIMIS' || key === 'NONTAX_OTHER' || /NON|MINIMIS/i.test(catRaw)) {
+      Logger.log((i+1) + ' | ' + name + ' | catRaw=' + catRaw + ' | key=' + key);
+    }
+    if (!catRaw && /RICE|LAUNDRY|MED|UNIFORM|DE MINIMIS|MINIMIS/i.test(name)) {
+      Logger.log((i+1) + ' | ' + name + ' | catRaw=<BLANK> (mapping miss)');
+    }
+  });
+}
+function debugFinalAnnNonTaxComponentPresence() {
+  const ss  = SpreadsheetApp.getActiveSpreadsheet();
+  const cfg = _readSettings_();
+  const year = 2026;
+
+  const { facts, headers, groupCols } = _buildFinalAnnFacts_(year, cfg);
+
+  const target = 'NON-TAXABLE ALLOWANCE';
+  const idx = headers.findIndex(h => String(h||'').trim().toUpperCase() === target);
+
+  Logger.log('Target header idx (0-based) = ' + idx);
+  Logger.log('In groupCols.DEMINIMIS? ' + ((groupCols.DEMINIMIS || []).indexOf(idx) !== -1));
+
+  let shown = 0;
+  facts.forEach((rec, empId) => {
+    if (shown >= 5) return;
+    Logger.log(empId + ' => rawYTDComponent=' + (rec.ytdComponents[idx] || 0));
+    shown++;
+  });
+}
+
+function DEBUG_FinalAnnualization_ComponentHeader(headerName) {
+  const ss  = SpreadsheetApp.getActiveSpreadsheet();
+  const cfg = _readSettings_();
+
+  const hist = ss.getSheetByName('PAYROLL_HISTORY');
+  if (!hist) throw new Error('Missing PAYROLL_HISTORY');
+
+  const headers = hist.getRange(1,1,1,hist.getLastColumn()).getValues()[0]
+    .map(h => String(h || '').trim());
+
+  const componentMap = _buildComponentMap_(cfg);
+
+  const target = String(headerName || '').trim();
+  const existsInHistory = headers.includes(target);
+
+  // these helpers are used by FinalAnnualization
+  const mapped = _componentMapGet_(componentMap, target);
+  const inferred = _inferCategoryFromHeader_(target);
+
+  Logger.log('=== DEBUG Final Annualization: Component Header ===');
+  Logger.log('Target=' + JSON.stringify(target));
+  Logger.log('Exists in PAYROLL_HISTORY headers? ' + existsInHistory);
+  Logger.log('_componentMapGet_ result=' + JSON.stringify(mapped));
+  Logger.log('inferred category=' + JSON.stringify(inferred));
+  Logger.log('=> If both mapped+inferred are empty, FinalAnnualization ignores this column.');
+}

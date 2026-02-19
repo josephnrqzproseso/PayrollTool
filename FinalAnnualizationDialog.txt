@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        font-size: 12px;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0 0 8px;
+      }
+      .section {
+        margin-bottom: 8px;
+      }
+      .form-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 6px;
+      }
+      .form-row label {
+        font-size: 11px;
+        display: flex;
+        flex-direction: column;
+      }
+      input[type="number"],
+      input[type="text"],
+      input[type="month"] {
+        font-size: 11px;
+        padding: 3px 4px;
+        min-width: 130px;
+      }
+      select {
+        font-size: 11px;
+        padding: 3px 4px;
+        min-width: 200px;
+      }
+      .btn-bar {
+        margin-top: 6px;
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      button {
+        font-size: 11px;
+        padding: 4px 10px;
+        cursor: pointer;
+      }
+      #status {
+        margin-top: 4px;
+        font-size: 11px;
+        color: #555;
+      }
+      #summary {
+        margin-top: 4px;
+        font-size: 11px;
+        font-weight: bold;
+      }
+
+      /* TABLE LAYOUT (similar to Pre-Annualization) */
+      #tableWrapper {
+        margin-top: 8px;
+        max-height: 320px;
+        overflow: auto;
+        border: 1px solid #ddd;
+        position: relative;
+      }
+      table {
+        border-collapse: collapse;
+        width: 100%;
+        font-size: 11px;
+      }
+      th, td {
+        border: 1px solid #ddd;
+        padding: 3px 4px;
+        white-space: normal;
+      }
+      #previewTable thead th {
+        position: sticky;
+        top: 0;
+        background: #f3f3f3;
+        text-align: center;
+        vertical-align: middle;
+        z-index: 6;
+      }
+      td.num {
+        text-align: right;
+      }
+      .sticky-header {
+        position: sticky;
+        top: 0;
+        background: #fff;
+        z-index: 3;
+        padding-bottom: 4px;
+      }
+
+      #prevTableWrapper {
+  margin-top: 4px;
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid #ddd;
+}
+#prevTable {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 11px;
+}
+#prevTable th,
+#prevTable td {
+  border: 1px solid #ddd;
+  padding: 2px 4px;
+  white-space: nowrap;
+}
+#prevTable th {
+  background: #f3f3f3;
+  text-align: left;
+}
+#prevTable td input,
+#prevTable td select {
+  width: 100%;
+  box-sizing: border-box;
+  font-size: 11px;
+  padding: 2px 3px;
+}
+.prev-row-remove {
+  font-size: 10px;
+  padding: 2px 4px;
+}
+
+
+            /* Freeze first 2 columns (Employee ID + Employee Name) */
+      #previewTable th.freeze-col-0,
+      #previewTable td.freeze-col-0,
+      #previewTable th.freeze-col-1,
+      #previewTable td.freeze-col-1 {
+        position: sticky;
+        background: #fff;
+        z-index: 4;
+        white-space: nowrap;      /* prevents header wrap like "Emp I" */
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /* column widths (prevents overlap) */
+      #previewTable th.freeze-col-0,
+      #previewTable td.freeze-col-0 {
+        left: 0;
+        min-width: 90px;
+        max-width: 90px;
+      }
+
+      #previewTable th.freeze-col-1,
+      #previewTable td.freeze-col-1 {
+        left: var(--fcol1-left, 90px);  /* set by JS based on col-0 width */
+        min-width: 200px;
+        max-width: 320px;
+      }
+
+      /* Ensure frozen HEADER cells stay above other sticky header cells */
+      #previewTable thead th.freeze-col-0,
+      #previewTable thead th.freeze-col-1 {
+        background: #f3f3f3; /* match header bg */
+        z-index: 10;
+      }
+
+
+      .subsection-title {
+        font-size: 12px;
+        font-weight: bold;
+        margin: 8px 0 4px;
+        border-bottom: 1px solid #ccc;
+        padding-bottom: 2px;
+      }
+      .small-note {
+        font-size: 10px;
+        color: #666;
+      }
+      input.prev-field {
+        font-size: 11px;
+        padding: 2px 4px;
+        box-sizing: border-box;
+      }
+      .prev-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 4px 10px;
+        margin-top: 4px;
+      }
+      .prev-grid label span {
+        font-size: 11px;
+      }
+
+            /* Toast notification */
+      .toast {
+        position: fixed;
+        right: 16px;
+        bottom: 16px;
+        min-width: 220px;
+        max-width: 360px;
+        background: #323232;
+        color: #fff;
+        font-size: 11px;
+        padding: 8px 10px;
+        border-radius: 4px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+        opacity: 0;
+        pointer-events: none;
+        transform: translateY(20px);
+        transition: opacity 0.25s ease-out, transform 0.25s ease-out;
+        z-index: 9999;
+      }
+      .toast.show {
+        opacity: 1;
+        pointer-events: auto;
+        transform: translateY(0);
+      }
+      .toast--success {
+        background: #2e7d32;
+      }
+      .toast--error {
+        background: #b00020;
+      }
+
+/* ✅ Brand logo INSIDE modal (sticky bottom, does not overlay scrollbar) */
+.brand-sticky-bottom{
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;  /* lower-right */
+  padding: 8px 0 2px;
+  background: #fff;
+}
+
+
+    </style>
+    <?!= include_('UiTheme'); ?>
+  </head>
+  <body>
+    <h1>Annualization</h1>
+    <!-- FINAL ANNUALIZATION PREVIEW -->
+    <div class="section sticky-header">
+      <div class="form-row">
+        <label>
+          Payroll Year (YYYY)
+          <input type="number" id="yearInput" min="2000" max="2100">
+        </label>
+      </div>
+
+      <div class="btn-bar">
+        <button type="button" id="btnPreview" onclick="onPreview()">Preview Final Annualization</button>
+        <button type="button" id="btnGenerate" onclick="onGenerate()">Generate Final Annualization Sheet</button>
+        <button type="button" onclick="google.script.host.close()">Close</button>
+      </div>
+
+      <div id="status"></div>
+      <div id="summary"></div>
+    </div>
+
+    <div id="tableWrapper">
+      <table id="previewTable"></table>
+    </div>
+
+    <!-- PREVIOUS EMPLOYER SECTION (LIST / TABLE) -->
+    <div class="section">
+      <div class="subsection-title">Previous Employer Information</div>
+      <div class="small-note">
+        Stored in this file’s <b>Document Properties</b> (key: <b>PREV_EMPLOYER_MAP_V1</b>) and used for both Pre-Annualization and Final Annualization.
+
+      </div>
+
+      <div class="btn-bar" style="margin-top:4px; margin-bottom:4px;">
+        <button type="button" onclick="addPrevLine()">Add Line</button>
+        <button type="button" onclick="onSavePrevEmployerList()">Save / Update All</button>
+        <span id="prevStatus" class="small-note"></span>
+      </div>
+
+      <div id="prevTableWrapper">
+        <table id="prevTable"></table>
+      </div>
+    </div>
+
+    <div class="brand-sticky-bottom">
+  <?!= include_('BrandWatermarkInline'); ?>
+</div>
+
+    <script>
+      
+
+            var employeeList = [];
+      var toastTimer = null;
+
+function toCaps(v) {
+  return String(v == null ? '' : v).toUpperCase();
+}
+
+
+      function showToast(message, type) {
+        var el = document.getElementById('toast');
+        if (!el) return;
+
+        el.textContent = message || '';
+
+        // reset class
+        el.className = 'toast';
+        if (type === 'success') el.className += ' toast--success';
+        if (type === 'error')   el.className += ' toast--error';
+
+        el.classList.add('show');
+
+        if (toastTimer) clearTimeout(toastTimer);
+        toastTimer = setTimeout(function () {
+          el.classList.remove('show');
+        }, 4000);
+      }
+
+
+      (function init() {
+        var now = new Date();
+        document.getElementById('yearInput').value = now.getFullYear();
+
+        google.script.run
+          .withSuccessHandler(populateEmployeeDropdown)
+          .getFinalAnnEmployeeList();
+      })();
+
+      function setBusy(isBusy, msg) {
+        document.getElementById('btnPreview').disabled = isBusy;
+        document.getElementById('btnGenerate').disabled = isBusy;
+        document.getElementById('status').textContent = msg || '';
+      }
+
+      function formatNumber(v) {
+        var n = Number(String(v).replace(/,/g, ''));
+        if (isNaN(n)) return v;
+        return n.toLocaleString('en-PH', {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2
+        });
+      }
+
+      function getFormData() {
+        var yearVal = document.getElementById('yearInput').value;
+        var year = Number(yearVal) || new Date().getFullYear();
+        // Reuse parser: YYYY-12 = whole year
+        return {
+          payrollMonth: year + '-12'
+        };
+      }
+
+      function onPreview() {
+        setBusy(true, 'Generating final annualization preview...');
+        var form = getFormData();
+        google.script.run
+          .withSuccessHandler(function (res) {
+            setBusy(false, '');
+            renderPreview(res || { componentHeaders: [], rows: [] });
+          })
+                    .withFailureHandler(function (err) {
+            setBusy(false, '');
+            var msg = (err && err.message ? err.message : err);
+            showToast('Error generating final annualization preview: ' + msg, 'error');
+          })
+
+          .getFinalAnnualizationPreview(form);
+      }
+
+      function onGenerate() {
+        setBusy(true, 'Creating Final Annualization sheet...');
+        var form = getFormData();
+
+        google.script.run
+          .withSuccessHandler(function (info) {
+            setBusy(false, '');
+            var name = info && info.sheetName ? info.sheetName : '(unknown)';
+            showToast('Final Annualization sheet created: ' + name, 'success');
+          })
+          .withFailureHandler(function (err) {
+            setBusy(false, '');
+            var msg = (err && err.message ? err.message : err);
+            showToast('Error creating Final Annualization sheet: ' + msg, 'error');
+          })
+          .createFinalAnnualizationSheet(form);
+      }
+
+
+      function renderPreview(res) {
+        var table = document.getElementById('previewTable');
+        var summary = document.getElementById('summary');
+
+        var rows = res && res.rows ? res.rows : [];
+        var componentHeaders = res && res.componentHeaders ? res.componentHeaders : [];
+                var nonTaxComponentHeaders = res && res.nonTaxComponentHeaders ? res.nonTaxComponentHeaders : [];
+
+
+        if (!rows.length) {
+          table.innerHTML = '';
+          summary.textContent = 'No data found for this payroll year.';
+          return;
+        }
+
+        var tc1Label = 'Tracking Category 1';
+        var tc2Label = 'Tracking Category 2';
+        if (rows[0]) {
+          if (rows[0].trackingCat1Label) tc1Label = rows[0].trackingCat1Label;
+          if (rows[0].trackingCat2Label) tc2Label = rows[0].trackingCat2Label;
+        }
+
+        summary.textContent =
+          'Employees in final annualization (Contract Type = Employee only): ' + rows.length;
+
+        var baseHeaders = [
+          'Employee ID',
+          'Employee Name',
+          'Payroll Group',
+          tc1Label,
+          tc2Label
+        ];
+
+var summaryHeaders = []
+  .concat(['Gross Compensation – Present'])
+  .concat(nonTaxComponentHeaders.map(function (h) { return '[NON-TAX] ' + h; }))
+  .concat([
+    'Non-tax 13th+Other (≤90k)',
+    'Total Non-taxable Compensation Income',
+    'Taxable Comp – Present',
+    'Taxable Comp – Previous',
+    'Total Taxable Compensation',
+    'Annual Tax Due',
+    'Taxes Withheld by Previous Employer',
+    'Tax Withheld – Present (YTD)',
+    'Total Tax Withheld',
+    'Variance (Tax Due – Total WTax)'
+  ]);
+
+
+
+        var html = '<thead><tr>';
+        var colIdx = 0;
+
+        baseHeaders.forEach(function (h) {
+          var cls = 'col-' + colIdx;
+          if (colIdx === 0) cls += ' freeze-col-0';
+          if (colIdx === 1) cls += ' freeze-col-1';
+          html += '<th class="' + cls + '">' + toCaps(h) + '</th>';
+
+          colIdx++;
+        });
+
+        componentHeaders.forEach(function (h) {
+          var cls = 'col-' + colIdx;
+          html += '<th class="' + cls + '">' + toCaps(h) + '</th>';
+
+          colIdx++;
+        });
+
+        summaryHeaders.forEach(function (h) {
+          var cls = 'col-' + colIdx;
+          html += '<th class="' + cls + '">' + toCaps(h) + '</th>';
+
+          colIdx++;
+        });
+
+        html += '</tr></thead><tbody>';
+
+        rows.forEach(function (r) {
+          html += '<tr>';
+
+          var currentCol = 0;
+
+          function tdText(val, numeric) {
+            if (val == null) val = '';
+            var cls = 'col-' + currentCol;
+            if (currentCol === 0) cls += ' freeze-col-0';
+            if (currentCol === 1) cls += ' freeze-col-1';
+            if (numeric) cls += ' num';
+            var display = val;
+            if (numeric && val !== '') display = formatNumber(val);
+            html += '<td class="' + cls + '">' + display + '</td>';
+            currentCol++;
+          }
+
+          // base columns
+          tdText(r.empId, false);
+          tdText(r.empName, false);
+          tdText(r.group, false);
+          tdText(r.trackingCat1, false);
+          tdText(r.trackingCat2, false);
+
+          // component columns (actual PAYROLL_HISTORY headers)
+          var compVals = r.componentValues || [];
+          componentHeaders.forEach(function (_, idx) {
+            tdText(compVals[idx] || 0, true);
+          });
+
+                    // summary columns
+          tdText(r.grossCompPresent, true);
+
+          // inserted: non-tax repeat block
+          var ntVals = r.nonTaxComponentValues || [];
+          nonTaxComponentHeaders.forEach(function (_, idx) {
+            tdText(ntVals[idx] || 0, true);
+          });
+
+          tdText(r.nonTax13thOtherAnnual, true);
+          tdText(r.totalNonTaxComp, true);
+          tdText(r.taxableCompPresent, true);
+          tdText(r.taxablePrev, true);
+          tdText(r.totalTaxableComp, true);
+tdText(r.taxDueAnnual, true);
+tdText(r.wtaxPrev, true);      // Taxes Withheld by Previous Employer (AFTER Annual Tax Due)
+tdText(r.wtaxPresent, true);   // Tax Withheld – Present (YTD)
+tdText(r.totalWtax, true);
+tdText(r.variance, true);
+
+
+
+          html += '</tr>';
+        });
+
+        html += '</tbody>';
+        table.innerHTML = html;
+
+                // run twice to allow browser to finish table layout
+        requestAnimationFrame(adjustFrozenOffsets);
+        setTimeout(adjustFrozenOffsets, 50);
+
+      }
+
+      // Align name column with actual ID width
+            function adjustFrozenOffsets() {
+        var table = document.getElementById('previewTable');
+        if (!table) return;
+
+        var th0 = table.querySelector('thead tr th.col-0');
+        if (!th0) return;
+
+        // Use ceil to avoid sub-pixel rounding overlap
+        var w0 = Math.ceil(th0.getBoundingClientRect().width || 0);
+        if (w0 <= 0) w0 = 90;
+
+        table.style.setProperty('--fcol1-left', w0 + 'px');
+      }
+
+      // keep offsets correct on resize
+      window.addEventListener('resize', function () {
+        setTimeout(adjustFrozenOffsets, 0);
+      });
+
+
+      /******** PREVIOUS EMPLOYER SECTION ********/
+
+            // Called once from init(): load employees, then load all prev-employer rows
+      function populateEmployeeDropdown(list) {
+        employeeList = list || [];
+
+        google.script.run
+          .withSuccessHandler(function (prevList) {
+            buildPrevEmployerTable(prevList || []);
+          })
+          .getFinalAnnPrevEmployerAll();
+      }
+
+      function buildPrevEmployerTable(prevList) {
+        var table = document.getElementById('prevTable');
+        if (!table) return;
+
+        var headerHtml =
+  '<thead><tr>' +
+  '<th>Employee Name</th>' +
+  '<th>Employee ID</th>' +
+  '<th>Previous Employer TIN</th>' +
+  '<th>Registered Name</th>' +
+  '<th>Registered Address</th>' +
+  '<th>ZIP Code</th>' +
+  '<th>Taxable Compensation Income (used in computation)</th>' +
+  '<th>Taxes Withheld by Previous Employer</th>' +
+
+  '<th>Gross Compensation Income</th>' +
+  '<th>Basic/Statutory Minimum Wage</th>' +
+  '<th>Holiday Pay</th>' +
+  '<th>Overtime Pay</th>' +
+  '<th>Night Shift Differential</th>' +
+  '<th>Hazard Pay</th>' +
+  '<th>Non-taxable 13th Month + Other Benefits</th>' +
+  '<th>De Minimis Benefits</th>' +
+  '<th>SSS/GSIS/PAG-IBIG/Union Dues</th>' +
+  '<th>Salaries & Other Compensation</th>' +
+  '<th>Total Non-taxable Compensation Income</th>' +
+  '<th>Taxable Basic Salary</th>' +
+  '<th>Taxable 13th Month + Other Benefits</th>' +
+  '<th>Taxable Salaries & Other Compensation</th>' +
+
+  '<th>Total Taxable Compensation Income (auto)</th>' +  // mirrors taxable
+  '<th></th>' +
+  '</tr></thead><tbody></tbody>';
+
+
+        table.innerHTML = headerHtml;
+        var tbody = table.querySelector('tbody');
+
+        if (prevList && prevList.length) {
+          prevList.forEach(function (rec) {
+            appendPrevRow(tbody, rec);
+          });
+        } else {
+          // at least one blank line
+          appendPrevRow(tbody, null);
+        }
+      }
+
+      function appendPrevRow(tbody, rec) {
+        rec = rec || {};
+        var tr = document.createElement('tr');
+
+        // Employee Name (dropdown)
+        var tdEmp = document.createElement('td');
+        var sel = document.createElement('select');
+        sel.className = 'prev-emp-select';
+        var optEmpty = document.createElement('option');
+        optEmpty.value = '';
+        optEmpty.textContent = '-- select --';
+        sel.appendChild(optEmpty);
+        (employeeList || []).forEach(function (e) {
+          var o = document.createElement('option');
+          o.value = e.empId;
+          o.textContent = (e.empName || '') + ' (' + e.empId + ')';
+          sel.appendChild(o);
+        });
+        if (rec.empId) sel.value = rec.empId;
+        tdEmp.appendChild(sel);
+        tr.appendChild(tdEmp);
+
+        // Employee ID (readonly)
+        var tdId = document.createElement('td');
+        var idInput = document.createElement('input');
+        idInput.type = 'text';
+        idInput.className = 'prev-emp-id';
+        idInput.readOnly = true;
+        idInput.value = rec.empId || '';
+        tdId.appendChild(idInput);
+        tr.appendChild(tdId);
+
+        function makeInputTd(className, value) {
+          var td = document.createElement('td');
+          var inp = document.createElement('input');
+          inp.type = 'text';
+          inp.className = className;
+          inp.value = (value != null ? value : '');
+          td.appendChild(inp);
+          return td;
+        }
+
+        function makeNumberTd(className, value, readOnly) {
+  var td = document.createElement('td');
+  var inp = document.createElement('input');
+  inp.type = 'number';
+  inp.step = '0.01';
+  inp.className = className;
+  inp.value = (value != null ? value : '');
+  if (readOnly) inp.readOnly = true;
+  td.appendChild(inp);
+  return td;
+}
+
+
+        tr.appendChild(makeInputTd('prev-tin',  rec.tin || ''));
+        tr.appendChild(makeInputTd('prev-name', rec.registeredName || ''));
+        tr.appendChild(makeInputTd('prev-addr', rec.address || ''));
+        tr.appendChild(makeInputTd('prev-zip',  rec.zip || ''));
+        var tdTaxable = makeNumberTd('prev-taxable', rec.taxable != null ? rec.taxable : '', false);
+var taxableInp = tdTaxable.querySelector('input');
+tr.appendChild(tdTaxable);
+
+tr.appendChild(makeNumberTd('prev-wtax', rec.wtax != null ? rec.wtax : '', false));
+tr.appendChild(makeNumberTd('prev-nt-gross', rec.prevNonTaxGrossCompIncome != null ? rec.prevNonTaxGrossCompIncome : '', false));
+tr.appendChild(makeNumberTd('prev-nt-basic', rec.prevNonTaxBasicSmw != null ? rec.prevNonTaxBasicSmw : '', false));
+tr.appendChild(makeNumberTd('prev-nt-hol',   rec.prevNonTaxHolidayPay != null ? rec.prevNonTaxHolidayPay : '', false));
+tr.appendChild(makeNumberTd('prev-nt-ot',    rec.prevNonTaxOvertimePay != null ? rec.prevNonTaxOvertimePay : '', false));
+tr.appendChild(makeNumberTd('prev-nt-nd',    rec.prevNonTaxNightDiff != null ? rec.prevNonTaxNightDiff : '', false));
+tr.appendChild(makeNumberTd('prev-nt-haz',   rec.prevNonTaxHazardPay != null ? rec.prevNonTaxHazardPay : '', false));
+tr.appendChild(makeNumberTd('prev-nt-13th',  rec.prevNonTax13thMonth != null ? rec.prevNonTax13thMonth : '', false));
+tr.appendChild(makeNumberTd('prev-nt-dem',   rec.prevNonTaxDeMinimis != null ? rec.prevNonTaxDeMinimis : '', false));
+tr.appendChild(makeNumberTd('prev-nt-sss',   rec.prevNonTaxSssEtc != null ? rec.prevNonTaxSssEtc : '', false));
+tr.appendChild(makeNumberTd('prev-nt-sal',   rec.prevNonTaxSalaries != null ? rec.prevNonTaxSalaries : '', false));
+tr.appendChild(makeNumberTd('prev-nt-total', rec.prevTotalNonTaxCompIncome != null ? rec.prevTotalNonTaxCompIncome : '', false));
+
+tr.appendChild(makeNumberTd('prev-tx-basic', rec.prevTaxableBasicSalary != null ? rec.prevTaxableBasicSalary : '', false));
+tr.appendChild(makeNumberTd('prev-tx-13th',  rec.prevTaxable13thMonth != null ? rec.prevTaxable13thMonth : '', false));
+tr.appendChild(makeNumberTd('prev-tx-sal',   rec.prevTaxableSalaries != null ? rec.prevTaxableSalaries : '', false));
+var tdAuto = makeNumberTd('prev-total-taxable-auto', (rec.taxable != null ? rec.taxable : ''), true);
+var autoInp = tdAuto.querySelector('input');
+tr.appendChild(tdAuto);
+
+if (taxableInp && autoInp) {
+  autoInp.value = taxableInp.value || '';
+  taxableInp.addEventListener('input', function () {
+    autoInp.value = taxableInp.value || '';
+  });
+}
+
+
+        var tdRemove = document.createElement('td');
+        var btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'prev-row-remove';
+        btn.textContent = 'X';
+        btn.onclick = function () {
+          removePrevRow(btn);
+        };
+        tdRemove.appendChild(btn);
+        tr.appendChild(tdRemove);
+
+        // link dropdown → Employee ID
+        sel.onchange = function () {
+          idInput.value = sel.value || '';
+        };
+
+        tbody.appendChild(tr);
+      }
+
+      function addPrevLine() {
+        var table = document.getElementById('prevTable');
+        if (!table) return;
+        var tbody = table.querySelector('tbody');
+        if (!tbody) return;
+        appendPrevRow(tbody, null);
+      }
+
+      function removePrevRow(btn) {
+        var tr = btn && btn.closest('tr');
+        if (!tr) return;
+        var tbody = tr.parentNode;
+        tbody.removeChild(tr);
+        // always keep at least one line
+        if (!tbody.rows.length) {
+          appendPrevRow(tbody, null);
+        }
+      }
+
+      function onSavePrevEmployerList() {
+        var table = document.getElementById('prevTable');
+        if (!table) return;
+        var tbody = table.querySelector('tbody');
+        if (!tbody) return;
+
+        var rows = Array.prototype.slice.call(tbody.rows);
+        var list = [];
+
+        for (var i = 0; i < rows.length; i++) {
+          var tr = rows[i];
+          var sel = tr.querySelector('.prev-emp-select');
+          var empIdField = tr.querySelector('.prev-emp-id');
+
+          var empId = (empIdField && empIdField.value || '').trim();
+          var selVal = (sel && sel.value || '').trim();
+
+          // if both empty, skip line
+          if (!empId && !selVal) continue;
+
+          var finalEmpId = empId || selVal;
+          if (!finalEmpId) continue;
+
+          var taxableRaw = (tr.querySelector('.prev-taxable').value || '').replace(/,/g, '');
+          var wtaxRaw    = (tr.querySelector('.prev-wtax').value || '').replace(/,/g, '');
+          var taxable = Number(taxableRaw || 0);
+          var wtax    = Number(wtaxRaw || 0);
+
+          function readNum(selector) {
+  var el = tr.querySelector(selector);
+  var raw = (el && el.value ? el.value : '').replace(/,/g, '');
+  var n = Number(raw || 0);
+  return isNaN(n) ? null : n;
+}
+
+var prevNonTaxGrossCompIncome = readNum('.prev-nt-gross');
+var prevNonTaxBasicSmw        = readNum('.prev-nt-basic');
+var prevNonTaxHolidayPay      = readNum('.prev-nt-hol');
+var prevNonTaxOvertimePay     = readNum('.prev-nt-ot');
+var prevNonTaxNightDiff       = readNum('.prev-nt-nd');
+var prevNonTaxHazardPay       = readNum('.prev-nt-haz');
+var prevNonTax13thMonth       = readNum('.prev-nt-13th');
+var prevNonTaxDeMinimis       = readNum('.prev-nt-dem');
+var prevNonTaxSssEtc          = readNum('.prev-nt-sss');
+var prevNonTaxSalaries        = readNum('.prev-nt-sal');
+var prevTotalNonTaxCompIncome = readNum('.prev-nt-total');
+
+var prevTaxableBasicSalary    = readNum('.prev-tx-basic');
+var prevTaxable13thMonth      = readNum('.prev-tx-13th');
+var prevTaxableSalaries       = readNum('.prev-tx-sal');
+
+var anyNull =
+  prevNonTaxGrossCompIncome == null ||
+  prevNonTaxBasicSmw == null ||
+  prevNonTaxHolidayPay == null ||
+  prevNonTaxOvertimePay == null ||
+  prevNonTaxNightDiff == null ||
+  prevNonTaxHazardPay == null ||
+  prevNonTax13thMonth == null ||
+  prevNonTaxDeMinimis == null ||
+  prevNonTaxSssEtc == null ||
+  prevNonTaxSalaries == null ||
+  prevTotalNonTaxCompIncome == null ||
+  prevTaxableBasicSalary == null ||
+  prevTaxable13thMonth == null ||
+  prevTaxableSalaries == null;
+
+if (anyNull) {
+  alert('Row ' + (i + 1) + ': One or more breakdown fields are not numeric.');
+  return;
+}
+
+
+          if (isNaN(taxable) || isNaN(wtax)) {
+            alert('Row ' + (i + 1) + ': Taxable and Taxes Withheld must be numeric.');
+            return;
+          }
+
+          list.push({
+  empId: finalEmpId,
+  tin: (tr.querySelector('.prev-tin').value || ''),
+  registeredName: (tr.querySelector('.prev-name').value || ''),
+  address: (tr.querySelector('.prev-addr').value || ''),
+  zip: (tr.querySelector('.prev-zip').value || ''),
+  taxable: taxable,
+  wtax: wtax,
+
+  prevNonTaxGrossCompIncome: prevNonTaxGrossCompIncome,
+  prevNonTaxBasicSmw: prevNonTaxBasicSmw,
+  prevNonTaxHolidayPay: prevNonTaxHolidayPay,
+  prevNonTaxOvertimePay: prevNonTaxOvertimePay,
+  prevNonTaxNightDiff: prevNonTaxNightDiff,
+  prevNonTaxHazardPay: prevNonTaxHazardPay,
+  prevNonTax13thMonth: prevNonTax13thMonth,
+  prevNonTaxDeMinimis: prevNonTaxDeMinimis,
+  prevNonTaxSssEtc: prevNonTaxSssEtc,
+  prevNonTaxSalaries: prevNonTaxSalaries,
+  prevTotalNonTaxCompIncome: prevTotalNonTaxCompIncome,
+
+  prevTaxableBasicSalary: prevTaxableBasicSalary,
+  prevTaxable13thMonth: prevTaxable13thMonth,
+  prevTaxableSalaries: prevTaxableSalaries
+});
+
+        }
+
+        if (!list.length) {
+          alert('Nothing to save.');
+          return;
+        }
+
+        var statusEl = document.getElementById('prevStatus');
+        statusEl.textContent = 'Saving...';
+
+        google.script.run
+          .withSuccessHandler(function (res) {
+            var cnt = res && typeof res.updated === 'number' ? res.updated : list.length;
+            statusEl.textContent = 'Saved ' + cnt + ' record(s).';
+          })
+                    .withFailureHandler(function (err) {
+            setBusy(false, '');
+            var msg = (err && err.message ? err.message : err);
+            showToast('Error generating final annualization preview: ' + msg, 'error');
+          })
+
+          .saveFinalAnnPrevEmployerList(list);
+      }
+
+
+      function onEmployeeChange() {
+        var empId = document.getElementById('empSelect').value;
+        document.getElementById('prevStatus').textContent = '';
+        clearPrevFields();
+
+        document.getElementById('prevEmpId').value = empId || '';
+
+        if (!empId) return;
+
+        google.script.run
+          .withSuccessHandler(fillPrevFields)
+          .getFinalAnnPrevEmployer(empId);
+      }
+
+      function clearPrevFields() {
+        document.getElementById('prevTin').value = '';
+        document.getElementById('prevName').value = '';
+        document.getElementById('prevAddr').value = '';
+        document.getElementById('prevZip').value = '';
+        document.getElementById('prevTaxable').value = '';
+        document.getElementById('prevWtax').value = '';
+      }
+
+      function fillPrevFields(rec) {
+        if (!rec) return;
+        document.getElementById('prevTin').value  = rec.tin || '';
+        document.getElementById('prevName').value = rec.registeredName || '';
+        document.getElementById('prevAddr').value = rec.address || '';
+        document.getElementById('prevZip').value  = rec.zip || '';
+        document.getElementById('prevTaxable').value =
+          rec.taxable != null && rec.taxable !== '' ? formatNumber(rec.taxable) : '';
+        document.getElementById('prevWtax').value =
+          rec.wtax != null && rec.wtax !== '' ? formatNumber(rec.wtax) : '';
+      }
+
+      function onSavePrevEmployer() {
+        var empId = document.getElementById('empSelect').value;
+        if (!empId) {
+          alert('Select an employee first.');
+          return;
+        }
+
+        var taxableRaw = (document.getElementById('prevTaxable').value || '').replace(/,/g, '');
+        var wtaxRaw    = (document.getElementById('prevWtax').value || '').replace(/,/g, '');
+        var taxable = Number(taxableRaw || 0);
+        var wtax    = Number(wtaxRaw || 0);
+
+        if (isNaN(taxable) || isNaN(wtax)) {
+          alert('Taxable and WTax must be numeric.');
+          return;
+        }
+
+        var payload = {
+          empId: empId,
+          tin: document.getElementById('prevTin').value || '',
+          registeredName: document.getElementById('prevName').value || '',
+          address: document.getElementById('prevAddr').value || '',
+          zip: document.getElementById('prevZip').value || '',
+          taxable: taxable,
+          wtax: wtax
+        };
+
+        document.getElementById('prevStatus').textContent = 'Saving...';
+
+        google.script.run
+          .withSuccessHandler(function () {
+            document.getElementById('prevStatus').textContent =
+              'Saved. Re-run Preview to see updated final annualization.';
+          })
+                    .withFailureHandler(function (err) {
+            setBusy(false, '');
+            var msg = (err && err.message ? err.message : err);
+            showToast('Error generating final annualization preview: ' + msg, 'error');
+          })
+
+          .saveFinalAnnPrevEmployer(payload);
+      }
+    </script>
+        <!-- Toast container -->
+    <div id="toast" class="toast"></div>
+
+
+  </body>
+</html>

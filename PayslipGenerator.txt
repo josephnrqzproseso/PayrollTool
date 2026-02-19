@@ -1,0 +1,2865 @@
+/****************************************************
+ * PAYSLIP GENERATOR (Standalone Module) — Batched (No Triggers)
+ * --------------------------------------------------------------
+ * - Uses _PayslipTemplate sheet with {{TAGS}}
+ * - Pulls data from Payroll Computation, Masterfile, and Inputs
+ * - Exports validated PDF payslips (never HTML/.gdoc)
+ * - Dynamic selection + Preview
+ * - Resumable via _resumePayslipRun_() (no time-based triggers)
+ ****************************************************/
+
+function debugPayslipAccess(folderIdOrUrl) {
+  const cfg = _readSettings_();
+  const folderId = _parseFolderId_(folderIdOrUrl);
+
+  Logger.log('Folder name: ' + DriveApp.getFolderById(folderId).getName());
+  Logger.log('Source SS name: ' + SpreadsheetApp.openById(cfg.SOURCE_SS_ID).getName());
+  Logger.log('Inputs SS name: ' + SpreadsheetApp.openById(cfg.INPUTS_SS_ID).getName());
+}
+
+// =========================
+// Payslip CHECK batching
+// =========================
+
+const PAYSLIP_CHECK_PROGRESS_KEY   = 'PAYSLIP_CHECK_PROGRESS_V1';
+const PAYSLIP_CHECK_RUN_STATE_KEY  = 'PAYSLIP_CHECK_RUN_STATE_V1';
+
+
+
+function _resetPayslipCheckProgress_() {
+  CacheService.getDocumentCache().remove(PAYSLIP_CHECK_PROGRESS_KEY);
+}
+function _updatePayslipCheckProgress_(percent, message) {
+  const progress = { percent, message, timestamp: Date.now() };
+  CacheService.getDocumentCache().put(PAYSLIP_CHECK_PROGRESS_KEY, JSON.stringify(progress), 3600);
+}
+function getPayslipCheckProgress() {
+  const data = CacheService.getDocumentCache().get(PAYSLIP_CHECK_PROGRESS_KEY);
+  return data ? JSON.parse(data) : { percent: 0, message: 'Initializing review...' };
+}
+
+
+
+function _collectTemplateTagCells_(templateSheet) {
+  const vals = templateSheet.getDataRange().getDisplayValues();
+  const cells = [];
+  for (let r = 0; r < vals.length; r++) {
+    for (let c = 0; c < vals[r].length; c++) {
+      const v = vals[r][c];
+      if (typeof v === 'string' && v.indexOf('{{') !== -1) {
+        cells.push([r + 1, c + 1, v]); // 1-based row/col, store the template text
+      }
+    }
+  }
+  return cells;
+}
+
+function _colNumToLetters_(n) {
+  let s = '';
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
+}
+
+function _a1FromRowCol_(row, col) {
+  return _colNumToLetters_(col) + String(row);
+}
+
+/**
+ * Build a map of (row,col) -> (topLeftRow, topLeftCol) for merged cells
+ * inside a given rectangular window.
+ */
+function _buildMergeTopLeftMap_(sh, r1, c1, r2, c2) {
+  const numRows = Math.max(1, r2 - r1 + 1);
+  const numCols = Math.max(1, c2 - c1 + 1);
+
+  const rng = sh.getRange(r1, c1, numRows, numCols);
+  const merged = rng.getMergedRanges();
+
+  const map = Object.create(null);
+
+  merged.forEach(mr => {
+    const tlr = mr.getRow();
+    const tlc = mr.getColumn();
+    const br  = mr.getLastRow();
+    const bc  = mr.getLastColumn();
+
+    for (let r = tlr; r <= br; r++) {
+      for (let c = tlc; c <= bc; c++) {
+        map[`${r},${c}`] = [tlr, tlc];
+      }
+    }
+  });
+
+  return map;
+}
+
+/**
+ * Finds the best cell (top-left A1) inside a window:
+ *  - Prefer a cell that has a formula (handling merged ranges)
+ *  - Else fallback to first numeric value cell
+ */
+function _findBestFormulaOrNumberCellInWindow_(sh, r1, c1, r2, c2) {
+  const numRows = Math.max(1, r2 - r1 + 1);
+  const numCols = Math.max(1, c2 - c1 + 1);
+
+  const rng = sh.getRange(r1, c1, numRows, numCols);
+  const vals = rng.getValues();
+  const formulas = rng.getFormulas();
+  const mergeTopLeft = _buildMergeTopLeftMap_(sh, r1, c1, r2, c2);
+
+  const getTopLeft = (absR, absC) => mergeTopLeft[`${absR},${absC}`] || [absR, absC];
+
+  // PASS 1: find first formula that EVALUATES to a number (skip "" / text results)
+  for (let rr = 0; rr < numRows; rr++) {
+    for (let cc = 0; cc < numCols; cc++) {
+      const absR = r1 + rr;
+      const absC = c1 + cc;
+      const tl = getTopLeft(absR, absC);
+      const tr = tl[0] - r1;
+      const tc = tl[1] - c1;
+
+      const f = (formulas[tr] && formulas[tr][tc]) ? String(formulas[tr][tc]).trim() : '';
+      if (!f) continue;
+
+      const v = (vals[tr] && vals[tr][tc] !== undefined) ? vals[tr][tc] : '';
+      if (typeof v === 'number' && !isNaN(v)) {
+        return _a1FromRowCol_(tl[0], tl[1]);
+      }
+      // else: formula exists but evaluates to ""/text -> skip
+    }
+  }
+
+  // PASS 2: find first numeric value (including 0)
+  for (let rr = 0; rr < numRows; rr++) {
+    for (let cc = 0; cc < numCols; cc++) {
+      const absR = r1 + rr;
+      const absC = c1 + cc;
+      const tl = getTopLeft(absR, absC);
+      const tr = tl[0] - r1;
+      const tc = tl[1] - c1;
+
+      const v = (vals[tr] && vals[tr][tc] !== undefined) ? vals[tr][tc] : '';
+      if (typeof v === 'number' && !isNaN(v)) return _a1FromRowCol_(tl[0], tl[1]);
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Find Net Pay cell A1 in template even if:
+ * - "NET PAY" label cell is merged
+ * - net pay value/formula is below (and may be merged)
+ *
+ * Strategy:
+ * 1) Locate "NET PAY" label (display values)
+ * 2) Use its merged range bounds as anchor
+ * 3) Search BELOW first (same merged columns span), then nearby right/below area
+ */
+function _findNetPayCellA1_(templateSheet) {
+  const sh = templateSheet;
+  const dr = sh.getDataRange();
+  const disp = dr.getDisplayValues();
+
+  // 1) Find "NET PAY" label in display values
+  let labelRow = -1, labelCol = -1;
+  outer:
+  for (let r = 0; r < disp.length; r++) {
+    for (let c = 0; c < disp[r].length; c++) {
+      const s = String(disp[r][c] || '').trim().toUpperCase();
+      if (s === 'NET PAY') {
+        labelRow = r + 1; // 1-based
+        labelCol = c + 1; // 1-based
+        break outer;
+      }
+    }
+  }
+  if (labelRow === -1) return null;
+
+  // 2) Resolve label merged box
+  const labelCell = sh.getRange(labelRow, labelCol);
+  const merges = labelCell.getMergedRanges();
+  const box = (merges && merges.length) ? merges[0] : labelCell;
+
+  const boxTop = box.getRow();
+  const boxLeft = box.getColumn();
+  const boxBottom = box.getLastRow();
+  const boxRight = box.getLastColumn();
+
+  const extraRight = 12;
+  const c2 = Math.min(boxRight + extraRight, sh.getMaxColumns());
+
+  // 3) FIRST: search to the RIGHT of the label box (same rows)
+  const sameRowR1 = boxTop;
+  const sameRowR2 = boxBottom;
+  const rightStart = Math.min(boxRight + 1, sh.getMaxColumns());
+  if (rightStart <= c2) {
+    const a1Right = _findBestFormulaOrNumberCellInWindow_(sh, sameRowR1, rightStart, sameRowR2, c2);
+    if (a1Right) return a1Right;
+  }
+
+  // 4) THEN: search BELOW the label box (same columns span)
+  const maxDown = 12;
+  const r1 = Math.min(boxBottom + 1, sh.getMaxRows());
+  const r2 = Math.min(boxBottom + maxDown, sh.getMaxRows());
+  if (r1 <= r2) {
+    const a1Below = _findBestFormulaOrNumberCellInWindow_(sh, r1, boxLeft, r2, boxRight);
+    if (a1Below) return a1Below;
+  }
+
+  // 5) LAST: expand search BELOW + to the right
+  if (r1 <= r2) {
+    const a1Wide = _findBestFormulaOrNumberCellInWindow_(sh, r1, boxLeft, r2, c2);
+    if (a1Wide) return a1Wide;
+  }
+
+  return null;
+}
+
+function _fillSheetTagsFromCells_(sh, map, tagCells) {
+  const rx = /\{\{\s*([^}]+?)\s*\}\}/g;
+
+  // Build normalized lookup once
+  const normMap = {};
+  Object.keys(map).forEach(k => {
+    const kk = _normTagKey_(k);
+    const v = map[k];
+    if (!(kk in normMap) || normMap[kk] === '' || normMap[kk] == null) {
+      normMap[kk] = v;
+    }
+  });
+
+  for (let i = 0; i < tagCells.length; i++) {
+    const row = tagCells[i][0];
+    const col = tagCells[i][1];
+    const tpl = tagCells[i][2];
+
+    const nv = String(tpl).replace(rx, (_, key) => {
+      const kk = _normTagKey_(key);
+      return normMap[kk] ?? '';
+    });
+
+    if (nv !== tpl) sh.getRange(row, col).setValue(nv);
+  }
+  SpreadsheetApp.flush();
+}
+
+
+
+
+const RUN_STATE_KEY_BASE = 'PAYSLIP_RUN_STATE_V2';
+
+
+const PAYSLIP_EMAIL_SETTINGS_KEY_BASE = 'PAYSLIP_EMAIL_SETTINGS_V1';
+
+function _payslipEmailSettingsKey_() {
+  return PAYSLIP_EMAIL_SETTINGS_KEY_BASE; // doc props already per spreadsheet
+}
+
+
+function _payslipDocProps_() {
+  return PropertiesService.getDocumentProperties(); // per container spreadsheet
+}
+
+function _payslipRunKey_() {
+  return RUN_STATE_KEY_BASE; // doc props already per spreadsheet
+}
+
+
+
+
+/* =========================
+ * 0) UI
+ * ========================= */
+function showPayslipDialog() {
+  const html = HtmlService.createTemplateFromFile('PayslipDialog')
+  .evaluate()
+    .setWidth(560)
+    .setHeight(720);
+  SpreadsheetApp.getUi().showModalDialog(html, ' ');
+}
+
+function getPayrollComputationSheets() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const names = ss.getSheets()
+      .filter(s => /\(posted\)\s*$/i.test(s.getName()))
+      .filter(s => {
+        const vals = s.getDataRange().getValues();
+        if (!vals.length) return false;
+        const hdr = vals[0].map(h => String(h||'').trim().toLowerCase());
+        return hdr.includes('employee id') && hdr.includes('employee name');
+      })
+      .map(s => s.getName());
+    return names.length ? names : ['⚠️ No Posted payroll sheets found'];
+  } catch (err) {
+    Logger.log('getPayrollComputationSheets error: ' + err.message);
+    return [];
+  }
+}
+
+function getEmployeesFromSheet(sheetName) {
+  try {
+    if (!sheetName) return { dim1Label: _getDim1Label_(), dim2Label: _getDim2Label_(), employees: [] };
+_syncDimLabelsFromMaster_();
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = ss.getSheetByName(sheetName);
+    if (!sh) return { dim1Label: _getDim1Label_(), dim2Label: _getDim2Label_(), employees: [] };
+
+    const vals = sh.getDataRange().getValues();
+    if (!vals.length) return { dim1Label: _getDim1Label_(), dim2Label: _getDim2Label_(), employees: [] };
+
+    const hdr = vals[0].map(h => String(h || '').trim());
+    const nameIdx = hdr.findIndex(h => /^Employee Name$/i.test(h));
+    const idIdx   = hdr.findIndex(h => /^Employee ID$/i.test(h));
+
+    if (nameIdx === -1) return { dim1Label: _getDim1Label_(), dim2Label: _getDim2Label_(), employees: [] };
+
+    const dimsByEmpId = _buildDimsByEmpIdFromMaster_(); // masterfile col D/E
+
+    const seen = Object.create(null);
+    const out = [];
+
+    for (let i = 1; i < vals.length; i++) {
+      const r = vals[i];
+      const name = String(r[nameIdx] || '').trim();
+      if (!name) continue;
+
+      // de-dupe by name (since Payslip flow uses names)
+      const key = name.toUpperCase();
+      if (seen[key]) continue;
+      seen[key] = true;
+
+      const empId = (idIdx >= 0) ? String(r[idIdx] || '').trim() : '';
+      const dims = empId ? (dimsByEmpId[empId] || {}) : {};
+
+      out.push({
+        name,
+        empId,
+        dim1: String(dims.dim1 || '').trim(),
+        dim2: String(dims.dim2 || '').trim()
+      });
+    }
+
+    out.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+
+    return { dim1Label: _getDim1Label_(), dim2Label: _getDim2Label_(), employees: out };
+  } catch (err) {
+    Logger.log('getEmployeesFromSheet error: ' + err.message);
+    return { dim1Label: _getDim1Label_(), dim2Label: _getDim2Label_(), employees: [] };
+  }
+}
+
+
+function _getDim1Label_() {
+  const dp = PropertiesService.getDocumentProperties();
+  return String(dp.getProperty('DIM1_LABEL') || 'Tracking Category 1');
+}
+
+function _getDim2Label_() {
+  const dp = PropertiesService.getDocumentProperties();
+  return String(dp.getProperty('DIM2_LABEL') || 'Tracking Category 2');
+}
+
+function _syncDimLabelsFromMaster_() {
+  const cfg = _readSettings_();
+
+  const masterSS = SpreadsheetApp.openById(cfg.SOURCE_SS_ID);
+  const master = masterSS.getSheetByName(cfg.MASTER_SHEET_NAME || 'Masterfile import');
+  if (!master) return;
+
+  // Your dims are in columns D and E (same as your _buildDimsByEmpIdFromMaster_())
+  const hDim1 = String(master.getRange(1, 4).getDisplayValue() || '').trim(); // col D header
+  const hDim2 = String(master.getRange(1, 5).getDisplayValue() || '').trim(); // col E header
+
+  const dp = PropertiesService.getDocumentProperties();
+  if (hDim1) dp.setProperty('DIM1_LABEL', hDim1);
+  if (hDim2) dp.setProperty('DIM2_LABEL', hDim2);
+}
+
+
+function _buildDimsByEmpIdFromMaster_() {
+  const cfg = _readSettings_();
+
+  const masterSS = SpreadsheetApp.openById(cfg.SOURCE_SS_ID);
+  const master = masterSS.getSheetByName(cfg.MASTER_SHEET_NAME || 'Masterfile import');
+  if (!master) return {};
+
+  const lastRow = master.getLastRow();
+  if (lastRow < 2) return {};
+
+  // Read A:E (A=Employee ID, D=Tracking Category 1, E=Tracking Category 2)
+  const data = master.getRange(2, 1, lastRow - 1, 5).getValues();
+
+  const map = Object.create(null);
+  for (let i = 0; i < data.length; i++) {
+    const empId = String(data[i][0] || '').trim(); // col A
+    if (!empId) continue;
+
+    map[empId] = {
+      dim1: String(data[i][3] || '').trim(), // col D
+      dim2: String(data[i][4] || '').trim()  // col E
+    };
+  }
+  return map;
+}
+
+
+/* =========================
+ * 1) Progress Tracker
+ * ========================= */
+const PAYSLIP_PROGRESS_KEY = 'PAYSLIP_PROGRESS';
+function _resetPayslipProgress_() {
+  CacheService.getDocumentCache().remove(PAYSLIP_PROGRESS_KEY);
+}
+function _updatePayslipProgress_(percent, message) {
+  const progress = { percent, message, timestamp: Date.now() };
+  CacheService.getDocumentCache().put(PAYSLIP_PROGRESS_KEY, JSON.stringify(progress), 3600);
+}
+function getPayslipProgress() {
+  const data = CacheService.getDocumentCache().get(PAYSLIP_PROGRESS_KEY);
+  return data ? JSON.parse(data) : { percent: 0, message: 'Initializing...' };
+}
+
+/* =========================
+ * 2) Batch Runner (No Triggers)
+ * ========================= */
+
+const DAILY_EMAIL_CAP = 600;
+
+function generatePayslips(form) {
+  _resetPayslipProgress_();
+  _updatePayslipProgress_(0, 'Starting payslip generation...');
+
+  const cfg = _readSettings_();
+  const ss  = SpreadsheetApp.getActiveSpreadsheet();
+  _ensurePayslipSnapshotHidden_(ss);
+
+
+  const folderId = _parseFolderId_(form.folderIdOrUrl);
+  DriveApp.getFolderById(folderId);
+
+  const templateName = form.templateName || 'PayslipTemplate';
+  if (!ss.getSheetByName(templateName)) throw new Error('❌ Template sheet not found.');
+  const payroll = ss.getSheetByName(form.sheetName);
+  if (!payroll) throw new Error('❌ Payroll sheet not found.');
+
+  const data = payroll.getDataRange().getValues();
+  const headers = data[0].map(h => String(h || '').trim());
+  const rows = data.slice(1).filter(r => r[0] && r[1]);
+
+  const sel = form.selectedEmployees || [];
+  const nameIdx = headers.findIndex(h => /^Employee Name$/i.test(h));
+  if (nameIdx === -1) throw new Error('⚠️ "Employee Name" column not found in payroll sheet.');
+
+  const filteredIndices = rows
+    .map((r, i) => ({ i1: i + 1, name: String(r[nameIdx]).trim() }))
+    .filter(o => sel.length === 0 || sel.includes(o.name))
+    .map(o => o.i1);
+
+  if (!filteredIndices.length) throw new Error('⚠️ No matching employees found.');
+
+  const state = {
+    form: form,
+    cfg: { SOURCE_SS_ID: cfg.SOURCE_SS_ID, INPUTS_SS_ID: cfg.INPUTS_SS_ID, MASTER_SHEET_NAME: cfg.MASTER_SHEET_NAME || 'Masterfile import' },
+    headers,
+    rowIndices: filteredIndices,
+    total: filteredIndices.length,
+    done: 0,
+    emailed: 0,
+    startedAt: Date.now()
+  };
+
+  state.containerSsId = ss.getId(); // IMPORTANT for triggers
+_payslipDocProps_().setProperty(_payslipRunKey_(), JSON.stringify(state));
+
+  const result = _runPayslipLoop_();
+  if (result && result.pending > 0) _scheduleSinglePayslipTrigger_();
+  return result;
+}
+
+function checkPayslipsOnly(form) {
+  _resetPayslipCheckProgress_();
+  _updatePayslipCheckProgress_(0, 'Starting payslip review...');
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  _ensurePayslipSnapshotHidden_(ss);
+  const cfg = _readSettings_();
+
+  const payroll  = ss.getSheetByName(form.sheetName);
+  const template = ss.getSheetByName(form.templateName || 'PayslipTemplate');
+  if (!payroll || !template) throw new Error('Missing payroll or template sheet.');
+
+  const data    = payroll.getDataRange().getValues();
+  const headers = data[0].map(h => String(h || '').trim());
+  const rows    = data.slice(1);
+
+  const nameIdx = headers.findIndex(h => /^Employee Name$/i.test(h));
+  const netIdx  = headers.findIndex(h => /^Net Pay$/i.test(h));
+  if (nameIdx === -1 || netIdx === -1)
+    throw new Error('Payroll sheet missing "Employee Name" or "Net Pay" column.');
+
+  const selected = form.selectedEmployees || [];
+  if (!selected.length) throw new Error('Select at least one employee for review.');
+
+  // Template tag scan ONCE
+  const tagSet   = new Set(_collectTemplateTags_(template));
+  const tagCells = _collectTemplateTagCells_(template);
+
+  const netPayA1 = _findNetPayCellA1_(template);
+  if (!netPayA1) throw new Error('❌ Net Pay formula cell not found. Ensure the template has a "NET PAY" label and the computed value is nearby (right or below), even if merged.');
+
+  // Master snapshot
+  const masterSS = SpreadsheetApp.openById(cfg.SOURCE_SS_ID);
+  const master   = masterSS.getSheetByName(cfg.MASTER_SHEET_NAME || 'Masterfile import');
+  if (!master) throw new Error(`❌ Master sheet not found: "${cfg.MASTER_SHEET_NAME || 'Masterfile import'}"`);
+
+  const mVals = master.getDataRange().getValues();
+  const mHdr  = mVals[0].map(h => String(h||'').trim());
+  const mIdx  = { ID:_findHeaderFuzzy_(mHdr,['Employee ID','Emp ID','ID','Employee Code']) };
+
+  const normId = s => String(s ?? '')
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/\u200B/g, '')
+    .replace(/[-–—]/g, '-')
+    .trim();
+
+  const masterMap = new Map();
+  mVals.slice(1).forEach(r => {
+    const rawId = String(r[mIdx.ID] || '').trim();
+    if (!rawId) return;
+    masterMap.set(rawId, r);
+    masterMap.set(normId(rawId), r);
+  });
+
+  // Inputs snapshot
+  const allAdj = _loadAdjustmentInputsForPayslip_({ INPUTS_SS_ID: cfg.INPUTS_SS_ID }, ss, form.sheetName);
+
+  let componentMap = {};
+  try { componentMap = _buildComponentMap_(cfg) || {}; } catch (e) { componentMap = {}; }
+
+  // Prepare audit sheet ONCE (keep)
+  const auditSheet = ss.getSheetByName('Payslip_Check') || ss.insertSheet('Payslip_Check');
+  auditSheet.clear();
+  auditSheet.appendRow(['Employee Name','Payslip Net Pay','Payroll Net Pay','Difference','Match?']);
+  auditSheet.getRange(1,1,1,5).setFontWeight('bold').setBackground('#e8f0fe');
+
+  // Filter target employees (preserve payroll order) (keep your exact match)
+  const targets = [];
+  for (let i = 0; i < rows.length; i++) {
+    const empName = String(rows[i][nameIdx] || '').trim();
+    if (!empName) continue;
+    if (selected.includes(empName)) targets.push(i);
+  }
+  if (!targets.length) throw new Error('No matching employees found for review.');
+
+  // Create temp sheet ONCE
+  const tmpName = '_TMPCHK_' + Utilities.getUuid().slice(0, 8);
+  template.copyTo(ss).setName(tmpName);
+
+  // Persist state for trigger-batched processing
+  const state = {
+    containerSsId: ss.getId(),
+    sheetName: form.sheetName,
+    templateName: form.templateName || 'PayslipTemplate',
+    tmpName,
+    netPayA1,
+    nameIdx,
+    netIdx,
+    headers,
+    targets,
+    cursor: 0,
+    ok: 0,
+    bad: 0
+  };
+  _payslipCheckDocProps_().setProperty(PAYSLIP_CHECK_RUN_STATE_KEY, JSON.stringify(state));
+
+    const result = _runPayslipCheckChunk_();
+  if (result && result.pending > 0) _scheduleSinglePayslipCheckTrigger_();
+
+  // How many have been processed so far (first chunk or full run)
+  let processed = (targets.length - (result ? result.pending : targets.length));
+  try {
+    const afterRaw = _payslipCheckDocProps_().getProperty(PAYSLIP_CHECK_RUN_STATE_KEY);
+    if (afterRaw) processed = JSON.parse(afterRaw).cursor || processed;
+  } catch (e) {}
+
+  return {
+    started: true,
+    sheet: 'Payslip_Check',
+
+    // include BOTH names so the UI can use either one without breaking
+    total: targets.length,
+    checked: processed,
+
+    ok: (result && typeof result.ok === 'number') ? result.ok : 0,
+    bad: (result && typeof result.bad === 'number') ? result.bad : 0,
+    pending: (result && typeof result.pending === 'number') ? result.pending : 0
+  };
+
+}
+
+function _runPayslipCheckChunk_() {
+  const props = _payslipCheckDocProps_();
+  const raw = props.getProperty(PAYSLIP_CHECK_RUN_STATE_KEY);
+  if (!raw) return { pending: 0 };
+
+  const state = JSON.parse(raw);
+  const ss = SpreadsheetApp.openById(state.containerSsId);
+
+  const payroll  = ss.getSheetByName(state.sheetName);
+  const template = ss.getSheetByName(state.templateName || 'PayslipTemplate');
+  const auditSheet = ss.getSheetByName('Payslip_Check') || ss.insertSheet('Payslip_Check');
+  const temp = ss.getSheetByName(state.tmpName) || template.copyTo(ss).setName(state.tmpName);
+
+  const data    = payroll.getDataRange().getValues();
+  const rows    = data.slice(1);
+
+  // Re-scan tags (cannot store large objects safely)
+  const tagSet   = new Set(_collectTemplateTags_(template));
+  const tagCells = _collectTemplateTagCells_(template);
+
+  const cfg = _readSettings_();
+
+  // Master snapshot (rebuild map)
+  const masterSS = SpreadsheetApp.openById(cfg.SOURCE_SS_ID);
+  const master   = masterSS.getSheetByName(cfg.MASTER_SHEET_NAME || 'Masterfile import');
+  const mVals = master.getDataRange().getValues();
+  const mHdr  = mVals[0].map(h => String(h||'').trim());
+  const mIdx  = { ID:_findHeaderFuzzy_(mHdr,['Employee ID','Emp ID','ID','Employee Code']) };
+
+  const normId = s => String(s ?? '')
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/\u200B/g, '')
+    .replace(/[-–—]/g, '-')
+    .trim();
+
+  const masterMap = new Map();
+  mVals.slice(1).forEach(r => {
+    const rawId = String(r[mIdx.ID] || '').trim();
+    if (!rawId) return;
+    masterMap.set(rawId, r);
+    masterMap.set(normId(rawId), r);
+  });
+
+  const allAdj = _loadAdjustmentInputsForPayslip_({ INPUTS_SS_ID: cfg.INPUTS_SS_ID }, ss, state.sheetName);
+  let componentMap = {};
+  try { componentMap = _buildComponentMap_(cfg) || {}; } catch (e) { componentMap = {}; }
+
+  const startMs = Date.now();
+  const MAX_MS = 5 * 60 * 1000 - 15 * 1000; // stay under hard limit
+  const BATCH = 15; // tune
+
+  let processed = 0;
+
+  while (state.cursor < state.targets.length) {
+    if (Date.now() - startMs > MAX_MS) break;
+    if (processed >= BATCH) break;
+
+    const i = state.targets[state.cursor];
+    const r = rows[i];
+    const empName = String(r[state.nameIdx] || '').trim();
+
+    try {
+      const map = _buildTagMapForRow_(r, state.headers, masterMap, mHdr, allAdj, tagSet, componentMap);
+
+      // Fill tags (NO tplRange.copyTo, NO sleep, NO borders)
+      _fillSheetTagsFromCells_(temp, map, tagCells);
+
+      // Read computed Net Pay
+      const payrollNet = Number(r[state.netIdx]) || 0;
+      const rawPayslipNet = temp.getRange(state.netPayA1).getValue();
+      const payslipNet = (typeof rawPayslipNet === 'number')
+        ? rawPayslipNet
+        : Number(String(rawPayslipNet).replace(/[₱,()\s]/g, '').trim());
+
+      if (isNaN(payslipNet)) throw new Error(`Payslip Net Pay is not numeric at ${state.netPayA1}. Value="${rawPayslipNet}"`);
+
+      const diff  = payslipNet - payrollNet;
+      const match = Math.abs(diff) < 0.01;
+
+      // WRITE LINE-BY-LINE
+      const rowIdx = auditSheet.getLastRow() + 1;
+      auditSheet.getRange(rowIdx, 1, 1, 5).setValues([[empName, payslipNet, payrollNet, diff, match ? '✅ OK' : '❌ MISMATCH']]);
+      auditSheet.getRange(rowIdx, 2, 1, 3).setNumberFormat('#,##0.00');
+      auditSheet.getRange(rowIdx, 1, 1, 5).setBackground(match ? '#ffffff' : '#fdecea');
+
+      if (match) state.ok++; else state.bad++;
+
+      // RESTORE TAG CELLS back to template strings (avoid tplRange.copyTo)
+      for (let k = 0; k < tagCells.length; k++) {
+        temp.getRange(tagCells[k][0], tagCells[k][1]).setValue(tagCells[k][2]);
+      }
+
+    } catch (e) {
+      const rowIdx = auditSheet.getLastRow() + 1;
+      auditSheet.getRange(rowIdx, 1, 1, 5).setValues([[empName, '—', '—', e.message, '❌ ERROR']]);
+      auditSheet.getRange(rowIdx, 1, 1, 5).setBackground('#fdecea');
+      state.bad++;
+
+      // Best-effort restore tags
+      for (let k = 0; k < tagCells.length; k++) {
+        temp.getRange(tagCells[k][0], tagCells[k][1]).setValue(tagCells[k][2]);
+      }
+    }
+
+    state.cursor++;
+    processed++;
+
+    const pct = Math.round((state.cursor / Math.max(1, state.targets.length)) * 100);
+    _updatePayslipCheckProgress_(pct, `Reviewed ${state.cursor}/${state.targets.length}: ${empName}`);
+    props.setProperty(PAYSLIP_CHECK_RUN_STATE_KEY, JSON.stringify(state));
+  }
+
+  const pending = state.targets.length - state.cursor;
+
+  if (pending <= 0) {
+    _updatePayslipCheckProgress_(100, `✅ Review complete. OK=${state.ok}, Mismatch/Error=${state.bad}`);
+    props.deleteProperty(PAYSLIP_CHECK_RUN_STATE_KEY);
+
+    // Cleanup temp
+    try { ss.deleteSheet(ss.getSheetByName(state.tmpName)); } catch (e) {}
+
+    // Cleanup leftovers (same cleanup you already do)【PayslipGenerator.txt†L646-L646】
+    ss.getSheets().filter(s => /^_TMPCHK_/i.test(s.getName())).forEach(s => { try { ss.deleteSheet(s); } catch(e){} });
+  }
+
+return {
+  pending,
+  ok: state.ok,
+  bad: state.bad,
+  total: state.targets.length,
+  checked: state.cursor
+};
+
+}
+
+
+/* ---------------------------------------------------
+ *  MAIN LOOP — fixed Q30 evaluation in AUDIT block
+ * --------------------------------------------------- */
+function _runPayslipLoop_() {
+  const stateRaw = _payslipDocProps_().getProperty(_payslipRunKey_());
+if (!stateRaw) throw new Error('No active run state.');
+const state = JSON.parse(stateRaw);
+
+// IMPORTANT: for trigger context, open the container spreadsheet explicitly
+const ss = SpreadsheetApp.openById(state.containerSsId);
+_ensurePayslipSnapshotHidden_(ss);
+
+  const cfg = state.cfg;
+  const payroll = ss.getSheetByName(state.form.sheetName);
+  const template = ss.getSheetByName(state.form.templateName || 'PayslipTemplate');
+  const tagSet = new Set(_collectTemplateTags_(template));
+  const netPayA1 = _findNetPayCellA1_(template);
+if (!netPayA1) throw new Error('❌ Net Pay formula cell not found. Ensure the template has a "NET PAY" label and the computed value is nearby (right or below), even if merged.');
+
+
+  let componentMap = {};
+try { componentMap = _buildComponentMap_(cfg) || {}; } catch(e) { componentMap = {}; }
+
+
+
+if (!payroll) throw new Error(`❌ Payroll sheet not found: "${state.form.sheetName}"`);
+if (!template) throw new Error(`❌ Template sheet not found: "${state.form.templateName || 'PayslipTemplate'}"`);
+
+let folderId = _parseFolderId_(state.form.folderIdOrUrl);
+let folder;
+try {
+  folder = DriveApp.getFolderById(folderId);
+  folder.getName(); // force permission check early
+} catch (e) {
+  throw new Error(`❌ Cannot access destination folder (${folderId}). ${e.message}`);
+}
+
+const masterSS = SpreadsheetApp.openById(cfg.SOURCE_SS_ID);
+const master = masterSS.getSheetByName(cfg.MASTER_SHEET_NAME || 'Masterfile import');
+if (!master) throw new Error(`❌ Master sheet not found: "${cfg.MASTER_SHEET_NAME || 'Masterfile import'}"`);
+  const mVals = master.getDataRange().getValues();
+  const mHdr = mVals[0].map(h => String(h||'').trim());
+  const mIdx = { ID:_findHeaderFuzzy_(mHdr,['Employee ID','Emp ID','ID']) };
+
+  
+
+  // 🔐 Robust Employee ID mapping (raw + normalized)
+  const normId = s => String(s ?? '')
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/\u200B/g, '')   // zero-width
+    .replace(/[-–—]/g, '-')   // dashes
+    .trim();
+
+  const masterMap = new Map();
+  mVals.slice(1).forEach(r => {
+    const rawId = String(r[mIdx.ID] || '').trim();
+    if (!rawId) return;
+    const keyNorm = normId(rawId);
+    masterMap.set(rawId, r);     // original
+    masterMap.set(keyNorm, r);   // normalized
+  });
+
+
+  const allAdj = _loadAdjustmentInputsForPayslip_({ INPUTS_SS_ID: cfg.INPUTS_SS_ID }, ss, state.form.sheetName);
+
+  
+
+  const data = payroll.getDataRange().getValues();
+  const dataHeaders = data[0].map(h => String(h || '').trim());
+  const headersUpper = dataHeaders.map(h => h.toUpperCase());
+  const headerIndexUp = (key) => headersUpper.indexOf(String(key).trim().toUpperCase());
+
+  const empIdIdx = headerIndexUp('EMPLOYEE ID');
+  const empNameIdx = headerIndexUp('EMPLOYEE NAME');
+  if (empIdIdx === -1 || empNameIdx === -1)
+    throw new Error('⚠️ Payroll sheet missing Employee ID or Name.');
+
+  const startTime = Date.now();
+  const softLimitMs = 5.5 * 60 * 1000;
+  let created = 0, skipped = 0;
+
+  const safeSleep = (ms)=>Utilities.sleep(ms);
+
+  while (state.rowIndices.length) {
+    const relRowIndex = state.rowIndices.shift();
+    const r = data[relRowIndex];
+    const empName = String(r[empNameIdx] || '').trim();
+
+    try {
+      const map = _buildTagMapForRow_(r, dataHeaders, masterMap, mHdr, allAdj, tagSet, componentMap);
+      const fname = _renderStringTemplate_(state.form.filenamePattern || '{{Employee Name}} - Payslip', map);
+
+      const tempName = '_TMP_' + Utilities.getUuid().slice(0,8);
+      const temp = template.copyTo(ss).setName(tempName);
+      _fillSheetTags_(temp, map);
+      SpreadsheetApp.flush();
+Utilities.sleep(800); // allow formulas to compute
+
+_applyPayslipOtAttBorders_(temp);
+SpreadsheetApp.flush();
+
+// AUDIT
+const auditSheetName = 'Payslip_Check';
+const payrollNetIdx = dataHeaders.findIndex(h => /^Net Pay$/i.test(h));
+const payrollNet = payrollNetIdx >= 0 ? Number(r[payrollNetIdx]) : NaN;
+
+// Use numeric value
+const rawPayslipNet = temp.getRange(netPayA1).getValue();
+const payslipNet = (typeof rawPayslipNet === 'number')
+  ? rawPayslipNet
+  : Number(String(rawPayslipNet).replace(/[₱,()\s]/g, '').trim());
+
+if (isNaN(payslipNet)) {
+  throw new Error(`Payslip Net Pay is not numeric at ${netPayA1}. Value="${rawPayslipNet}"`);
+}
+
+
+
+
+      const blob=_exportSheetAsPdf_Reliable_(ss.getId(),temp.getSheetId(),fname);
+      if(!blob)throw new Error('PDF export failed.');
+      const file=folder.createFile(blob);
+      created++;
+
+      if(state.form.sendEmail){
+        if((state.emailed||0)>=DAILY_EMAIL_CAP)break;
+        try{
+                    const emailField = (state.form.emailColumn || 'Company Email')
+            .trim()
+            .toLowerCase()
+            .replace(/\s+/g, '');
+
+          // Use same normalization as masterMap
+          const empIdValRaw = String(r[empIdIdx] || '').trim();
+          const empIdKey = normId(empIdValRaw);
+          const masterRow = masterMap.get(empIdValRaw) || masterMap.get(empIdKey);
+
+          let empEmail = '';
+          if (masterRow) {
+            const mHdrLc = mHdr.map(h => String(h).trim().toLowerCase().replace(/\s+/g, ''));
+
+            // ✅ Match exact OR "contains" → handles "Company Email Address", etc.
+            const emailIdxMF = mHdrLc.findIndex(h =>
+              h === emailField || h.indexOf(emailField) !== -1
+            );
+
+            if (emailIdxMF !== -1) {
+              empEmail = String(masterRow[emailIdxMF] || '').trim();
+            }
+          }
+
+          if (empEmail && empEmail.includes('@')) {
+  const subj = _renderStringTemplate_(state.form.emailSubject || 'Payslip', map);
+
+// ✅ must be let because we may append signature
+let bodyHtml = _renderStringTemplate_(state.form.emailBody || '', map);
+
+// ✅ support BOTH flag names to avoid UI/server mismatch
+const wantSig = !!(state.form.useGmailSignature || state.form.appendGmailSignature);
+if (wantSig) {
+  const sig = payslipGetPrimaryGmailSignatureHtml_();
+  if (sig) bodyHtml = bodyHtml + "<br><br>" + sig;
+}
+
+GmailApp.sendEmail(empEmail, subj, '', {
+  htmlBody: bodyHtml,
+  attachments: [file.getBlob()],
+  cc: state.form.cc || '',
+  bcc: state.form.bcc || '',
+  replyTo: state.form.replyTo || '',
+  name: state.form.senderEmail || 'Payroll Team'
+});
+
+
+  state.emailed = (state.emailed || 0) + 1;
+}
+
+        }catch(e){Logger.log(`❌ Email failed for ${empName}: ${e.message}`);}
+      }
+
+      try{ss.deleteSheet(temp);}catch(e){}
+      safeSleep(400);
+
+    } catch(err){
+      Logger.log(`❌ Skipped ${empName}: ${err.message}`);
+      skipped++;
+    }
+
+    state.done++;
+    const pct=Math.round((state.done/state.total)*100);
+    _updatePayslipProgress_(pct,`Processed ${state.done}/${state.total}: ${empName}`);
+    if((Date.now()-startTime)>softLimitMs){
+      _payslipDocProps_().setProperty(_payslipRunKey_(), JSON.stringify(state));
+      return{created,skipped,emailed:state.emailed||0,pending:state.rowIndices.length};
+    }
+  }
+
+  _updatePayslipProgress_(100, `✅ Completed ${state.done} ${Number(state.done) === 1 ? 'payslip' : 'payslips'}`);
+  _payslipDocProps_().deleteProperty(_payslipRunKey_());
+  ss.getSheets().filter(s=>/^_TMP_/i.test(s.getName())).forEach(s=>{try{ss.deleteSheet(s);}catch(e){}});
+  _unlockAdjustmentsFile_();
+  return{created,skipped,emailed:state.emailed||0,pending:0};
+}
+
+/* (Remaining helper functions unchanged from your source: 
+   _runPayslipAuto_, _scheduleSinglePayslipTrigger_, _deletePayslipTriggers_, 
+   previewPayslip, cleanupPayslipPreview_, purgeAllTriggers, 
+   _resumePayslipRun_, _parseFolderId_, _collectTemplateTags_, _findHeaderFuzzy_,
+   _loadAdjustmentInputs_, _buildTagMapForRow_, _renderStringTemplate_,
+   _fillSheetTags_, _exportSheetAsPdf_Reliable_, _autoResumeFailsafe_,
+   getSavedPayslipEmailSettings, generatePayslipsSettingsSave )
+*/
+
+
+function runPayslipAuto() {
+  // IMPORTANT: triggers may not have an "active spreadsheet" in the container context,
+  // so we must locate the state in THIS container’s Document Properties.
+  const stateRaw = _payslipDocProps_().getProperty(_payslipRunKey_());
+
+  if (!stateRaw) {
+    Logger.log('ℹ️ No pending payslip run to auto-resume.');
+    _deletePayslipTriggers_();
+    return;
+  }
+
+  const stateBefore = JSON.parse(stateRaw);
+
+  // _runPayslipLoop_() should open the container by state.containerSsId
+  const result = _runPayslipLoop_();
+
+  // Re-read state to compute accurate %
+  const stateAfterRaw = _payslipDocProps_().getProperty(_payslipRunKey_());
+  const stateForPct = stateAfterRaw ? JSON.parse(stateAfterRaw) : stateBefore;
+  const pct = Math.min(99, Math.round((stateForPct.done / Math.max(1, stateForPct.total)) * 100));
+
+  if (result && result.pending > 0) {
+    _updatePayslipProgress_(pct, `⏸️ Auto-resume scheduled. Pending: ${result.pending}`);
+    Logger.log(`⏸️ Auto-resume scheduled. Pending: ${result.pending}`);
+    _scheduleSinglePayslipTrigger_();
+  } else {
+    _updatePayslipProgress_(100, `✅ All payslips completed.`);
+    Logger.log('✅ All payslips completed. Cleaning up triggers.');
+    _deletePayslipTriggers_();
+  }
+}
+
+
+/** Ensures only ONE active resume trigger exists */
+function _scheduleSinglePayslipTrigger_() {
+  _deletePayslipTriggers_(); // prevent buildup
+  ScriptApp.newTrigger('runPayslipAuto')
+    .timeBased()
+    .after(60 * 1000) // 1 minute
+    .create();
+}
+
+/** Delete any triggers related to payslip resumes */
+function _deletePayslipTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => ['runPayslipAuto', '_runPayslipLoop_'].includes(t.getHandlerFunction()))
+    .forEach(t => {
+      try { ScriptApp.deleteTrigger(t); } catch (e) { Logger.log('⚠️ Trigger delete failed: ' + e.message); }
+    });
+}
+
+function _payslipCheckDocProps_() {
+  return PropertiesService.getDocumentProperties(); // per container spreadsheet
+}
+
+function _deletePayslipCheckTriggers_() {
+  ScriptApp.getProjectTriggers()
+    .filter(t => ['runPayslipCheckAuto'].includes(t.getHandlerFunction()))
+    .forEach(t => { try { ScriptApp.deleteTrigger(t); } catch (e) {} });
+}
+
+function _scheduleSinglePayslipCheckTrigger_() {
+  _deletePayslipCheckTriggers_();
+  ScriptApp.newTrigger('runPayslipCheckAuto')
+    .timeBased()
+    .after(60 * 1000)
+    .create();
+}
+
+function runPayslipCheckAuto() {
+  const raw = _payslipCheckDocProps_().getProperty(PAYSLIP_CHECK_RUN_STATE_KEY);
+  if (!raw) {
+    _deletePayslipCheckTriggers_();
+    return;
+  }
+  const result = _runPayslipCheckChunk_();
+  if (result && result.pending > 0) _scheduleSinglePayslipCheckTrigger_();
+  else _deletePayslipCheckTriggers_();
+}
+
+
+/* =========================
+ * 3) Download (direct to browser)
+ * ========================= */
+
+function _blobToDownloadPayload_(blob, filenameOverride) {
+  const b = filenameOverride ? blob.copyBlob().setName(filenameOverride) : blob;
+  return {
+    filename: b.getName(),
+    mimeType: b.getContentType(),
+    base64: Utilities.base64Encode(b.getBytes()),
+  };
+}
+
+/**
+ * Single-employee PDF download (returns base64 payload to HTML)
+ * - NO Drive folder created
+ * - NO Drive file created
+ */
+function downloadPayslip(form) {
+  if (!form || !form.selectedEmployees || form.selectedEmployees.length !== 1) {
+    throw new Error('Select exactly one employee for download.');
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  _ensurePayslipSnapshotHidden_(ss);
+
+  const cfg = _readSettings_();
+
+  const payroll = ss.getSheetByName(form.sheetName);
+  const template = ss.getSheetByName(form.templateName || 'PayslipTemplate');
+  if (!payroll) throw new Error('❌ Payroll sheet not found.');
+  if (!template) throw new Error('❌ Template sheet not found.');
+
+  const data = payroll.getDataRange().getValues();
+  const headers = data[0].map(h => String(h || '').trim());
+  const rows = data.slice(1);
+
+  const empNameIdx = headers.findIndex(h => /^Employee Name$/i.test(h));
+  if (empNameIdx === -1) throw new Error('⚠️ "Employee Name" column not found in payroll sheet.');
+
+  const targetName = String(form.selectedEmployees[0] || '').trim();
+  const row = rows.find(r => String(r[empNameIdx] || '').trim() === targetName);
+  if (!row) throw new Error('⚠️ Employee not found in payroll sheet: ' + targetName);
+
+  // Build Master map (same logic as generator)
+  const masterSS = SpreadsheetApp.openById(cfg.SOURCE_SS_ID);
+  const master = masterSS.getSheetByName(cfg.MASTER_SHEET_NAME || 'Masterfile import');
+  if (!master) throw new Error(`❌ Master sheet not found: "${cfg.MASTER_SHEET_NAME || 'Masterfile import'}"`);
+
+  const mVals = master.getDataRange().getValues();
+  const mHdr = mVals[0].map(h => String(h || '').trim());
+  const mIdx = { ID: _findHeaderFuzzy_(mHdr, ['Employee ID', 'Emp ID', 'ID']) };
+
+  const normId = s => String(s ?? '')
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/\u200B/g, '')
+    .replace(/\u00A0/g, '')
+    .replace(/[-–—]/g, '-')
+    .trim();
+
+  const masterMap = new Map();
+  mVals.slice(1).forEach(r => {
+    const rawId = String(r[mIdx.ID] || '').trim();
+    if (!rawId) return;
+    masterMap.set(rawId, r);
+    masterMap.set(normId(rawId), r);
+  });
+
+  const tagSet = new Set(_collectTemplateTags_(template));
+  let componentMap = {};
+  try { componentMap = _buildComponentMap_(cfg) || {}; } catch (e) { componentMap = {}; }
+
+  const allAdj = _loadAdjustmentInputsForPayslip_({ INPUTS_SS_ID: cfg.INPUTS_SS_ID }, ss, form.sheetName);
+
+  const tempName = '_TMPDL_' + Utilities.getUuid().slice(0, 8);
+  const temp = template.copyTo(ss).setName(tempName);
+
+  try {
+    const map = _buildTagMapForRow_(row, headers, masterMap, mHdr, allAdj, tagSet, componentMap);
+    const fnameBase = _renderStringTemplate_(form.filenamePattern || '{{Employee Name}} - Payslip', map);
+
+    _fillSheetTags_(temp, map);
+    SpreadsheetApp.flush();
+    Utilities.sleep(800);
+
+    _applyPayslipOtAttBorders_(temp);
+    SpreadsheetApp.flush();
+
+    const blob = _exportSheetAsPdf_Reliable_(ss.getId(), temp.getSheetId(), fnameBase);
+    // _exportSheetAsPdf_Reliable_ already sets .pdf name
+    return _blobToDownloadPayload_(blob);
+
+  } finally {
+    try { ss.deleteSheet(temp); } catch (e) {}
+  }
+}
+
+/**
+ * Multi-employee ZIP download (returns base64 payload to HTML)
+ * - NO Drive folder created
+ * - NO Drive files created
+ */
+function downloadPayslipsZip(form) {
+  if (!form || !form.selectedEmployees || !form.selectedEmployees.length) {
+    throw new Error('Select at least one employee for download.');
+  }
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  _ensurePayslipSnapshotHidden_(ss);
+
+  const cfg = _readSettings_();
+
+  const payroll = ss.getSheetByName(form.sheetName);
+  const template = ss.getSheetByName(form.templateName || 'PayslipTemplate');
+  if (!payroll) throw new Error('❌ Payroll sheet not found.');
+  if (!template) throw new Error('❌ Template sheet not found.');
+
+  const data = payroll.getDataRange().getValues();
+  const headers = data[0].map(h => String(h || '').trim());
+  const rows = data.slice(1);
+
+  const empNameIdx = headers.findIndex(h => /^Employee Name$/i.test(h));
+  if (empNameIdx === -1) throw new Error('⚠️ "Employee Name" column not found in payroll sheet.');
+
+  // Build Master map (same logic as generator)
+  const masterSS = SpreadsheetApp.openById(cfg.SOURCE_SS_ID);
+  const master = masterSS.getSheetByName(cfg.MASTER_SHEET_NAME || 'Masterfile import');
+  if (!master) throw new Error(`❌ Master sheet not found: "${cfg.MASTER_SHEET_NAME || 'Masterfile import'}"`);
+
+  const mVals = master.getDataRange().getValues();
+  const mHdr = mVals[0].map(h => String(h || '').trim());
+  const mIdx = { ID: _findHeaderFuzzy_(mHdr, ['Employee ID', 'Emp ID', 'ID']) };
+
+  const normId = s => String(s ?? '')
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/\u200B/g, '')
+    .replace(/\u00A0/g, '')
+    .replace(/[-–—]/g, '-')
+    .trim();
+
+  const masterMap = new Map();
+  mVals.slice(1).forEach(r => {
+    const rawId = String(r[mIdx.ID] || '').trim();
+    if (!rawId) return;
+    masterMap.set(rawId, r);
+    masterMap.set(normId(rawId), r);
+  });
+
+  const tagSet = new Set(_collectTemplateTags_(template));
+  let componentMap = {};
+  try { componentMap = _buildComponentMap_(cfg) || {}; } catch (e) { componentMap = {}; }
+
+  const allAdj = _loadAdjustmentInputsForPayslip_({ INPUTS_SS_ID: cfg.INPUTS_SS_ID }, ss, form.sheetName);
+
+  // Preserve payroll order
+  const selectedSet = new Set(form.selectedEmployees.map(x => String(x || '').trim()));
+  const targets = rows
+    .map((r, i) => ({ r, i, name: String(r[empNameIdx] || '').trim() }))
+    .filter(o => o.name && selectedSet.has(o.name));
+
+  if (!targets.length) throw new Error('⚠️ No matching employees found for download.');
+
+  const blobs = [];
+
+  for (let k = 0; k < targets.length; k++) {
+    const row = targets[k].r;
+
+    const tempName = '_TMPDL_' + Utilities.getUuid().slice(0, 8);
+    const temp = template.copyTo(ss).setName(tempName);
+
+    try {
+      const map = _buildTagMapForRow_(row, headers, masterMap, mHdr, allAdj, tagSet, componentMap);
+      const fnameBase = _renderStringTemplate_(form.filenamePattern || '{{Employee Name}} - Payslip', map);
+
+      _fillSheetTags_(temp, map);
+      SpreadsheetApp.flush();
+      Utilities.sleep(800);
+
+      _applyPayslipOtAttBorders_(temp);
+      SpreadsheetApp.flush();
+
+      const pdfBlob = _exportSheetAsPdf_Reliable_(ss.getId(), temp.getSheetId(), fnameBase);
+      blobs.push(pdfBlob); // already named *.pdf
+    } finally {
+      try { ss.deleteSheet(temp); } catch (e) {}
+    }
+  }
+
+  const zipBlob = Utilities.zip(blobs, 'Payslips.zip');
+  return _blobToDownloadPayload_(zipBlob);
+}
+
+
+function purgeAllTriggers() {
+  const all = ScriptApp.getProjectTriggers();
+  all.forEach(t => {
+    try { ScriptApp.deleteTrigger(t); } catch(e) {}
+  });
+  Logger.log(`🧹 Deleted ${all.length} triggers`);
+}
+
+
+function _resumePayslipRun_() {
+  const raw = _payslipDocProps_().getProperty(_payslipRunKey_());
+  if (!raw) {
+    Logger.log('ℹ️ No pending payslip run to resume.');
+    return { created: 0, skipped: 0, pending: 0 };
+  }
+
+  const state = JSON.parse(raw);
+
+  if (!state.rowIndices || state.rowIndices.length === 0) {
+    Logger.log('✅ All payslips already completed.');
+    _payslipDocProps_().deleteProperty(_payslipRunKey_());
+    return { created: 0, skipped: 0, pending: 0 };
+  }
+
+  Logger.log(`🔁 Resuming payslip batch (${state.rowIndices.length} remaining)…`);
+  return _runPayslipLoop_();
+}
+
+
+/* =========================
+ * 5) Helpers (unchanged APIs)
+ * ========================= */
+function _parseFolderId_(s) {
+  const m = String(s || '').match(/[-\w]{25,}/);
+  if (!m) throw new Error('Invalid folder ID or URL.');
+  return m[0];
+}
+
+function _cleanTagToken_(s) {
+  // Remove invisible characters that commonly break tag matching
+  return String(s ?? '')
+    .replace(/\u200B/g, '')   // zero-width space
+    .replace(/\u00A0/g, ' ')  // NBSP
+    .replace(/\s+/g, ' ')     // collapse whitespace
+    .trim();
+}
+
+function _normTagKey_(s) {
+  return _cleanTagToken_(s).toLowerCase();
+}
+
+
+function _collectTemplateTags_(sh) {
+  const vals = sh.getDataRange().getDisplayValues();
+  const tags = [];
+  const rx = /\{\{\s*([^}]+?)\s*\}\}/g;
+
+  for (let r = 0; r < vals.length; r++) {
+    for (let c = 0; c < vals[r].length; c++) {
+      const cell = vals[r][c];
+      if (typeof cell !== 'string' || cell.indexOf('{{') === -1) continue;
+
+      rx.lastIndex = 0; // IMPORTANT: reset per cell
+      let m;
+      while ((m = rx.exec(cell)) !== null) {
+        tags.push(_cleanTagToken_(m[1])); // strip hidden chars
+      }
+    }
+  }
+  return [...new Set(tags)];
+}
+
+function _findHeaderFuzzy_(headers, possibleNames) {
+  const lc = headers.map(h => String(h).toLowerCase());
+  for (const name of possibleNames) {
+    const idx = lc.findIndex(h => h.includes(String(name).toLowerCase()));
+    if (idx !== -1) return idx;
+  }
+  return -1;
+}
+
+function _loadAdjustmentInputsForPayslip_(cfg, ss, payrollSheetName) {
+  ss = ss || SpreadsheetApp.getActiveSpreadsheet();
+  cfg = cfg || {};
+  payrollSheetName = String(payrollSheetName || '').trim();
+
+  const isPosted = /\(posted\)\s*$/i.test(payrollSheetName);
+  const snapName = '_PAYSLIP_INPUT_SNAPSHOT';
+
+  if (isPosted) {
+    const snap = ss.getSheetByName(snapName);
+    if (snap) {
+      const v = snap.getDataRange().getValues();
+      if (v.length > 1) {
+        const H = v[0].map(x => String(x || '').trim());
+        const idx = (name) => H.findIndex(h => String(h).trim().toLowerCase() === String(name).trim().toLowerCase());
+
+        const iPosted = idx('Posted Sheet Name');
+        const iSource = idx('Source Sheet');
+        const iEmpId  = idx('Employee ID');
+        const iEmpNm  = idx('Employee Name');
+        const iType   = idx('Type');
+        const iVal    = idx('Value');
+        const iRate   = idx('Rate');
+        const iHrs    = idx('Hours');
+        const iDays   = idx('Days');
+        const iAmt    = idx('Amount');
+        const iDesc   = idx('Description');
+        const iCat    = idx('Payroll Category');
+        const iAdjNm  = idx('Adjustment Name');
+
+        const want = payrollSheetName.toUpperCase();
+const normId = s => String(s ?? '')
+  .toLowerCase()
+  .replace(/\s+/g, '')
+  .replace(/\u200B/g, '')     // zero-width
+  .replace(/\u00A0/g, '')     // NBSP
+  .replace(/[-–—]/g, '-')     // dash normalize
+  .trim();
+
+
+        const rows = [];
+        for (let r = 1; r < v.length; r++) {
+          const rowPosted = String(v[r][iPosted] || '').trim().toUpperCase();
+          if (rowPosted !== want) continue;
+
+          rows.push({
+            Sheet: String(v[r][iSource] || '').trim(),                 // Variable_Adjustments / Overtime / Absences_Tardiness
+            'Employee ID': normId(v[r][iEmpId]),
+          // already normalized on snapshot
+            'Employee Name': String(v[r][iEmpNm] || '').trim(),
+            'Type': String(v[r][iType] || '').trim(),
+            'OT Type': String(v[r][iType] || '').trim(),
+            'Value': Number(v[r][iVal]) || 0,
+            'Rate': Number(v[r][iRate]) || 0,
+            'Hours': Number(v[r][iHrs]) || 0,
+            'Days': Number(v[r][iDays]) || 0,
+            'Amount': Number(v[r][iAmt]) || 0,
+            'Description': String(v[r][iDesc] || '').trim(),
+            'Payroll Category': String(v[r][iCat] || '').trim(),
+            'Adjustment Name': String(v[r][iAdjNm] || '').trim()
+          });
+        }
+
+        if (rows.length) {
+          Logger.log(`✅ Using snapshot inputs for "${payrollSheetName}" rows=${rows.length}`);
+          return rows;
+        }
+      }
+    }
+  }
+
+  // Fallback: live Inputs file (current behavior)
+  return _loadAdjustmentInputs_(cfg);
+}
+
+
+/** Inputs loader: Variable_Adjustments, Overtime, Absences_Tardiness */
+function _loadAdjustmentInputs_(cfg) {
+  try {
+    if (!cfg || !cfg.INPUTS_SS_ID) throw new Error('Inputs file ID is not set in Settings.');
+    const adjSS = SpreadsheetApp.openById(cfg.INPUTS_SS_ID);
+    const allSheets = ['Variable_Adjustments','Overtime','Absences_Tardiness'];
+    const allRows = [];
+
+    const num = v => Number(String(v ?? '').replace(/[₱,()]/g, '').trim()) || 0;
+    const norm = s => String(s ?? '')
+      .toLowerCase()
+      .replace(/\s+/g, ' ')
+      .trim();
+    const normHeader = s => String(s ?? '')
+      .toLowerCase()
+      .replace(/\s+/g, '')
+      .replace(/[^a-z0-9]/g, ''); // remove punctuation
+    const normId = s => String(s ?? '')
+      .toLowerCase()
+      .replace(/\s+/g, '')
+      .replace(/\u200B/g, '')   // zero-width
+      .replace(/[-–—]/g, '-')   // normalize dashes
+      .trim();
+
+    const aliasIdx = (H, aliases) => {
+      const HN = H.map(normHeader);
+      const want = (Array.isArray(aliases) ? aliases : [aliases]).map(normHeader);
+      for (const w of want) {
+        const i = HN.indexOf(w);
+        if (i !== -1) return i;
+      }
+      return -1;
+    };
+
+    let total = 0;
+
+    allSheets.forEach(sheetName => {
+      const sh = adjSS.getSheetByName(sheetName);
+      if (!sh) { Logger.log(`⚠️ Sheet "${sheetName}" not found in Inputs file.`); return; }
+      const raw = sh.getDataRange().getValues();
+      if (raw.length < 2) { Logger.log(`⚠️ Sheet "${sheetName}" is empty.`); return; }
+
+      const headers = raw[0].map(h => String(h || '').trim());
+      const IDX = {
+        ID: aliasIdx(headers, ['employee id','emp id','employeeid','employee code','empcode','id']),
+        NAME: aliasIdx(headers, ['employee name','name']),
+        TYPE: aliasIdx(headers, ['type','ot type','adj type','category type']),
+        VALUE: aliasIdx(headers, ['value','units','qty','no. of days','days','hours','hours/units','unit']),
+        RATE: aliasIdx(headers, ['rate','hourly rate','daily rate','amount per unit','amount/day','amount/hour']),
+        AMOUNT: aliasIdx(headers, ['amount','ot amount','value amount','amt','total','computed amount','net amount']),
+        DESC: aliasIdx(headers, ['description','adjustment name','remarks','particulars','component','item']),
+        CAT: aliasIdx(headers, ['payroll category','category','payrollcomponent','component group'])
+      };
+
+      raw.slice(1).forEach(r => {
+        const idRaw = IDX.ID === -1 ? '' : r[IDX.ID];
+        const empId = normId(idRaw);
+        if (!empId) return;
+
+        const typeText = IDX.TYPE === -1 ? '' : r[IDX.TYPE];
+        const row = {
+          Sheet: sheetName,
+          'Employee ID': empId, // normalized
+          'Employee Name': IDX.NAME === -1 ? '' : String(r[IDX.NAME] || '').trim(),
+          'Type': String(typeText || '').trim(),
+          'OT Type': String(typeText || '').trim(),
+          'Value': IDX.VALUE === -1 ? 0 : num(r[IDX.VALUE]),
+          'Rate': IDX.RATE  === -1 ? 0 : num(r[IDX.RATE]),
+          'Hours': IDX.VALUE === -1 ? 0 : num(r[IDX.VALUE]),
+          'Days':  IDX.VALUE === -1 ? 0 : num(r[IDX.VALUE]),
+          'Amount': IDX.AMOUNT === -1 ? 0 : num(r[IDX.AMOUNT]),
+          'Description': IDX.DESC === -1
+              ? (String(typeText || '').trim() || sheetName)
+              : String(r[IDX.DESC] || typeText || '').trim(),
+          'Payroll Category': IDX.CAT === -1 ? '' : String(r[IDX.CAT] || '').trim(),
+          'Adjustment Name': IDX.DESC === -1 ? '' : String(r[IDX.DESC] || '').trim()
+        };
+        allRows.push(row);
+        total++;
+      });
+    });
+
+    Logger.log(`✅ Inputs loaded: ${total} rows across ${allSheets.length} sheets`);
+    return allRows;
+
+  } catch (err) {
+    Logger.log('_loadAdjustmentInputs_ error: ' + err.message);
+    return [];
+  }
+}
+
+// Payslip snapshot sheet (stored in the CONTAINER spreadsheet)
+const _PAYSLIP_INPUT_SNAPSHOT = '_PAYSLIP_INPUT_SNAPSHOT';
+
+function _ensurePayslipSnapshotHidden_(ss) {
+  try {
+    if (!ss) ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sh = ss.getSheetByName(_PAYSLIP_INPUT_SNAPSHOT);
+    if (sh) {
+      // hide unconditionally (safe even if already hidden)
+      sh.hideSheet();
+    }
+  } catch (e) {
+    // never block payslip generation just because hide failed
+    Logger.log('⚠️ _ensurePayslipSnapshotHidden_ failed: ' + e.message);
+  }
+}
+
+
+/**
+ * If payroll sheet is "(Posted)", load adjustments from snapshot inside the container SS.
+ * Otherwise, fall back to live Inputs file.
+ */
+function _loadAdjustmentInputsForPayslip_(cfg, containerSs, payrollSheetName) {
+  const isPosted = /\(\s*posted\s*\)\s*$/i.test(String(payrollSheetName || ''));
+
+  // Default: live inputs
+  if (!isPosted) {
+    return _loadAdjustmentInputs_(cfg);
+  }
+
+  const snap = containerSs.getSheetByName(_PAYSLIP_INPUT_SNAPSHOT);
+if (snap) _ensurePayslipSnapshotHidden_(containerSs);
+
+if (!snap) {
+
+    Logger.log(`⚠️ Snapshot sheet not found: ${_PAYSLIP_INPUT_SNAPSHOT}. Falling back to live inputs.`);
+    return _loadAdjustmentInputs_(cfg);
+  }
+
+  const v = snap.getDataRange().getValues();
+  if (!v || v.length < 2) return [];
+
+  const hdr = v[0].map(h => String(h || '').trim());
+
+  const idx = (name) => hdr.findIndex(h => String(h).toLowerCase() === String(name).toLowerCase());
+
+  const iPosted = idx('Posted Sheet Name');
+  const iSheet  = idx('Source Sheet');
+  const iEmpId  = idx('Employee ID');
+  const iEmpNm  = idx('Employee Name');
+  const iType   = idx('Type');
+  const iVal    = idx('Value');
+  const iRate   = idx('Rate');
+  const iHours  = idx('Hours');
+  const iDays   = idx('Days');
+  const iAmt    = idx('Amount');
+  const iDesc   = idx('Description');
+  const iCat    = idx('Payroll Category');
+  const iAdjNm  = idx('Adjustment Name');
+
+  // If required headers are missing, fail safely.
+  const required = { iPosted, iSheet, iEmpId, iEmpNm, iType, iAmt };
+  const missing = Object.entries(required).filter(([k, val]) => val < 0).map(([k]) => k);
+  if (missing.length) {
+    Logger.log(`⚠️ Snapshot headers missing (${missing.join(', ')}). Falling back to live inputs.`);
+    return _loadAdjustmentInputs_(cfg);
+  }
+
+  // Normalize sheet-name match to avoid dash/space issues
+  const normSheetName = s => String(s || '')
+    .trim()
+    .toUpperCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[-–—]/g, '-');
+
+  const want = normSheetName(payrollSheetName);
+
+  const out = [];
+  for (let r = 1; r < v.length; r++) {
+    const rowPosted = normSheetName(v[r][iPosted]);
+    if (rowPosted !== want) continue;
+
+    out.push({
+      Sheet: String(v[r][iSheet] || '').trim(),
+      'Employee ID': String(v[r][iEmpId] || '').trim(),
+      'Employee Name': String(v[r][iEmpNm] || '').trim(),
+      Type: String(v[r][iType] || '').trim(),
+      Value: Number(v[r][iVal]) || 0,
+      Rate: Number(v[r][iRate]) || 0,
+      Hours: Number(v[r][iHours]) || 0,
+      Days: Number(v[r][iDays]) || 0,
+      Amount: Number(v[r][iAmt]) || 0,
+      Description: String(v[r][iDesc] || '').trim(),
+      'Payroll Category': String(v[r][iCat] || '').trim(),
+      'Adjustment Name': String(v[r][iAdjNm] || '').trim(),
+    });
+  }
+
+  Logger.log(`✅ Snapshot adjustments loaded: ${out.length} rows for "${payrollSheetName}"`);
+  return out;
+}
+
+
+/** Build per-employee tag map (with VA filtering + WTAX & OVERTIME merge) */
+function _buildTagMapForRow_(r, hdr, masterMap, mHdr, allAdjustments, tagSet, componentMap) {
+
+  const map = {};
+
+  // --- Robust header mapping: keep original, lower, and UPPER keys
+  hdr.forEach((h, i) => {
+    const orig  = String(h || '').trim();
+    const lower = orig.toLowerCase();
+    const upper = orig.toUpperCase();
+    const val   = r[i];
+    map[orig]   = val;
+    map[lower]  = val;
+    map[upper]  = val;
+  });
+
+  // Canonical keys for Employee ID / Name
+  if (map['Employee ID'] == null && map['employee id'] != null) map['Employee ID'] = map['employee id'];
+  if (map['Employee ID'] == null && map['EMPLOYEE ID']  != null) map['Employee ID'] = map['EMPLOYEE ID'];
+
+  if (map['Employee Name'] == null && map['employee name'] != null) map['Employee Name'] = map['employee name'];
+  if (map['Employee Name'] == null && map['EMPLOYEE NAME']  != null) map['Employee Name'] = map['EMPLOYEE NAME'];
+
+  const empIdRaw = String(map['Employee ID'] || '').trim();
+  const normId = s => String(s ?? '')
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/\u200B/g, '')
+    .replace(/[-–—]/g, '-')
+    .trim();
+  const empIdKey = normId(empIdRaw);
+
+  // Helpers
+  const tz = Session.getScriptTimeZone();
+  const toNum = (v) => {
+    if (v === null || v === undefined || v === '') return 0;
+    if (typeof v === 'number') return v;
+    const n = Number(String(v).replace(/[₱,()\s]/g, '').replace(/^-\s*/, '-'));
+    return isNaN(n) ? 0 : n;
+  };
+  const fmtAmt = (n) => (toNum(n)).toLocaleString(undefined, { minimumFractionDigits: 2 });
+  const fmtNeg = (n) => '-' + Math.abs(toNum(n)).toLocaleString(undefined, { minimumFractionDigits: 2 });
+  const fmtNum = (n, d = 2) => (toNum(n)).toFixed(d);
+
+  // --- MF.* only
+    // --- MF.* only (raw or normalized ID)
+  const mRow = masterMap.get(empIdRaw) || masterMap.get(empIdKey);
+  if (mRow) {
+
+    mHdr.forEach((h, i) => {
+      const clean = String(h).trim();
+      const lower = clean.toLowerCase();
+      const upper = clean.toUpperCase();
+      const val   = String(mRow[i] || '').trim();
+      map[`MF.${clean}`] = val;
+      map[`MF.${lower}`] = val;
+      map[`MF.${upper}`] = val;
+    });
+  }
+
+  // --- Date fields
+  const dateFields = ['From','To','Crediting Date','START DATE','Date Hired','Date From','Date To','MF.START DATE','Payroll Month'];
+  const toDate = (v) => {
+    if (!v) return null;
+    if (Object.prototype.toString.call(v) === '[object Date]') return isNaN(v) ? null : v;
+    if (typeof v === 'number') return new Date(1899, 11, 30 + v);
+    const d = new Date(v); return isNaN(d) ? null : d;
+  };
+  dateFields.forEach(f => {
+    const v = map[f] ?? map[String(f).toLowerCase()] ?? map[String(f).toUpperCase()];
+    const d = toDate(v);
+    if (d) {
+      const pretty = Utilities.formatDate(d, tz, 'MMMM dd, yyyy');
+      map[f] = pretty;
+      map[f.toLowerCase()] = pretty;
+      map[f.toUpperCase()] = pretty;
+    }
+  });
+
+  // --- Precompute helpers for Variable_Adjustments filtering
+  const hdrLower = hdr.map(h => String(h || '').trim().toLowerCase());
+  const templateBaseTagsLower = new Set(
+    Array.from(tagSet || [])
+      .map(t => String(t || '').trim())
+      // ignore composite tags (ADJ.*, MF.*)
+      .filter(t => !/^adj\./i.test(t) && !/^mf\./i.test(t))
+      .map(t => t.toLowerCase())
+  );
+
+  // helper: merge a delta amount into a payroll field (header)
+  const mergeIntoPayrollField = (fieldName, delta) => {
+    if (!delta) return;
+    const fieldLower = String(fieldName).toLowerCase();
+
+    // find the real header in hdr (for consistent key)
+    let headerName = null;
+    const idx = hdrLower.indexOf(fieldLower);
+    if (idx !== -1) headerName = hdr[idx];
+    else headerName = fieldName; // fallback, even if not literally a header
+
+    const current = toNum(map[headerName] || map[headerName.toLowerCase()] || map[headerName.toUpperCase()] || 0);
+    const updated = current + toNum(delta);
+
+    map[headerName] = updated;
+    map[headerName.toLowerCase()] = updated;
+    map[headerName.toUpperCase()] = updated;
+  };
+
+  // helper: find first header whose text contains any of the given keywords
+  const findHeaderByKeywords = (keywords) => {
+    const kws = keywords.map(k => k.toLowerCase());
+    for (let i = 0; i < hdrLower.length; i++) {
+      const h = hdrLower[i];
+      for (let k of kws) {
+        if (h.indexOf(k) !== -1) return hdr[i];
+      }
+    }
+    return null;
+  };
+
+  // --- Shared OT aggregation (for both VA + Overtime sheet)
+  const groupedOT = {};
+  const addToGroupedOT = (type, hrs, amt, hasHours) => {
+    const key = (type || 'Overtime').trim() || 'Overtime';
+    if (!groupedOT[key]) groupedOT[key] = { hrs: 0, amt: 0, hasHours: false };
+    groupedOT[key].amt += toNum(amt);
+    if (hasHours && hrs != null && hrs !== '') {
+      const h = toNum(hrs);
+      groupedOT[key].hrs += h;
+      if (h !== 0) groupedOT[key].hasHours = true;
+    }
+  };
+
+  // --- Employee adjustments (match by Employee ID, case-insensitive)
+  const empAdjustments = allAdjustments.filter(a =>
+    String(a['Employee ID'] || '').trim().toLowerCase() === empIdKey
+  );
+  Logger.log(`🧩 Found ${empAdjustments.length} adjustment rows for ${map['Employee Name'] || ''} (${empIdKey})`);
+
+  /* ============================================================
+   * Variable Adjustments
+   * - Skip items whose description matches an existing payroll tag
+   *   used in the template (prevents duplication vs. main columns).
+   * - If name is "Withholding Tax" → feed the Withholding Tax tag
+   *   without double-counting against the payroll column.
+   * - If name is "Overtime"/"Overtime Pay"/"OT" → merge into Overtime tag
+   *   AND also appear in ADJ.OT Breakdown / Totals (amount-only if no hrs).
+   * ============================================================ */
+  const varAdj = empAdjustments.filter(a => a.Sheet === 'Variable_Adjustments');
+const groupedVar = {};
+let totalVAWtax = 0; // collect WTAX from Variable_Adjustments
+
+// --- NEW: collect statutory system components from Variable_Adjustments (EE/ER shares)
+// Normalize: "PAG-IBIG EE", "pag ibig ee", "PAGIBIG EE" -> "pag ibig ee"
+const _normSysKey_ = s => String(s || '')
+  .toLowerCase()
+  .replace(/[_-]+/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+const SYS_VA_MAP = {
+  'sss ee mc':      'SSS EE MC',
+  'sss ee mpf':     'SSS EE MPF',
+  'philhealth ee':  'PHILHEALTH EE',
+  'pag ibig ee':    'PAG-IBIG EE',
+
+  'sss er mc':      'SSS ER MC',
+  'sss er mpf':     'SSS ER MPF',
+  'sss ec':         'SSS EC',
+  'philhealth er':  'PHILHEALTH ER',
+  'pag ibig er':    'PAG-IBIG ER',
+};
+
+const totalVASys = Object.create(null); // e.g. { 'SSS EE MC': 123.45, ... }
+
+
+  varAdj.forEach(a => {
+    const rawDesc = (a['Description'] || a['Payroll Category'] || 'Misc').trim();
+    const descLower = rawDesc.toLowerCase();
+    const amt = toNum(a['Amount']);
+    const cat = String(a['Payroll Category'] || '').trim().toLowerCase();
+
+    if (!amt) return; // nothing to show / merge
+
+    // 1) Special case: Withholding Tax from Variable_Adjustments
+    //    -> collect amount; actual merge is done AFTER the loop
+    if (['withholding tax', 'withholding', 'wtax'].includes(descLower)) {
+      totalVAWtax += amt;
+      return; // do NOT add to ADJ.* tags
+      
+    }
+
+// 1b) NEW: statutory system components from Variable_Adjustments
+//     -> collect amount; merge is done AFTER the loop (and NOT added to ADJ.*)
+const sysKey = SYS_VA_MAP[_normSysKey_(rawDesc)];
+if (sysKey) {
+  totalVASys[sysKey] = (totalVASys[sysKey] || 0) + amt;
+  return; // do NOT add to ADJ.* tags
+}
+
+
+    // 2) Special case: Overtime from Variable_Adjustments
+    //    → merge into main Overtime field AND ADJ.OT Breakdown (amount-only, no hrs)
+    if (['overtime', 'overtime pay', 'ot'].includes(descLower)) {
+      const otHeader = findHeaderByKeywords(['overtime']) || 'Overtime';
+      mergeIntoPayrollField(otHeader, amt);
+
+      // For VA OT, treat as "no hours" – only amount shows in ADJ.OT Breakdown
+      addToGroupedOT(rawDesc || 'Overtime', 0, amt, false);
+
+      return; // still do NOT add to ADJ.Earnings/Deductions Breakdown
+    }
+
+    // 3) If description matches some payroll header AND that header
+    //    is actually used as a tag in the template, skip from ADJ.*
+    const hdrIdx = hdrLower.indexOf(descLower);
+    if (hdrIdx !== -1) {
+      const headerName = String(hdr[hdrIdx] || '').trim();
+      if (templateBaseTagsLower.has(headerName.toLowerCase())) {
+        // Example: desc = "Other Deductions" and template has {{Other Deductions}}
+        // → let the main column handle it, don't repeat in ADJ.Deductions.
+        return;
+      }
+    }
+
+    // 4) Otherwise, aggregate by description into ADJ.Earnings/ADJ.Deductions
+    groupedVar[rawDesc] = (groupedVar[rawDesc] || 0) + amt;
+    if (!groupedVar[`__cat_${rawDesc}`]) groupedVar[`__cat_${rawDesc}`] = cat;
+    const hdrIdx2 = hdrLower.indexOf(descLower);
+groupedVar[`__isHdr_${rawDesc}`] = (hdrIdx2 !== -1);
+
+  });
+
+  // ✅ Apply merged Withholding Tax rule AFTER scanning Variable_Adjustments
+  if (totalVAWtax !== 0) {
+    const existingW = toNum(
+      map['Withholding Tax'] ||
+      map['withholding tax'] ||
+      map['WITHHOLDING TAX'] ||
+      0
+    );
+
+// --- NEW: merge statutory system components like WTAX (only if payroll column is blank/0)
+Object.keys(totalVASys).forEach(fieldName => {
+  const delta = totalVASys[fieldName];
+  if (!delta) return;
+
+  // Use the actual payroll header casing if it exists
+  const fieldLower = String(fieldName).toLowerCase();
+  const idx = hdrLower.indexOf(fieldLower);
+  const headerName = (idx !== -1) ? hdr[idx] : fieldName;
+
+  const existing = toNum(
+    map[headerName] ||
+    map[headerName.toLowerCase()] ||
+    map[headerName.toUpperCase()] ||
+    0
+  );
+
+  const finalVal = (Math.abs(existing) < 0.005)
+    ? existing + delta
+    : existing;
+
+  map[headerName] = finalVal;
+  map[headerName.toLowerCase()] = finalVal;
+  map[headerName.toUpperCase()] = finalVal;
+});
+
+
+    // If payroll column is 0/blank, use VA amount.
+    // If payroll already has a value, keep it (avoid double counting).
+    const finalW = (Math.abs(existingW) < 0.005)
+      ? existingW + totalVAWtax
+      : existingW;
+
+    map['Withholding Tax']  = finalW;
+    map['withholding tax']  = finalW;
+    map['WITHHOLDING TAX']  = finalW;
+  }
+
+  let totalVarEarn = 0, totalVarDed = 0;
+  const labelWidth = 30;
+  const earnLines = [], dedLines = [];
+
+  Object.entries(groupedVar).forEach(([desc, amt]) => {
+    if (desc.startsWith('__cat_')) return; // skip category metadata
+
+    const label = (desc + ' '.repeat(labelWidth)).substring(0, labelWidth);
+    const cat = groupedVar[`__cat_${desc}`] || '';
+
+    const isAddition = cat === 'addition';
+    if (amt < 0 && !isAddition) {
+      dedLines.push(`${label} ${fmtNeg(Math.abs(amt))}`);
+      totalVarDed += Math.abs(amt);
+    } else if (amt > 0 || isAddition) {
+      earnLines.push(`${label} ${fmtAmt(amt)}`);
+      totalVarEarn += amt;
+    }
+  });
+
+  map['ADJ.Earnings Breakdown']   = earnLines.join('\n');
+  map['ADJ.Deductions Breakdown'] = dedLines.join('\n');
+  map['ADJ.Total Earnings']       = fmtAmt(totalVarEarn);
+  map['ADJ.Total Deductions']     = fmtNeg(totalVarDed);
+
+
+
+  // --- Overtime (from dedicated Overtime sheet, plus any VA OT already added)
+  const otRows = empAdjustments.filter(a => a.Sheet === 'Overtime');
+  otRows.forEach(row => {
+    const type = (row['OT Type'] || row['Type'] || 'OT').trim();
+    const hrs  = toNum(row['Hours']);
+    const amt  = toNum(row['Amount']);
+    // For real OT rows, we do have hours
+    addToGroupedOT(type, hrs, amt, true);
+  });
+
+  const otLines = Object.entries(groupedOT).map(([k, v]) => {
+    const label = (k + ' '.repeat(25)).substring(0,25);
+    if (v.hasHours) {
+      // Normal case: show hours and amount
+      return `${label} ${fmtNum(v.hrs,2)} hr(s) = ${fmtAmt(v.amt)}`;
+    }
+    // VA-only OT: show amount only (no "0.00 hr(s)")
+    return `${label} = ${fmtAmt(v.amt)}`;
+  });
+
+  map['ADJ.OT Breakdown']     = otLines.join('\n');
+  map['ADJ.OT Total Amount']  = fmtAmt(Object.values(groupedOT).reduce((s, v) => s + v.amt, 0));
+  map['ADJ.OT Total Hours']   = fmtNum(Object.values(groupedOT).reduce((s, v) => s + v.hrs, 0), 2);
+
+  // --- Absences & Tardiness
+  const atRows  = empAdjustments.filter(a => a.Sheet === 'Absences_Tardiness');
+  const absRows = atRows.filter(a => /^absence$/i.test(String(a['Type'] || '')));
+  const tarRows = atRows.filter(a => /^tardiness$/i.test(String(a['Type'] || '')));
+
+  const absDays = absRows.reduce((s,row)=> s + toNum(row['Value']), 0);
+  const absAmt  = absRows.reduce((s,row)=> s + toNum(row['Amount']), 0);
+  const tarHrs  = tarRows.reduce((s,row)=> s + toNum(row['Value']), 0);
+  const tarAmt  = tarRows.reduce((s,row)=> s + toNum(row['Amount']), 0);
+
+  const absLines = absRows.map(row => {
+    const v = toNum(row['Value']), rate = toNum(row['Rate']), amt = toNum(row['Amount']);
+    return `Absence (${fmtNum(v)} day${v===1?'':'s'} @ ${fmtAmt(rate)}): ${fmtNeg(Math.abs(amt))}`;
+  });
+  const tarLines = tarRows.map(row => {
+    const v = toNum(row['Value']), rate = toNum(row['Rate']), amt = toNum(row['Amount']);
+    return `Tardiness (${fmtNum(v)} hr${v===1?'':'s'} @ ${fmtAmt(rate)}): ${fmtNeg(Math.abs(amt))}`;
+  });
+
+  map['ADJ.Absence Breakdown']     = absLines.join('\n');
+  map['ADJ.Tardy Breakdown']       = tarLines.join('\n');
+  map['ADJ.Absence Total Days']    = fmtNum(absDays, 2);
+  map['ADJ.Absence Total Amount']  = fmtNeg(Math.abs(absAmt));
+  map['ADJ.Tardy Total Hours']     = fmtNum(tarHrs, 2);
+  map['ADJ.Tardy Total Amount']    = fmtNeg(Math.abs(tarAmt));
+  map['ADJ.Attendance Breakdown']  = [absLines.join('\n'), tarLines.join('\n')].filter(Boolean).join('\n');
+
+
+
+  /* ============================================================
+   * Dynamic Earnings/Deductions table tags (Field + Amount)
+   * - ITEMIZED: uses payroll header/component name, and VA Description
+   * - Skips empties per employee
+   * - Enforces ordering:
+   *   Earnings: Basic Pay → +Recurring(each) → Overtime → Other earnings(each)
+   *   Deductions: WTAX → SSS EE MC → SSS EE MPF → PH EE → PI EE → -Recurring(each) → Other deductions(each)
+   * - EXCLUDES employer contributions (SSS ER*, SSS EC, PH ER, PI ER) from "Other Earnings"
+   * ============================================================ */
+
+  const MAX_LINES_EARN = 12;
+  const MAX_LINES_DED  = 12;
+
+  const normT = s => String(s || '')
+    .toLowerCase()
+    .replace(/\u00a0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const fmtAcct = (n, asDeduction) => {
+    const v = Math.abs(toNum(n));
+    if (v < 0.005) return '';
+    const s = v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return asDeduction ? `(${s})` : s;
+  };
+
+  const findHdrCI = (aliases) => {
+    const wants = (Array.isArray(aliases) ? aliases : [aliases]).map(normT);
+    // exact
+    for (let i = 0; i < hdr.length; i++) {
+      const nh = normT(hdr[i]);
+      if (wants.includes(nh)) return hdr[i];
+    }
+    // contains
+    for (let i = 0; i < hdr.length; i++) {
+      const nh = normT(hdr[i]);
+      for (const w of wants) if (nh.includes(w)) return hdr[i];
+    }
+    return null;
+  };
+
+  const getValByAliases = (aliases) => {
+    const h = findHdrCI(aliases);
+    if (!h) return 0;
+    return toNum(
+      map[h] ??
+      map[String(h).toLowerCase()] ??
+      map[String(h).toUpperCase()] ??
+      0
+    );
+  };
+
+  // Build component meta lookup (best-effort; safe if componentMap missing)
+  const compMetaByName = Object.create(null);
+try {
+  if (componentMap && typeof componentMap === 'object') {
+    Object.keys(componentMap).forEach(k => {
+      const rec = componentMap[k];
+
+      // ✅ index by map key (often equals payroll header)
+      const kk = normT(k);
+      if (kk) compMetaByName[kk] = rec;
+
+      // ✅ also index by rec.name when present
+      const rn = rec && rec.name ? normT(rec.name) : '';
+      if (rn) compMetaByName[rn] = rec;
+    });
+  }
+} catch (e) {}
+
+
+  const getMeta = (headerName) => compMetaByName[normT(headerName)] || null;
+
+  const isInfoOrTotal = (h) => {
+  const nh = normT(h);
+
+  // identity + period metadata
+  if (nh === 'employee id' || nh === 'employee name') return true;
+  if (nh === 'period' || nh === 'from' || nh === 'to') return true;
+  if (nh.includes('crediting')) return true;
+  if (nh === 'payroll month') return true;
+
+  // totals / summary fields
+  if (nh === 'gross pay' || nh === 'net pay') return true;
+
+  // IMPORTANT: only exclude "Taxable Income" style summary columns,
+  // NOT anything that merely contains the words "taxable" / "non-taxable"
+  if (nh === 'taxable income' || nh.includes('taxable income')) return true;
+  if (nh === 'non-taxable income' || nh.includes('non-taxable income')) return true;
+
+  // generic totals
+  if (nh.includes('total') && (nh.includes('pay') || nh.includes('earn') || nh.includes('ded'))) return true;
+
+  return false;
+};
+
+
+  const isSystemEE = (h) => {
+    const nh = normT(h);
+    const aliases = [
+      'withholding tax','wtax',
+      'sss ee mc','sss mc ee','sss ee',
+      'sss ee mpf','sss mpf ee',
+      'philhealth ee','phic ee','ph ee',
+      'pag-ibig ee','pag ibig ee','pagibig ee','hdmf ee'
+    ].map(normT);
+    if (aliases.includes(nh)) return true;
+    return aliases.some(a => nh.includes(a));
+  };
+
+  const isEmployerContrib = (h) => {
+    const nh = normT(h);
+
+     // ✅ Let refunds/reversals pass through into earnings breakdown
+  if (/\b(refund|reversal|return)\b/i.test(nh)) return false;
+    const aliases = [
+      'sss er mc','sss mc er',
+      'sss er mpf','sss mpf er',
+      'sss ec',
+      'philhealth er','phic er','ph er',
+      'pag-ibig er','pag ibig er','pagibig er','hdmf er'
+    ].map(normT);
+    if (aliases.includes(nh)) return true;
+    return aliases.some(a => nh.includes(a));
+  };
+
+  const hBasic = findHdrCI(['Basic Pay', 'BASIC PAY']) || findHeaderByKeywords(['basic pay']) || 'Basic Pay';
+  const hOT    = findHeaderByKeywords(['overtime']) || findHdrCI(['Overtime', 'OT', 'Overtime Pay']);
+
+  // System deduction values (dedicated rows)
+  const valWtax = getValByAliases(['Withholding Tax', 'WTAX']);
+  const valSSS1 = getValByAliases(['SSS EE MC', 'SSS MC EE', 'SSS EE']);
+  const valSSS2 = getValByAliases(['SSS EE MPF', 'SSS MPF EE']);
+  const valPH   = getValByAliases(['PHILHEALTH EE', 'PhilHealth EE', 'PHIC EE', 'PH EE']);
+  const valPI   = getValByAliases(['PAG-IBIG EE', 'Pag-IBIG EE', 'PAGIBIG EE', 'HDMF EE']);
+
+  // Collect rows in required groups, preserving payroll header order
+  const recurringEarnRows = [];
+  const recurringDedRows  = [];
+  const otherEarnRows     = [];
+  const otherDedRows      = [];
+
+  // Basic + OT amounts (single rows)
+  const basicPayAmt = toNum(map[hBasic] ?? map[String(hBasic).toLowerCase()] ?? map[String(hBasic).toUpperCase()] ?? 0);
+  const overtimeAmt = hOT ? toNum(map[hOT] ?? map[String(hOT).toLowerCase()] ?? map[String(hOT).toUpperCase()] ?? 0) : 0;
+
+  for (let i = 0; i < hdr.length; i++) {
+    const h = hdr[i];
+    if (!h) continue;
+    if (isInfoOrTotal(h)) continue;
+
+    // handled separately
+    if (normT(h) === normT(hBasic)) continue;
+    if (hOT && normT(h) === normT(hOT)) continue;
+
+    // never show employer contributions in earnings breakdown
+    if (isEmployerContrib(h)) continue;
+
+    // system EE deductions handled as dedicated rows (not part of "other")
+    if (isSystemEE(h)) continue;
+
+    const v = toNum(map[h] ?? map[String(h).toLowerCase()] ?? map[String(h).toUpperCase()] ?? 0);
+    if (Math.abs(v) < 0.005) continue;
+
+    const meta = getMeta(h);
+    const src  = meta ? String(meta.source || '') : '';
+    const cat  = meta ? String(meta.category || '').toLowerCase() : '';
+
+    const label = (meta && meta.name) ? String(meta.name) : String(h);
+
+    const isRecurring = (String(src).toUpperCase() === 'RECURRING');
+
+const isAdditionCat  = /^addition\b/i.test(cat);
+const isDeductionCat = /^deduction\b/i.test(cat);
+
+// ✅ "loan" keyword only applies if NOT categorized as addition
+const treatAsDed = isDeductionCat || (!isAdditionCat && /deduction|loan|advance|recovery|arrears/i.test(h));
+
+
+    if (isRecurring) {
+      if (v > 0 && !treatAsDed) recurringEarnRows.push({ label, amt: v, isDed: false });
+      else recurringDedRows.push({ label, amt: Math.abs(v), isDed: true });
+      continue;
+    }
+
+    // Non-recurring: classify by sign / category
+    if (v < 0 || treatAsDed) otherDedRows.push({ label, amt: Math.abs(v), isDed: true });
+    else otherEarnRows.push({ label, amt: v, isDed: false });
+  }
+
+  // Include extra Variable_Adjustments that are NOT payroll headers (itemized)
+  // (these are the ones you intentionally kept in groupedVar)
+  Object.entries(groupedVar).forEach(([desc, amt]) => {
+    if (desc.startsWith('__cat_')) return;
+    if (desc.startsWith('__isHdr_')) return;
+
+    const inHdr = !!groupedVar[`__isHdr_${desc}`];
+    if (inHdr) return; // payroll header already shows it
+
+    const a = toNum(amt);
+    if (Math.abs(a) < 0.005) return;
+
+    // Safety: don't ever let employer contributions leak from VA naming
+    if (isEmployerContrib(desc)) return;
+
+    const cat = String(groupedVar[`__cat_${desc}`] || '').toLowerCase();
+    const isAddition = /^addition\b/i.test(cat);
+
+
+    if (a < 0 && !isAddition) otherDedRows.push({ label: desc, amt: Math.abs(a), isDed: true });
+    else otherEarnRows.push({ label: desc, amt: a, isDed: false });
+  });
+
+  // ✅ System EE items: if positive (refund), show in EARN; if negative, show in DED
+  const sysEarnRows = [];
+  const sysDedRows  = [];
+
+  const pushSys = (label, val) => {
+    const v = toNum(val);
+    if (Math.abs(v) < 0.005) return;
+    if (v > 0) sysEarnRows.push({ label, amt: v, isDed: false });
+    else       sysDedRows.push({ label, amt: Math.abs(v), isDed: true });
+  };
+
+  pushSys('Withholding Tax', valWtax);
+  pushSys('SSS EE MC',       valSSS1);
+  pushSys('SSS EE MPF',      valSSS2);
+  pushSys('PhilHealth EE',   valPH);
+  pushSys('Pag-IBIG EE',     valPI);
+
+
+  // Assemble final ordered rows
+  let earnRows = [];
+  if (Math.abs(basicPayAmt) >= 0.005) earnRows.push({ label: 'Basic Pay', amt: basicPayAmt, isDed: false });
+  earnRows = earnRows.concat(recurringEarnRows);
+
+  // ✅ insert system refunds into earnings (so they become {{EARN.n.FIELD}} / {{EARN.n.AMOUNT}})
+  earnRows = earnRows.concat(sysEarnRows);
+
+  if (overtimeAmt >= 0.005) earnRows.push({ label: 'Overtime', amt: overtimeAmt, isDed: false });
+  earnRows = earnRows.concat(otherEarnRows);
+
+  let dedRows = [];
+
+  // ✅ system deductions remain deductions (always positive amt here, formatted as (x.xx))
+  dedRows = dedRows.concat(sysDedRows);
+
+  dedRows = dedRows.concat(recurringDedRows);
+  dedRows = dedRows.concat(otherDedRows);
+
+
+  // If too many rows for your template, keep detail up to MAX-1 and collapse the rest into one final "Other"
+  const collapseOverflow = (rows, max, overflowLabel, isDed) => {
+    if (rows.length <= max) return rows;
+    const keep = rows.slice(0, Math.max(0, max - 1));
+    const rest = rows.slice(Math.max(0, max - 1));
+    const sum  = rest.reduce((s, r) => s + toNum(r.amt), 0);
+    keep.push({ label: overflowLabel, amt: sum, isDed: !!isDed });
+    return keep;
+  };
+
+  earnRows = collapseOverflow(earnRows, MAX_LINES_EARN, 'Other Earnings', false);
+  dedRows  = collapseOverflow(dedRows,  MAX_LINES_DED,  'Other Deductions', true);
+
+  const setRowTags = (prefix, idx, label, amt, isDed) => {
+  const k1 = String(idx);
+  const k2 = String(idx).padStart(2, '0');
+
+  const L = String(label || '').toUpperCase();
+
+  map[`${prefix}.${k1}.FIELD`]  = L;
+  map[`${prefix}.${k2}.FIELD`]  = L;
+
+  const v = fmtAcct(amt, !!isDed);
+  map[`${prefix}.${k1}.AMOUNT`] = v;
+  map[`${prefix}.${k2}.AMOUNT`] = v;
+};
+
+
+  for (let i = 1; i <= MAX_LINES_EARN; i++) {
+    const row = earnRows[i - 1];
+    setRowTags('EARN', i, row ? row.label : '', row ? row.amt : 0, row ? row.isDed : false);
+  }
+
+  for (let i = 1; i <= MAX_LINES_DED; i++) {
+    const row = dedRows[i - 1];
+    setRowTags('DED', i, row ? row.label : '', row ? row.amt : 0, row ? row.isDed : true);
+  }
+
+  /* ============================================================
+   * NEW: Structured breakdown row tags (tables)
+   * - Keeps existing multiline tags (ADJ.* Breakdown) intact
+   * - Adds row-based tags: OT.*, ATT.*, ADJ.EARN.*, ADJ.DED.*
+   * ============================================================ */
+
+  const MAX_OT_LINES   = 12;
+  const MAX_ATT_LINES  = 12;
+  const MAX_ADJ_LINES  = 20;
+
+  const fmtAcct2 = (n, asDeduction) => {
+    const v = Math.abs(toNum(n));
+    if (v < 0.005) return '';
+    const s = v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return asDeduction ? `(${s})` : s;
+  };
+
+  const fmtNum2 = (n, d = 2) => {
+    const v = toNum(n);
+    if (Math.abs(v) < 0.005) return '';
+    return v.toFixed(d);
+  };
+
+  const setRow = (prefix, idx, obj) => {
+  const k1 = String(idx);
+  const k2 = String(idx).padStart(2, '0');
+
+  Object.keys(obj).forEach(field => {
+    const val = obj[field];
+    const out = (typeof val === 'string') ? val.toUpperCase() : val;
+
+    map[`${prefix}.${k1}.${field}`] = out;
+    map[`${prefix}.${k2}.${field}`] = out;
+  });
+};
+
+
+  /* -------------------------
+   * OT rows (by OT type)
+   * ------------------------- */
+  const otEntries = Object.entries(groupedOT || {})
+    .map(([type, v]) => ({
+      type,
+      hrs: toNum(v && v.hrs),
+      amt: toNum(v && v.amt),
+      hasHours: !!(v && v.hasHours)
+    }))
+    .filter(o => Math.abs(o.amt) >= 0.005);
+
+  map['OT.COUNT'] = otEntries.length;
+
+  for (let i = 1; i <= MAX_OT_LINES; i++) {
+    const row = otEntries[i - 1];
+    if (!row) {
+      setRow('OT', i, { TYPE:'', HOURS:'', RATE:'', AMOUNT:'' });
+      continue;
+    }
+
+    // Rate used: weighted implied rate (Amount / Hours) when Hours exist
+    const rate = (row.hasHours && row.hrs) ? (row.amt / row.hrs) : 0;
+
+    setRow('OT', i, {
+      TYPE: String(row.type || ''),
+      HOURS: (row.hasHours && row.hrs) ? fmtNum2(row.hrs, 2) : '',
+      RATE:  (row.hasHours && row.hrs) ? fmtAcct2(rate, false) : '',
+      AMOUNT: fmtAcct2(row.amt, false)
+    });
+  }
+
+  /* -------------------------
+   * Attendance rows (Absence / Tardiness)
+   * ------------------------- */
+  const attRows = [];
+
+  // absDays/absAmt, tarHrs/tarAmt already computed above
+  if (Math.abs(toNum(absAmt)) >= 0.005 || Math.abs(toNum(absDays)) >= 0.005) {
+    attRows.push({
+      type: 'Absence',
+      value: toNum(absDays),
+      unit: 'day(s)',
+      amtAbs: Math.abs(toNum(absAmt))
+    });
+  }
+  if (Math.abs(toNum(tarAmt)) >= 0.005 || Math.abs(toNum(tarHrs)) >= 0.005) {
+    attRows.push({
+      type: 'Tardiness',
+      value: toNum(tarHrs),
+      unit: 'hr(s)',
+      amtAbs: Math.abs(toNum(tarAmt))
+    });
+  }
+
+  map['ATT.COUNT'] = attRows.length;
+
+  for (let i = 1; i <= MAX_ATT_LINES; i++) {
+    const row = attRows[i - 1];
+    if (!row) {
+      setRow('ATT', i, { TYPE:'', VALUE:'', UNIT:'', AMOUNT:'' });
+      continue;
+    }
+    setRow('ATT', i, {
+      TYPE: row.type,
+      VALUE: fmtNum2(row.value, 2),
+      UNIT: row.unit,
+      AMOUNT: fmtAcct2(row.amtAbs, true) // attendance is a deduction
+    });
+  }
+
+  /* -------------------------
+   * Adjustment Earnings/Deductions rows (Variable_Adjustments)
+   * - This uses groupedVar (already excludes: WTAX, system comps, OT)
+   * - Also respects your earlier “skip if matches payroll tag” logic
+   * ------------------------- */
+  const adjEarnItems = [];
+  const adjDedItems  = [];
+
+  Object.entries(groupedVar || {}).forEach(([desc, amt]) => {
+    if (desc.startsWith('__cat_')) return;
+    if (desc.startsWith('__isHdr_')) return;
+
+    const a = toNum(amt);
+    if (Math.abs(a) < 0.005) return;
+
+    const cat = String(groupedVar[`__cat_${desc}`] || '').toLowerCase();
+    const isAddition = (cat === 'addition');
+
+    // Match your existing logic:
+    // - if amt < 0 and NOT addition => deduction
+    // - else => earning
+    if (a < 0 && !isAddition) {
+      adjDedItems.push({ name: desc, amtAbs: Math.abs(a) });
+    } else {
+      adjEarnItems.push({ name: desc, amt: a });
+    }
+  });
+
+  map['ADJ.EARN.COUNT'] = adjEarnItems.length;
+  map['ADJ.DED.COUNT']  = adjDedItems.length;
+
+  for (let i = 1; i <= MAX_ADJ_LINES; i++) {
+    const e = adjEarnItems[i - 1];
+    setRow('ADJ.EARN', i, {
+      NAME: e ? String(e.name || '') : '',
+      AMOUNT: e ? fmtAcct2(e.amt, false) : ''
+    });
+
+    const d = adjDedItems[i - 1];
+    setRow('ADJ.DED', i, {
+      NAME: d ? String(d.name || '') : '',
+      AMOUNT: d ? fmtAcct2(d.amtAbs, true) : ''
+    });
+  }
+
+
+  map['EARN.COUNT'] = earnRows.length;
+  map['DED.COUNT']  = dedRows.length;
+  // --- Ensure all template tags exist (normalized; do NOT create hidden-char duplicate keys)
+const existingNorm = new Set(Object.keys(map).map(k => _normTagKey_(k)));
+
+(tagSet || []).forEach(t => {
+  const raw = _cleanTagToken_(t);
+  if (!raw) return;
+  const nk = _normTagKey_(raw);
+  if (existingNorm.has(nk)) return;
+  map[raw] = '';
+  existingNorm.add(nk);
+});
+
+return map;
+
+}
+
+
+
+function _renderStringTemplate_(s, map) {
+  return String(s || '').replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_, k) => map[k] ?? map[String(k).trim().toLowerCase()] ?? '');
+}
+
+function _fillSheetTags_(sh, map) {
+  const range = sh.getDataRange();
+  const vals = range.getValues();
+  const rx = /\{\{\s*([^}]+?)\s*\}\}/g;
+
+  const normMap = {};
+  Object.keys(map).forEach(k => {
+    const kk = _normTagKey_(k);
+    const v = map[k];
+    if (!(kk in normMap) || normMap[kk] === '' || normMap[kk] == null) {
+      normMap[kk] = v;
+    }
+  });
+
+  for (let r = 0; r < vals.length; r++) {
+    for (let c = 0; c < vals[r].length; c++) {
+      const v = vals[r][c];
+      if (typeof v === 'string' && v.indexOf('{{') !== -1) {
+        const nv = v.replace(rx, (_, key) => {
+          const kk = _normTagKey_(key);
+          return normMap[kk] ?? '';
+        });
+        if (nv !== v) sh.getRange(r + 1, c + 1).setValue(nv);
+      }
+    }
+  }
+  SpreadsheetApp.flush();
+}
+
+/** Robust PDF exporter with validation + retries */
+function _exportSheetAsPdf_Reliable_(spreadsheetId, sheetId, filename) {
+  const urlBase = `https://docs.google.com/spreadsheets/d/${spreadsheetId}/export?` +
+    `format=pdf&gid=${sheetId}&portrait=true&size=A4&fitw=true&scale=4` +
+    `&top_margin=0.50&bottom_margin=0.50&left_margin=0.50&right_margin=0.50` +
+    `&gridlines=false&printtitle=false&sheetnames=false&pagenum=UNDEFINED` +
+    `&fzr=false&horizontal_alignment=CENTER&vertical_alignment=TOP&pageorder=1`;
+
+  let blob = null;
+  let success = false;
+  const maxTries = 5;
+
+  for (let attempt = 1; attempt <= maxTries; attempt++) {
+    try {
+      SpreadsheetApp.flush();
+      Utilities.sleep(1200 * attempt);
+      const response = UrlFetchApp.fetch(urlBase, {
+        headers: { Authorization: `Bearer ${ScriptApp.getOAuthToken()}` },
+        muteHttpExceptions: true,
+      });
+      blob = response.getBlob();
+
+      if (blob.getContentType() === 'application/pdf' && blob.getBytes().length > 2000) {
+        success = true;
+        break;
+      } else {
+        const head = blob.getDataAsString().slice(0, 120);
+        Logger.log(`⚠️ Export attempt ${attempt} returned ${blob.getContentType()} (head: ${head})`);
+      }
+    } catch (e) {
+      Logger.log(`⚠️ PDF export attempt ${attempt} failed: ${e.message}`);
+    }
+    Utilities.sleep(1800 * attempt);
+  }
+
+  if (!success) throw new Error('PDF export failed after retries.');
+  return blob.setName(filename + '.pdf');
+}
+
+function _autoResumeFailsafe_() {
+  const triggers = ScriptApp.getProjectTriggers()
+    .filter(t => t.getHandlerFunction() === 'runPayslipAuto');
+  if (!triggers.length) return;
+
+  const state = _payslipDocProps_().getProperty(_payslipRunKey_());
+  if (!state) {
+    triggers.forEach(t => { try { ScriptApp.deleteTrigger(t); } catch (e) {} });
+    Logger.log('🧹 Cleared orphaned payslip trigger (no state found).');
+  }
+}
+
+
+
+function payslipGetGmailSignatureHtml_() {
+  try {
+    if (typeof Gmail === 'undefined' || !Gmail.Users || !Gmail.Users.Settings || !Gmail.Users.Settings.SendAs) {
+      return '';
+    }
+    const list = Gmail.Users.Settings.SendAs.list('me');
+    const arr = (list && list.sendAs) ? list.sendAs : [];
+    const primary = arr.find(sa => sa && sa.isPrimary) || arr[0];
+    const sig = primary && primary.signature ? String(primary.signature) : '';
+    return sig;
+  } catch (e) {
+    return '';
+  }
+}
+
+
+
+function payslipGetGmailSignature() {
+  return payslipGetPrimaryGmailSignatureHtml_();
+}
+
+// ✅ Public wrapper for the dialog (google.script.run)
+function payslipGetGmailSignatureHtml() {
+  return payslipGetPrimaryGmailSignatureHtml_();
+}
+
+
+function payslipGetPrimaryGmailSignatureHtml_() {
+  try {
+    const resp = Gmail.Users.Settings.SendAs.list('me');
+    const arr = (resp && resp.sendAs) ? resp.sendAs : [];
+    if (!arr.length) return "";
+
+    const primary = arr.find(s => s && s.isPrimary) || arr[0];
+    return String((primary && primary.signature) ? primary.signature : "");
+  } catch (e) {
+    Logger.log("payslipGetPrimaryGmailSignatureHtml_ error: " + e);
+    return "";
+  }
+}
+
+
+/* =========================
+ * 6) Settings persistence (unchanged API)
+ * ========================= */
+function getSavedPayslipEmailSettings() {
+  const props = PropertiesService.getDocumentProperties(); // per client file
+  const data = props.getProperty('PAYSLIP_EMAIL_SETTINGS');
+  return data ? JSON.parse(data) : null;
+}
+
+function generatePayslipsSettingsSave(form) {
+  const props = PropertiesService.getDocumentProperties(); // per client file
+  props.setProperty('PAYSLIP_EMAIL_SETTINGS', JSON.stringify(form || {}));
+}
+
+
+
+function DEBUG_Payslip_OT_ATT_Tags(sheetName, templateName, employeeName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const payroll = ss.getSheetByName(sheetName);
+  const template = ss.getSheetByName(templateName || 'PayslipTemplate');
+  const cfg = _readSettings_();
+
+  const data = payroll.getDataRange().getValues();
+  const hdr = data[0].map(h => String(h||'').trim());
+  const rows = data.slice(1);
+
+  const empNameIdx = hdr.findIndex(h => /^Employee Name$/i.test(h));
+  const r = rows.find(x => String(x[empNameIdx]||'').trim() === employeeName);
+  if (!r) throw new Error('Employee not found in payroll sheet.');
+
+  const tagSet = new Set(_collectTemplateTags_(template));
+
+  const masterSS = SpreadsheetApp.openById(cfg.SOURCE_SS_ID);
+  const master = masterSS.getSheetByName(cfg.MASTER_SHEET_NAME || 'Masterfile import');
+  const mVals = master.getDataRange().getValues();
+  const mHdr = mVals[0].map(h => String(h||'').trim());
+  const mIdx = { ID:_findHeaderFuzzy_(mHdr,['Employee ID','Emp ID','ID']) };
+
+  const normId = s => String(s ?? '').toLowerCase().replace(/\s+/g,'').replace(/\u200B/g,'').replace(/[-–—]/g,'-').trim();
+  const masterMap = new Map();
+  mVals.slice(1).forEach(row => {
+    const id = String(row[mIdx.ID]||'').trim();
+    if (!id) return;
+    masterMap.set(id, row);
+    masterMap.set(normId(id), row);
+  });
+
+  const allAdj = _loadAdjustmentInputsForPayslip_({ INPUTS_SS_ID: cfg.INPUTS_SS_ID }, ss, sheetName);
+
+  let componentMap = {};
+  try { componentMap = _buildComponentMap_(cfg) || {}; } catch(e) { componentMap = {}; }
+
+  const map = _buildTagMapForRow_(r, hdr, masterMap, mHdr, allAdj, tagSet, componentMap);
+
+  Logger.log('OT.COUNT=' + map['OT.COUNT']);
+  Logger.log('OT.1.TYPE=' + map['OT.1.TYPE'] + ' OT.1.HOURS=' + map['OT.1.HOURS'] + ' OT.1.AMOUNT=' + map['OT.1.AMOUNT']);
+  Logger.log('ATT.COUNT=' + map['ATT.COUNT']);
+  Logger.log('ATT.1.TYPE=' + map['ATT.1.TYPE'] + ' ATT.1.VALUE=' + map['ATT.1.VALUE'] + ' ATT.1.AMOUNT=' + map['ATT.1.AMOUNT']);
+}
+
+function DEBUG_EmpIdMatch(sheetName, employeeName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(sheetName);
+  const data = sh.getDataRange().getValues();
+  const H = data[0].map(h => String(h || '').trim());
+  const iId = H.findIndex(h => /^Employee ID$/i.test(h));
+  const iNm = H.findIndex(h => /^Employee Name$/i.test(h));
+
+  const row = data.slice(1).find(r => String(r[iNm] || '').trim() === employeeName);
+  if (!row) throw new Error('Employee not found.');
+
+  const rawPayrollId = String(row[iId] || '').trim();
+  const kPayroll = _normEmpId_(rawPayrollId);
+
+  Logger.log(`PAYROLL raw="${rawPayrollId}" norm="${kPayroll}"`);
+
+  const cfg = _readSettings_();
+  const allAdj = _loadAdjustmentInputsForPayslip_({ INPUTS_SS_ID: cfg.INPUTS_SS_ID }, ss, sheetName);
+
+  const hits = allAdj.filter(a => String(a['Employee ID'] || '').trim().toLowerCase() === kPayroll);
+  Logger.log(`ADJ rows matched=${hits.length}`);
+  Logger.log(`Sample ADJ IDs=` + hits.slice(0,5).map(x => x['Employee ID']).join(', '));
+}
+
+function DEBUG_FindOTATTTags(templateName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(templateName);
+  if (!sh) throw new Error('Template not found: ' + templateName);
+
+  const vals = sh.getDataRange().getDisplayValues();
+  const rx = /\{\{\s*([^}]+?)\s*\}\}/g;
+
+  const found = [];
+  for (let r = 0; r < vals.length; r++) {
+    for (let c = 0; c < vals[r].length; c++) {
+      const cell = vals[r][c];
+      if (typeof cell !== 'string' || cell.indexOf('{{') === -1) continue;
+
+      rx.lastIndex = 0;
+      let m;
+      while ((m = rx.exec(cell)) !== null) {
+        const raw = String(m[1]);
+        if (/^(OT|ATT)\./i.test(raw) || /^(OT|ATT)\b/i.test(raw)) {
+          found.push({
+            a1: sh.getRange(r + 1, c + 1).getA1Notation(),
+            raw,
+            cleaned: raw.replace(/\u200B/g,'').replace(/\u00A0/g,' ').trim(),
+            codes: raw.split('').map(ch => ch.charCodeAt(0)).join(',')
+          });
+        }
+      }
+    }
+  }
+
+  Logger.log(JSON.stringify(found.slice(0, 100), null, 2));
+}
+
+function DEBUG_Payslip_OT_ATT_FromSnapshot(payrollSheetName, employeeIdOrName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const cfg = _readSettings_();
+
+  const sh = ss.getSheetByName(payrollSheetName);
+  if (!sh) throw new Error(`Payroll sheet not found: ${payrollSheetName}`);
+
+  const data = sh.getDataRange().getValues();
+  const hdr = data[0].map(h => String(h || '').trim().toUpperCase());
+
+  const iEmpId = hdr.indexOf('EMPLOYEE ID');
+  const iEmpNm = hdr.indexOf('EMPLOYEE NAME');
+  if (iEmpId < 0) throw new Error('EMPLOYEE ID column not found in payroll sheet.');
+  if (iEmpNm < 0) throw new Error('EMPLOYEE NAME column not found in payroll sheet.');
+
+  const needle = String(employeeIdOrName || '').trim().toLowerCase();
+
+  let row = null;
+  for (let r = 1; r < data.length; r++) {
+    const rid = String(data[r][iEmpId] || '').trim().toLowerCase();
+    const rnm = String(data[r][iEmpNm] || '').trim().toLowerCase();
+    if (rid === needle || rnm.includes(needle)) {
+      row = data[r];
+      break;
+    }
+  }
+  if (!row) throw new Error(`Employee not found in payroll sheet by: ${employeeIdOrName}`);
+
+  const empIdRaw = String(row[iEmpId] || '').trim();
+  const empName  = String(row[iEmpNm] || '').trim();
+
+  const allAdj = _loadAdjustmentInputsForPayslip_({ INPUTS_SS_ID: cfg.INPUTS_SS_ID }, ss, payrollSheetName);
+
+  const oldMatch = allAdj.filter(a =>
+    String(a['Employee ID']).trim().toLowerCase() === empIdRaw.toLowerCase()
+  ).length;
+
+  const newMatch = allAdj.filter(a =>
+    _normEmpIdKey_(a['Employee ID']) === _normEmpIdKey_(empIdRaw)
+  ).length;
+
+  const matched = allAdj.filter(a =>
+    _normEmpIdKey_(a['Employee ID']) === _normEmpIdKey_(empIdRaw)
+  );
+
+  const otRows  = matched.filter(a => String(a.Sheet || '') === 'Overtime');
+  const attRows = matched.filter(a => String(a.Sheet || '') === 'Absences_Tardiness');
+
+  Logger.log(JSON.stringify({
+    payrollSheetName,
+    empIdRaw,
+    empName,
+    allAdj_totalRows: allAdj.length,
+    matches_oldStrict: oldMatch,
+    matches_newNorm: newMatch,
+    matched_total: matched.length,
+    matched_overtime_rows: otRows.length,
+    matched_abs_tard_rows: attRows.length,
+    overtime_sample: otRows.slice(0, 5),
+    abs_tard_sample: attRows.slice(0, 5),
+  }, null, 2));
+}
+
+function _normEmpIdKey_(s) {
+  let t = String(s ?? '')
+    .toLowerCase()
+    .replace(/\u200B/g, '')   // zero-width
+    .replace(/\u00A0/g, '')   // NBSP
+    .replace(/\s+/g, '')
+    .replace(/[-–—]/g, '-')
+    .trim();
+
+  // Strip common "id-" prefix if present (id-56642 -> 56642)
+  t = t.replace(/^id[-:]?/i, '');
+  return t;
+}
+
+/**
+ * Applies/clears the OT/ATT borders on the payslip template based on:
+ * - A41 (OT.COUNT)  -> controls B41:F47 block
+ * - M41 (ATT.COUNT) -> controls H41:L47 block
+ *
+ * Rules:
+ * - If A41 > 0:
+ *   - all borders:     B41:F42
+ *   - outside borders: B43:F47
+ *   - outside borders: E43:E47
+ * - If M41 > 0:
+ *   - all borders:     H41:L42
+ *   - outside borders: H43:L47
+ *   - outside borders: K43:K47
+ */
+function _applyPayslipOtAttBorders_(sh) {
+  if (!sh) return;
+
+  const otCount  = Number(sh.getRange('A41').getValue()) || 0;
+  const attCount = Number(sh.getRange('M41').getValue()) || 0;
+
+  // Always clear first so "no rows" truly shows no borders
+  sh.getRange('B41:F47').setBorder(false, false, false, false, false, false);
+  sh.getRange('H41:L47').setBorder(false, false, false, false, false, false);
+
+  if (otCount > 0) {
+    // All borders (includes internal grid)
+    sh.getRange('B41:F42').setBorder(true, true, true, true, true, true);
+
+    // Outside borders only (no internal lines)
+    sh.getRange('B43:F47').setBorder(true, true, true, true, false, false);
+
+    // Outside borders for the HOURS column group (single column)
+    sh.getRange('E43:E47').setBorder(true, true, true, true, false, false);
+  }
+
+  if (attCount > 0) {
+    // All borders (includes internal grid)
+    sh.getRange('H41:L42').setBorder(true, true, true, true, true, true);
+
+    // Outside borders only (no internal lines)
+    sh.getRange('H43:L47').setBorder(true, true, true, true, false, false);
+
+    // Outside borders for the VALUE column group (single column)
+    sh.getRange('K43:K47').setBorder(true, true, true, true, false, false);
+  }
+}
+
+function DEBUG_WhyClothingIsNotBeforeOT(sheetName, templateName, employeeName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const payroll = ss.getSheetByName(sheetName);
+  const template = ss.getSheetByName(templateName || 'PayslipTemplate');
+  if (!payroll || !template) throw new Error('Missing payroll/template.');
+
+  const cfg = _readSettings_();
+
+  const data = payroll.getDataRange().getValues();
+  const hdr = data[0].map(h => String(h || '').trim());
+  const rows = data.slice(1);
+
+  const empNameIdx = hdr.findIndex(h => /^Employee Name$/i.test(h));
+  const row = rows.find(r => String(r[empNameIdx] || '').trim() === employeeName);
+  if (!row) throw new Error('Employee not found.');
+
+  // Build masterMap (same as your generator)
+  const masterSS = SpreadsheetApp.openById(cfg.SOURCE_SS_ID);
+  const master = masterSS.getSheetByName(cfg.MASTER_SHEET_NAME || 'Masterfile import');
+  const mVals = master.getDataRange().getValues();
+  const mHdr = mVals[0].map(h => String(h||'').trim());
+  const mIdx = { ID:_findHeaderFuzzy_(mHdr,['Employee ID','Emp ID','ID']) };
+
+  const normId = s => String(s ?? '').toLowerCase().replace(/\s+/g,'').replace(/\u200B/g,'').replace(/[-–—]/g,'-').trim();
+  const masterMap = new Map();
+  mVals.slice(1).forEach(r => {
+    const id = String(r[mIdx.ID] || '').trim();
+    if (!id) return;
+    masterMap.set(id, r);
+    masterMap.set(normId(id), r);
+  });
+
+  const tagSet = new Set(_collectTemplateTags_(template));
+  const allAdj = _loadAdjustmentInputsForPayslip_({ INPUTS_SS_ID: cfg.INPUTS_SS_ID }, ss, sheetName);
+
+  let componentMap = {};
+  try { componentMap = _buildComponentMap_(cfg) || {}; } catch(e) { componentMap = {}; }
+
+  // Build the actual tag map (so we see the same values your payslip sees)
+  const map = _buildTagMapForRow_(row, hdr, masterMap, mHdr, allAdj, tagSet, componentMap);
+
+  // Helpers
+  const toNum = (v) => {
+    if (v === null || v === undefined || v === '') return 0;
+    if (typeof v === 'number') return v;
+    const n = Number(String(v).replace(/[₱,()\s]/g, '').replace(/^-\s*/, '-'));
+    return isNaN(n) ? 0 : n;
+  };
+  const normT = s => String(s || '').toLowerCase().replace(/\u00a0/g,' ').replace(/\s+/g,' ').trim();
+
+  // Find payroll header for clothing allowance (exact or contains)
+  const wants = ['clothing allowance'];
+  let clothingHdr = null;
+  for (let i = 0; i < hdr.length; i++) {
+    const nh = normT(hdr[i]);
+    if (wants.some(w => nh === w || nh.includes(w))) { clothingHdr = hdr[i]; break; }
+  }
+
+  // Get componentMap meta using the same logic your code *tries* to do
+  const compMetaByName = Object.create(null);
+  Object.keys(componentMap || {}).forEach(k => {
+    const rec = componentMap[k];
+    if (rec && rec.name) compMetaByName[normT(rec.name)] = rec;
+  });
+  const meta = clothingHdr ? (compMetaByName[normT(clothingHdr)] || null) : null;
+
+  const val = clothingHdr
+    ? toNum(map[clothingHdr] ?? map[clothingHdr.toLowerCase()] ?? map[clothingHdr.toUpperCase()] ?? 0)
+    : null;
+
+  const isRecurring = !!(meta && String(meta.source || '').toUpperCase() === 'RECURRING');
+
+  Logger.log(JSON.stringify({
+    employeeName,
+    clothingHdrFound: clothingHdr,
+    clothingValueSeenByPayslip: val,
+    metaFound: meta,
+    isRecurringByCodeRule: isRecurring,
+    note:
+      !clothingHdr ? 'Clothing header not found in payroll sheet headers.' :
+      (Math.abs(val) < 0.005) ? 'Clothing value is 0/blank so it gets skipped.' :
+      (!meta ? 'No componentMap meta match, so it will NOT be treated as recurring.' :
+       (!isRecurring ? 'Meta found but source != "RECURRING", so it will be treated as OTHER earning (after OT).' :
+        'It should appear before OT under recurringEarnRows.'))
+  }, null, 2));
+}

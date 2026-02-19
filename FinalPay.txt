@@ -1,0 +1,415 @@
+/************************************************************
+ * FINAL PAY MODULE (POSTABLE COMPUTATION SHEET)
+ * ----------------------------------------------------------
+ * - Produces a sheet that looks like a Payroll Computation output
+ * - Can be posted via Post / Unpost Payroll History
+ * - Computes annual tax due using existing annualization utilities:
+ *     _buildFinalAnnFacts_ (FinalAnnualization)
+ *     _computeAnnualTaxFromBir_ (PreAnnualization)
+ *
+ * IMPORTANT:
+ * - Tax settlement is written into "Withholding Tax".
+ *   If refund -> Withholding Tax becomes NEGATIVE.
+ *   This ensures PAYROLL_HISTORY ytdWtax stays correct after posting.
+ ************************************************************/
+
+function showFinalPayDialog() {
+  const html = HtmlService.createTemplateFromFile('FinalPayDialog')
+    .evaluate()
+    .setWidth(1100)
+    .setHeight(750);
+  SpreadsheetApp.getUi().showModalDialog(html, 'Final Pay (Resigned)');
+}
+
+function getFinalPayPreview(payload) {
+  payload = payload || {};
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const tz = Session.getScriptTimeZone();
+
+  // --- Required inputs ---
+  const empId = String(payload.empId || '').trim();
+  if (!empId) throw new Error('Employee ID is required.');
+
+  const endDate = new Date(payload.endDate);
+  if (!endDate || isNaN(endDate.getTime())) throw new Error('End Date is required.');
+
+  const fromDate = new Date(payload.fromDate);
+  const toDate = new Date(payload.toDate);
+  const creditingDate = new Date(payload.creditingDate);
+
+  if (!fromDate || isNaN(fromDate.getTime())) throw new Error('From date is required.');
+  if (!toDate || isNaN(toDate.getTime())) throw new Error('To date is required.');
+  if (!creditingDate || isNaN(creditingDate.getTime())) throw new Error('Crediting Date is required.');
+
+  // --- Amount helpers ---
+  const n = (v) => {
+    const x = Number(v);
+    return Number.isFinite(x) ? x : 0;
+  };
+
+  // Earnings (map these to your reference template)
+  const addBasic          = n(payload.unpaidSalary);        // Unpaid Salary
+  const addTaxAllow       = n(payload.unpaidAllowanceTax);  // Unpaid allowance (taxable)
+  const addNonTaxAllow    = n(payload.unpaidAllowanceNonTax); // Unpaid allowance (non-tax)
+  const addDeminimis      = n(payload.deminimis);           // Deminimis
+  const addOt             = n(payload.unpaidOt);            // Unpaid OT/On Call
+  const addOtherComp      = n(payload.otherComp);           // Other compensation
+  const addSlPlConv       = n(payload.slplConversion);      // SL/PL conversion (can be negative)
+  const addRedundancy     = n(payload.redundancyPay);       // Redundancy pay
+  const addOther13        = n(payload.unpaid13th);          // Unpaid 13th month
+
+  // Deductions (final pay payout deductions)
+  const sssEeMc   = n(payload.sssEeMc);
+  const sssEeMpf  = n(payload.sssEeMpf);
+  const phEe      = n(payload.phEe);
+  const piEe      = n(payload.piEe);
+
+  const ctcDed    = n(payload.ctcDeduction);
+  const otherDed  = n(payload.otherDeductions);
+
+  // --- Settings / Masterfile meta ---
+  const cfg = _readSettings_(); // existing helper in PayrollGenerator
+  const meta = _finalPayLoadMasterMeta_(cfg, empId);
+
+  // --- Annualization facts (YTD) ---
+  const year = endDate.getFullYear();
+  const birTableSheet = ss.getSheetByName('BIR_TABLE');
+  if (!birTableSheet) throw new Error('Missing BIR_TABLE sheet.');
+  const birTable = _loadBirTable_(birTableSheet); // existing in PayrollGenerator
+
+  const ytd = _buildFinalAnnFacts_(year, cfg); // FinalAnnualization
+  const rec = (ytd.facts && ytd.facts.get(empId)) ? ytd.facts.get(empId) : null;
+
+  // Base YTD totals (present employer, from PAYROLL_HISTORY)
+  const ytdBasic        = rec ? (rec.totalBasic || 0) : 0;
+  const ytdTaxable      = rec ? (rec.totalTaxable || 0) : 0;
+  const ytdDem          = rec ? (rec.totalDem || 0) : 0;
+  const ytdNonTaxOther  = rec ? (rec.totalNonTaxOther || 0) : 0;
+  const ytdOther13      = rec ? (rec.totalOther13 || 0) : 0;
+
+  const ytdSssEeMc      = rec ? (rec.ytdSssEeMc || 0) : 0;
+  const ytdSssEeMpf     = rec ? (rec.ytdSssEeMpf || 0) : 0;
+  const ytdPhEe         = rec ? (rec.ytdPhEe || 0) : 0;
+  const ytdPiEe         = rec ? (rec.ytdPiEe || 0) : 0;
+  const ytdWtaxPresent  = rec ? (rec.ytdWtax || 0) : 0;
+
+  // Prev employer (FinalAnnualization store)
+  const prevMap = _loadFinalPrevEmployerMap_();
+  const prev = prevMap.get(empId) || { taxable: 0, wtax: 0 };
+  const taxablePrev = Number(prev.taxable || 0) || 0;
+  const wtaxPrev    = Number(prev.wtax || 0) || 0;
+
+  // New totals incl. final pay components
+  const totalBasic       = ytdBasic + addBasic;
+  const totalTaxable     = ytdTaxable + (addTaxAllow + addOt + addOtherComp + addSlPlConv + addRedundancy);
+  const totalDem         = ytdDem + addDeminimis;
+  const totalNonTaxOther = ytdNonTaxOther + addNonTaxAllow;
+  const totalOther13     = ytdOther13 + addOther13;
+
+  // Contributions included in “non-tax comp” buckets for annualization
+  const totalSssEeMc  = ytdSssEeMc + sssEeMc;
+  const totalSssEeMpf = ytdSssEeMpf + sssEeMpf;
+  const totalPhEe     = ytdPhEe + phEe;
+  const totalPiEe     = ytdPiEe + piEe;
+
+  const grossCompPresent =
+    totalBasic + totalTaxable + totalDem + totalNonTaxOther + totalOther13;
+
+  const nonTax13thOtherAnnual =
+    Math.min(OTHER_BENEFITS_EXEMPT_YTD, Math.max(0, totalOther13));
+
+  let totalNonTaxComp =
+    totalDem +
+    totalNonTaxOther +
+    nonTax13thOtherAnnual +
+    totalSssEeMc +
+    totalSssEeMpf +
+    totalPhEe +
+    totalPiEe;
+
+  let taxableCompPresent = Math.max(0, grossCompPresent - totalNonTaxComp);
+
+  // MWE rule (reuse FinalAnnualization behavior)
+  const isMwe = !!meta.mwe;
+  if (isMwe) {
+    const eeContribYtd = (totalSssEeMc + totalSssEeMpf + totalPhEe + totalPiEe);
+    const mweNonTaxBasic = Math.max(0, totalBasic - eeContribYtd);
+
+    // OT is shifted only if it was classified as TAXABLE in annualization;
+    // for final pay input, we treat the OT you entered as taxable OT, so shift it too.
+    let mweNonTaxOvertime = 0;
+    if (ytd && ytd.headers && ytd.colType && rec) {
+      mweNonTaxOvertime += _sumTaxableOvertimeFromHistory_(ytd.headers, ytd.colType, rec);
+    }
+    mweNonTaxOvertime += addOt;
+
+    totalNonTaxComp += (mweNonTaxBasic + mweNonTaxOvertime);
+    taxableCompPresent = Math.max(0, grossCompPresent - totalNonTaxComp);
+  }
+
+  const totalTaxableComp = taxableCompPresent + taxablePrev;
+
+  // Annual tax due (MWE => 0)
+  const taxDueAnnual = isMwe ? 0 : _computeAnnualTaxFromBir_(totalTaxableComp, birTable);
+
+  const totalWtaxSoFar = (ytdWtaxPresent + wtaxPrev);
+  const variance = taxDueAnnual - totalWtaxSoFar; // + => still need to withhold, - => refund
+
+  // Write settlement into Withholding Tax; refund becomes negative
+  const finalWtax = variance;
+
+  // Computation sheet run-level numbers
+  const grossPayRun =
+    addBasic +
+    addTaxAllow +
+    addNonTaxAllow +
+    addDeminimis +
+    addOt +
+    addOtherComp +
+    addSlPlConv +
+    addRedundancy +
+    addOther13;
+
+  // Taxable income run (approx; does not affect annual settlement)
+  const nonTax13thBefore = Math.min(OTHER_BENEFITS_EXEMPT_YTD, Math.max(0, ytdOther13));
+  const nonTax13thAfter  = Math.min(OTHER_BENEFITS_EXEMPT_YTD, Math.max(0, totalOther13));
+  const nonTax13thRun    = Math.max(0, nonTax13thAfter - nonTax13thBefore);
+
+  const taxableIncomeRun = isMwe
+    ? 0
+    : Math.max(0,
+        grossPayRun
+        - (addNonTaxAllow + addDeminimis + nonTax13thRun)
+        - (sssEeMc + sssEeMpf + phEe + piEe)
+      );
+
+  const netPay =
+    grossPayRun
+    - (sssEeMc + sssEeMpf + phEe + piEe)
+    - ctcDed
+    - otherDed
+    - finalWtax; // subtracting negative adds refund
+
+  return {
+    year,
+    empId,
+    empName: meta.empName,
+    payrollGroup: meta.payrollGroup,
+    tc1Label: meta.tc1Label,
+    tc2Label: meta.tc2Label,
+    tc1Value: meta.tc1Value,
+    tc2Value: meta.tc2Value,
+    mwe: isMwe,
+
+    totals: {
+      taxablePrev,
+      wtaxPrev,
+      ytdWtaxPresent,
+      totalWtaxSoFar,
+      totalTaxableComp,
+      taxDueAnnual,
+      variance
+    },
+
+    run: {
+      grossPayRun,
+      taxableIncomeRun,
+      withholdingTax: finalWtax,
+      netPay
+    },
+
+    dates: {
+      period: `${year}-${String(toDate.getMonth() + 1).padStart(2, '0')}-FP`,
+      from: Utilities.formatDate(fromDate, tz, 'yyyy-MM-dd'),
+      to: Utilities.formatDate(toDate, tz, 'yyyy-MM-dd'),
+      crediting: Utilities.formatDate(creditingDate, tz, 'yyyy-MM-dd'),
+      payrollMonth: Utilities.formatDate(toDate, tz, 'MMMM yyyy')
+    },
+
+    inputsEcho: {
+      addBasic, addTaxAllow, addNonTaxAllow, addDeminimis, addOt, addOtherComp, addSlPlConv, addRedundancy, addOther13,
+      sssEeMc, sssEeMpf, phEe, piEe, ctcDed, otherDed
+    }
+  };
+}
+
+function createFinalPaySheet(payload) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const preview = getFinalPayPreview(payload);
+
+  // Build computation-style headers (matches your payroll outputs)
+  const preCols = [
+    'Employee ID',
+    'Employee Name',
+    preview.tc1Label,
+    'Payroll Group',
+    preview.tc2Label,
+    'Period',
+    'From',
+    'To',
+    'Crediting Date',
+    'Payroll Month'
+  ];
+
+  const earningCols = [
+    'BASIC PAY',
+    'ALLOWANCE',
+    'NON-TAXABLE ALLOWANCE',
+    'DEMINIMIS ALLOWANCE',
+    'REGULAR OT PAY',
+    'OTHER COMPENSATION',
+    'SL/PL CONVERSION',
+    'REDUNDANCY PAY',
+    '13TH MONTH PAY'
+  ];
+
+  const coreCols = [
+    'Gross Pay',
+    'SSS EE MC',
+    'SSS EE MPF',
+    'PhilHealth EE',
+    'Pag-IBIG EE',
+    'Taxable Income',
+    'Withholding Tax'
+  ];
+
+  const deductionCols = [
+    'CTC DEDUCTION',
+    'OTHER DEDUCTIONS'
+  ];
+
+  const postCols = [
+    'Net Pay',
+    'SSS ER MC',
+    'SSS ER MPF',
+    'SSS EC',
+    'PhilHealth ER',
+    'Pag-IBIG ER'
+  ];
+
+  const fullHeader = [];
+  const seen = new Set();
+  const pushUnique = (h) => {
+    const k = String(h || '').trim();
+    if (k && !seen.has(k)) { seen.add(k); fullHeader.push(k); }
+  };
+
+  [].concat(preCols, earningCols, coreCols, deductionCols, postCols).forEach(pushUnique);
+
+  // Row builder
+  const row = {};
+  row['Employee ID'] = preview.empId;
+  row['Employee Name'] = preview.empName || '';
+  row[preview.tc1Label] = preview.tc1Value || '';
+  row['Payroll Group'] = preview.payrollGroup || '';
+  row[preview.tc2Label] = preview.tc2Value || '';
+  row['Period'] = preview.dates.period;
+  row['From'] = preview.dates.from;
+  row['To'] = preview.dates.to;
+  row['Crediting Date'] = preview.dates.crediting;
+  row['Payroll Month'] = preview.dates.payrollMonth;
+
+  const x = preview.inputsEcho;
+  row['BASIC PAY'] = x.addBasic;
+  row['ALLOWANCE'] = x.addTaxAllow;
+  row['NON-TAXABLE ALLOWANCE'] = x.addNonTaxAllow;
+  row['DEMINIMIS ALLOWANCE'] = x.addDeminimis;
+  row['REGULAR OT PAY'] = x.addOt;
+  row['OTHER COMPENSATION'] = x.addOtherComp;
+  row['SL/PL CONVERSION'] = x.addSlPlConv;
+  row['REDUNDANCY PAY'] = x.addRedundancy;
+  row['13TH MONTH PAY'] = x.addOther13;
+
+  row['Gross Pay'] = preview.run.grossPayRun;
+
+  row['SSS EE MC'] = x.sssEeMc;
+  row['SSS EE MPF'] = x.sssEeMpf;
+  row['PhilHealth EE'] = x.phEe;
+  row['Pag-IBIG EE'] = x.piEe;
+
+  row['Taxable Income'] = preview.run.taxableIncomeRun;
+  row['Withholding Tax'] = preview.run.withholdingTax; // can be negative (refund)
+
+  row['CTC DEDUCTION'] = x.ctcDed;
+  row['OTHER DEDUCTIONS'] = x.otherDed;
+
+  row['Net Pay'] = preview.run.netPay;
+
+  // Employer shares left 0 unless you intentionally compute them
+  row['SSS ER MC'] = 0;
+  row['SSS ER MPF'] = 0;
+  row['SSS EC'] = 0;
+  row['PhilHealth ER'] = 0;
+  row['Pag-IBIG ER'] = 0;
+
+  const outRow = fullHeader.map(h => row[h] !== undefined ? row[h] : '');
+
+  // Sheet name
+  const nameBase = `${preview.empName || preview.empId} - ${preview.dates.period}`;
+  const safeName = String(nameBase).slice(0, 95);
+  const sheet = ss.insertSheet(safeName);
+
+  _writeComputation_(sheet, fullHeader, [outRow]); // existing helper in PayrollGenerator
+  formatPayrollSheetUnified_(sheet, true);         // existing helper in PayrollGenerator
+  protectComputationSheet_(sheet);                 // existing helper in PayrollGenerator
+
+  return { sheetName: sheet.getName(), preview: preview };
+}
+
+/**
+ * Loads masterfile meta needed for a computation-style output row.
+ * Uses your existing tracking label resolver (_resolveTrackingColumns_).
+ */
+function _finalPayLoadMasterMeta_(cfg, empId) {
+  if (!cfg || !cfg.SOURCE_SS_ID || !cfg.MASTER_SHEET_NAME) {
+    throw new Error('Settings missing SOURCE_SS_ID / MASTER_SHEET_NAME.');
+  }
+
+  const masterSS = SpreadsheetApp.openById(cfg.SOURCE_SS_ID);
+  const master = masterSS.getSheetByName(cfg.MASTER_SHEET_NAME);
+  if (!master) throw new Error(`Masterfile sheet not found: ${cfg.MASTER_SHEET_NAME}`);
+
+  const vals = master.getDataRange().getValues();
+  if (vals.length < 2) throw new Error('Masterfile has no rows.');
+
+  const hdr = vals[0].map(h => String(h || '').trim());
+  const rows = vals.slice(1);
+
+  const idIdx = _findHeaderFuzzy_(hdr, ['Employee ID','EMPLOYEE ID','Emp ID','ID']);
+  const nameIdx = _findHeaderFuzzy_(hdr, ['Employee Name','EMPLOYEE NAME','Name']);
+  const groupIdx = _findHeaderFuzzy_(hdr, ['Payroll Group','PAYROLL GROUP','Group']);
+
+  const mweIdx = _findHeaderFuzzy_(hdr, ['MWE','Minimum Wage Earner']);
+
+  const tc = _resolveTrackingColumns_(hdr);
+  const tc1Label = tc && tc.dim1Label ? tc.dim1Label : 'Tracking Category 1';
+  const tc2Label = tc && tc.dim2Label ? tc.dim2Label : 'Tracking Category 2';
+  const tc1Idx = tc && Number.isInteger(tc.dim1Idx) ? tc.dim1Idx : -1;
+  const tc2Idx = tc && Number.isInteger(tc.dim2Idx) ? tc.dim2Idx : -1;
+
+  const want = String(empId).trim();
+  let found = null;
+
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i];
+    const id = String(r[idIdx] || '').trim();
+    if (id === want) { found = r; break; }
+  }
+  if (!found) throw new Error(`Employee not found in Masterfile: ${empId}`);
+
+  const parseBool = (v) => {
+    const s = String(v || '').trim().toUpperCase();
+    return (s === 'TRUE' || s === 'YES' || s === 'Y' || s === '1');
+  };
+
+  return {
+    empName: nameIdx >= 0 ? String(found[nameIdx] || '').trim() : '',
+    payrollGroup: groupIdx >= 0 ? String(found[groupIdx] || '').trim() : '',
+    mwe: mweIdx >= 0 ? parseBool(found[mweIdx]) : false,
+    tc1Label,
+    tc2Label,
+    tc1Value: tc1Idx >= 0 ? String(found[tc1Idx] || '').trim() : '',
+    tc2Value: tc2Idx >= 0 ? String(found[tc2Idx] || '').trim() : ''
+  };
+}

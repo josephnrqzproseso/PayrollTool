@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+
+    <?!= include_('UiTheme'); ?>
+
+    <style>
+      /* Dialog-specific layout (built on UiTheme) */
+      .titlebar { margin-bottom: 4px; }
+      .card .row { align-items: flex-end; }
+
+      .field { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+
+      .section-title {
+        margin: 0 0 8px;
+        font-size: 12px;
+        font-weight: 650;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: .3px;
+      }
+
+      .chk-list { display: flex; flex-direction: column; gap: 6px; }
+
+      /* Critical fix: override UiTheme input width:100% for checkboxes */
+      .chk-row input[type="checkbox"] {
+        width: auto !important;
+        padding: 0 !important;
+        margin: 2px 0 0 0;
+      }
+
+      .chk-row {
+        display: grid;
+        grid-template-columns: 18px 1fr;
+        gap: 10px;
+        align-items: start;
+        padding: 8px 10px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: var(--surface);
+      }
+      .chk-row:hover { background: var(--surface-2); }
+
+      .chk-row span {
+        font-size: 12px;
+        color: var(--text);
+        line-height: 1.25;
+      }
+
+      .divider {
+        height: 1px;
+        background: var(--border);
+        margin: 6px 0;
+      }
+
+      /* Keep status consistent; UiTheme already styles #status */
+      #status:empty { display: none; }
+
+/* ✅ Brand logo INSIDE modal (sticky bottom, does not overlay scrollbar) */
+.brand-sticky-bottom{
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;  /* lower-right */
+  padding: 8px 0 2px;
+  background: #fff;
+}
+
+
+    </style>
+  </head>
+
+  <body class="ui-page">
+    <div class="titlebar">
+      <h2>Statutory Reports</h2>
+    </div>
+
+    <div class="card stack">
+      <div class="field">
+        <label for="monthInput">MONTH</label>
+        <input type="month" id="monthInput" />
+      </div>
+    </div>
+
+    <div class="card stack">
+      <div class="section-title">STATUTORIES</div>
+
+      <div class="chk-list">
+        <div class="chk-row">
+          <input type="checkbox" id="chkSSS" checked />
+          <span>SSS Contributions</span>
+        </div>
+
+        <div class="chk-row">
+          <input type="checkbox" id="chkPH" checked />
+          <span>PhilHealth Contributions</span>
+        </div>
+
+        <div class="chk-row">
+          <input type="checkbox" id="chkPI" checked />
+          <span>Pag-IBIG Contributions</span>
+        </div>
+
+        <div class="divider"></div>
+
+        <div class="chk-row">
+          <input type="checkbox" id="chkSSSLoans" />
+          <span>SSS Loans</span>
+        </div>
+
+        <div class="chk-row">
+          <input type="checkbox" id="chkPILoans" />
+          <span>Pag-IBIG Loans</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card stack">
+      <div class="section-title">EXPORT</div>
+
+      <div class="chk-list">
+        <div class="chk-row">
+          <input type="checkbox" id="downloadExcel" checked />
+          <span>Excel</span>
+        </div>
+
+        <div class="chk-row">
+          <input type="checkbox" id="exportToSheet" />
+          <span>Google Sheets</span>
+        </div>
+      </div>
+
+      <div id="status"></div>
+    </div>
+
+    <div class="ui-footer">
+      <button type="button" id="btnClose" onclick="google.script.host.close()">Close</button>
+      <button type="button" id="btnGenerate" onclick="runExport()">Generate</button>
+    </div>
+
+    <div class="brand-sticky-bottom">
+  <?!= include_('BrandWatermarkInline'); ?>
+</div>
+
+    <script>
+      (function initMonth() {
+        var el = document.getElementById('monthInput');
+        if (!el) return;
+        var now = new Date();
+        var y = now.getFullYear();
+        var m = String(now.getMonth() + 1).padStart(2, '0');
+        el.value = y + '-' + m;
+      })();
+
+      function setStatus(msg) {
+        var el = document.getElementById('status');
+        el.textContent = msg || '';
+      }
+
+      function runExport() {
+        var btn = document.getElementById('btnGenerate');
+        UI && UI.setBusy ? UI.setBusy(btn, true, 'Generating…') : (btn.disabled = true);
+
+        setStatus('Generating report…');
+
+        var month = document.getElementById('monthInput').value;
+        if (!month) {
+          UI && UI.setBusy ? UI.setBusy(btn, false) : (btn.disabled = false);
+          setStatus('Error: Please select a Payroll Month.');
+          return;
+        }
+
+        var form = {
+          month: month,
+          sss: document.getElementById('chkSSS').checked,
+          philhealth: document.getElementById('chkPH').checked,
+          pagibig: document.getElementById('chkPI').checked,
+          sssLoans: document.getElementById('chkSSSLoans').checked,
+          pagibigLoans: document.getElementById('chkPILoans').checked,
+          downloadExcel: document.getElementById('downloadExcel').checked,
+          exportToSheet: document.getElementById('exportToSheet').checked
+        };
+
+        if (!form.downloadExcel && !form.exportToSheet) {
+          UI && UI.setBusy ? UI.setBusy(btn, false) : (btn.disabled = false);
+          setStatus('Error: Select at least one output option (Excel or Google Sheet).');
+          return;
+        }
+
+        google.script.run
+          .withSuccessHandler(function (resp) {
+            UI && UI.setBusy ? UI.setBusy(btn, false) : (btn.disabled = false);
+
+            if (!resp) {
+              setStatus('Error: No response from server.');
+              return;
+            }
+            if (resp.ok === false) {
+              setStatus('Error: ' + (resp.message || 'Unknown error.'));
+              return;
+            }
+
+            var msg = 'Report generated.';
+            if (resp.sheetName) msg += '\nSheet: ' + resp.sheetName;
+            setStatus(msg);
+
+            if (resp.download && resp.download.contentBase64) {
+              var a = document.createElement('a');
+              a.href = 'data:' + resp.download.mimeType + ';base64,' + resp.download.contentBase64;
+              a.download = resp.download.fileName || 'StatutoryReport.xlsx';
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+            }
+          })
+          .withFailureHandler(function (err) {
+            UI && UI.setBusy ? UI.setBusy(btn, false) : (btn.disabled = false);
+            setStatus('Error: ' + (err && err.message ? err.message : err));
+          })
+          .generateStatutoryReport(form);
+      }
+    </script>
+
+
+  </body>
+</html>

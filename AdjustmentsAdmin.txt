@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body { font-family: "Segoe UI", Roboto, sans-serif; margin: 20px; }
+    h2 { font-size: 18px; margin-bottom: 10px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+    th, td { border: 1px solid #ddd; padding: 6px; font-size: 13px; text-align: left; }
+    th { background-color: #f4f4f4; }
+    input, select {
+      width: 100%; padding: 6px; border: 1px solid #ccc; border-radius: 4px;
+      box-sizing: border-box; font-size: 13px;
+    }
+    button {
+      margin-top: 10px; padding: 8px 14px; border: none; border-radius: 4px;
+      cursor: pointer; background-color: #1a73e8; color: white; font-size: 13px;
+    }
+    button:hover { background-color: #0f5dd6; }
+
+    .delBtn {
+      background-color: #d9534f; color: white; padding: 4px 8px;
+      font-size: 12px; border-radius: 4px; cursor: pointer; border: none;
+      margin-top: 0;
+    }
+    .delBtn:hover { background-color: #b52b27; }
+
+    .editBtn {
+      background-color: #f4b400; color: white; padding: 4px 8px;
+      font-size: 12px; border-radius: 4px; cursor: pointer; border: none;
+      margin-right: 4px; margin-top: 0;
+    }
+    .editBtn:hover { background-color: #e0a800; }
+
+    .saveBtn {
+      background-color: #1a73e8; color: white; padding: 4px 8px;
+      font-size: 12px; border-radius: 4px; cursor: pointer; border: none;
+      margin-right: 4px; margin-top: 0;
+    }
+    .saveBtn:hover { background-color: #0f5dd6; }
+
+    .cancelBtn {
+      background-color: #777; color: white; padding: 4px 8px;
+      font-size: 12px; border-radius: 4px; cursor: pointer; border: none;
+      margin-top: 0;
+    }
+    .cancelBtn:hover { background-color: #555; }
+
+    #close { background-color: #777; }
+    #close:hover { background-color: #555; }
+
+        #aboutBtn { background-color: #777; }
+    #aboutBtn:hover { background-color: #555; }
+
+    /* ===== About / License Modal ===== */
+    .about-backdrop{
+      position: fixed;
+      inset: 0;
+      background: rgba(32,33,36,0.45);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      z-index: 999999;
+      padding: 16px;
+      box-sizing: border-box;
+    }
+    .about-modal{
+      width: min(520px, calc(100vw - 32px));
+      background: #fff;
+      border-radius: 10px;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.25);
+      overflow: hidden;
+      border: 1px solid #e0e0e0;
+    }
+    .about-header{
+      padding: 12px 14px;
+      border-bottom: 1px solid #eee;
+      font-weight: 700;
+      font-size: 13px;
+      color: #202124;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+    .about-x{
+      border: none;
+      background: transparent;
+      cursor: pointer;
+      font-size: 16px;
+      line-height: 1;
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+    .about-x:hover{ background:#f1f3f4; }
+    .about-body{
+      padding: 12px 14px;
+      font-size: 12px;
+      color: #333;
+      line-height: 1.45;
+    }
+    .about-actions{
+      padding: 12px 14px;
+      border-top: 1px solid #eee;
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+    }
+    .about-logo-wrap{
+      display:flex;
+      justify-content:center;
+      margin-bottom:12px;
+    }
+    .about-logo{
+      max-width: 320px;
+      width: 100%;
+      height: auto;
+      display:block;
+    }
+
+        /* Discreet branding inside dialog (no overlay / no fixed) */
+    .brand-inline-corner {
+      margin-top: 10px;
+      display: flex;
+      justify-content: flex-end; /* lower-right */
+      opacity: 0.55;
+      filter: grayscale(100%);
+      pointer-events: none;
+      user-select: none;
+    }
+    .brand-inline-corner img {
+      height: 16px;
+      width: auto;
+      display: block;
+    }
+
+    /* ✅ Discreet logo inside modal, sticky at bottom (won’t overlay scrollbar) */
+    .brand-sticky-bottom {
+      position: sticky;
+      bottom: 0;
+      z-index: 5;
+      display: flex;
+      justify-content: flex-end;   /* right corner */
+      padding: 8px 0 2px;
+      background: #fff;            /* prevents overlap-looking */
+    }
+
+
+
+    #status { margin-top: 10px; font-size: 12px; color: #444; white-space: pre-line; }
+  </style>
+  <?!= include_('UiTheme'); ?>
+</head>
+<body class="ui-page">
+  
+
+  <label>Adjustment Name</label>
+  <input type="text" id="adjName" placeholder="e.g., Sales Bonus, Internet Allowance">
+
+  <label>Payroll Category</label>
+<select id="adjCat">
+  <option value="">Select Category…</option>
+  <option value="Basic Pay Related">Basic Pay Related</option>
+  <option value="Taxable Earning">Taxable Earning</option>
+  <option value="Non-Taxable Earning - De Minimis">Non-Taxable Earning - De Minimis</option>
+  <option value="Non-Taxable Earning - Other">Non-Taxable Earning - Other</option>
+  <option value="13th Month Pay and Other Benefits">13th Month Pay and Other Benefits</option>
+  <option value="Addition">Addition</option>
+  <option value="Deduction">Deduction</option>
+</select>
+
+
+    <button onclick="addType()">➕ Add Type</button>
+    <button id="close" onclick="google.script.host.close()">Close</button>
+
+  
+
+  <div id="status"></div>
+
+  <h3>Existing Types</h3>
+  <table>
+    <thead>
+      <tr>
+        <th>Adjustment Name</th>
+        <th>Payroll Category</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+    <div class="brand-sticky-bottom">
+    <?!= include_('BrandWatermarkInline'); ?>
+  </div>
+
+
+  <script>
+    // Categories used everywhere (top dropdown + inline edit)
+const CAT_VALUES = [
+  'Basic Pay Related',
+  'Taxable Earning',
+  'Non-Taxable Earning - De Minimis',
+  'Non-Taxable Earning - Other',
+  '13th Month Pay and Other Benefits',
+  'Addition',
+  'Deduction'
+];
+
+
+    window.onload = refreshList;
+
+        function openAbout() {
+      const bd = document.getElementById('aboutBackdrop');
+      if (bd) bd.style.display = 'flex';
+    }
+
+    function closeAbout(e) {
+      // If called from click handler, only close when clicking the backdrop itself
+      if (e && e.target && e.target.id !== 'aboutBackdrop') return;
+
+      const bd = document.getElementById('aboutBackdrop');
+      if (bd) bd.style.display = 'none';
+    }
+
+
+    function setStatus(msg) {
+      document.getElementById('status').textContent = msg || '';
+    }
+
+    function refreshList() {
+      setStatus('Loading…');
+      google.script.run
+        .withSuccessHandler(rows => {
+          setStatus('');
+          const tbody = document.getElementById('tbody');
+          tbody.innerHTML = '';
+
+          if (!rows || !rows.length) {
+            tbody.innerHTML =
+              '<tr><td colspan="3" style="text-align:center;">No types defined yet.</td></tr>';
+            return;
+          }
+
+          rows.forEach(r => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+              <td>${escapeHtml(r[0])}</td>
+              <td>${escapeHtml(r[1])}</td>
+              <td>
+                <button class="editBtn"
+                        onclick="enterEditMode(this, '${escapeAttr(r[0])}', '${escapeAttr(r[1])}')">
+                  ✏️ Edit
+                </button>
+                <button class="delBtn"
+                        onclick="deleteType('${escapeAttr(r[0])}')">
+                  🗑️ Delete
+                </button>
+              </td>
+            `;
+            tbody.appendChild(tr);
+          });
+        })
+        .withFailureHandler(err =>
+          setStatus('❌ ' + (err && err.message ? err.message : err))
+        )
+        ._getAdjustmentTypes();
+    }
+
+    function addType() {
+      const nameEl = document.getElementById('adjName');
+      const catEl  = document.getElementById('adjCat');
+      const name = nameEl.value.trim();
+      const cat  = catEl.value.trim();
+
+      if (!name || !cat) {
+        setStatus('⚠️ Please enter both Adjustment Name and select a Category.');
+        return;
+      }
+
+      const payload = { name, cat };
+      setStatus('⏳ Adding type…');
+
+      google.script.run
+        .withSuccessHandler(() => {
+          setStatus(`✅ "${name}" added as ${cat}.`);
+          nameEl.value = '';
+          catEl.selectedIndex = 0;
+          refreshList();
+          google.script.run.setupAdjustmentsDropdown_(true);
+        })
+        .withFailureHandler(err =>
+          setStatus(`❌ Error: ${err && err.message ? err.message : err}`)
+        )
+        ._addAdjustmentType(JSON.parse(JSON.stringify(payload)));
+    }
+
+    // ======== INLINE EDIT MODE ========
+
+    function enterEditMode(btn, oldName, oldCat) {
+      const tr = btn.closest('tr');
+      if (!tr) return;
+
+      tr.dataset.oldName = oldName;
+      tr.dataset.oldCat  = oldCat;
+
+      const nameTd   = tr.children[0];
+      const catTd    = tr.children[1];
+      const actionTd = tr.children[2];
+
+      // Name input
+      const nameInput = document.createElement('input');
+      nameInput.type = 'text';
+      nameInput.value = oldName;
+      nameInput.style.width = '100%';
+
+      // Category select
+      const catSelect = document.createElement('select');
+      catSelect.style.width = '100%';
+      const blank = document.createElement('option');
+      blank.value = '';
+      blank.textContent = 'Select Category…';
+      catSelect.appendChild(blank);
+
+      CAT_VALUES.forEach(v => {
+        const opt = document.createElement('option');
+        opt.value = v;
+        opt.textContent = v;
+        if (v === oldCat) opt.selected = true;
+        catSelect.appendChild(opt);
+      });
+
+      nameTd.textContent = '';
+      catTd.textContent  = '';
+      nameTd.appendChild(nameInput);
+      catTd.appendChild(catSelect);
+
+      // Action buttons: Save / Cancel
+      actionTd.innerHTML = '';
+
+      const saveBtn = document.createElement('button');
+      saveBtn.className = 'saveBtn';
+      saveBtn.textContent = '💾 Save';
+      saveBtn.onclick = function () { saveTypeEdit(tr); };
+
+      const cancelBtn = document.createElement('button');
+      cancelBtn.className = 'cancelBtn';
+      cancelBtn.textContent = '✖ Cancel';
+      cancelBtn.onclick = function () {
+        setStatus('');
+        refreshList();   // reload original table state
+      };
+
+      actionTd.appendChild(saveBtn);
+      actionTd.appendChild(cancelBtn);
+    }
+
+    function saveTypeEdit(tr) {
+      const oldName = tr.dataset.oldName;
+      if (!oldName) return;
+
+      const nameInput = tr.querySelector('input');
+      const catSelect = tr.querySelector('select');
+
+      const newName = (nameInput && nameInput.value || '').trim();
+      const newCat  = (catSelect && catSelect.value || '').trim();
+
+      if (!newName || !newCat) {
+        setStatus('⚠️ Please enter name and select a category.');
+        return;
+      }
+
+      setStatus('✏️ Updating type…');
+
+      google.script.run
+        .withSuccessHandler(() => {
+          setStatus(`✅ "${oldName}" updated to "${newName}" (${newCat}).`);
+          refreshList();
+          google.script.run.setupAdjustmentsDropdown_(true);
+          google.script.run.refreshPayrollCategories(true);
+        })
+        .withFailureHandler(err =>
+          setStatus('❌ ' + (err && err.message ? err.message : err))
+        )
+        ._editAdjustmentType({ oldName, newName, newCat });
+    }
+
+    // ======== DELETE ========
+
+    function deleteType(name) {
+      if (!confirm(`Are you sure you want to delete "${name}"?`)) return;
+      setStatus('🗑️ Deleting…');
+      google.script.run
+        .withSuccessHandler(() => {
+          setStatus(`🗑️ "${name}" deleted.`);
+          refreshList();
+          google.script.run.setupAdjustmentsDropdown_(true);
+          google.script.run.refreshPayrollCategories(true);
+        })
+        .withFailureHandler(err =>
+          setStatus('❌ ' + (err && err.message ? err.message : err))
+        )
+        ._deleteAdjustmentType(name);
+    }
+
+    // ======== ESCAPERS ========
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, m => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+      }[m]));
+    }
+    function escapeAttr(s) {
+      return String(s).replace(/["']/g, m =>
+        m === '"' ? '&quot;' : '&#39;'
+      );
+    }
+  </script>
+
+
+</body>
+</html>

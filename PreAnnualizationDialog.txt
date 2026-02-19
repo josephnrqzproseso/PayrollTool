@@ -1,0 +1,692 @@
+<!DOCTYPE html> 
+<html>
+  <head>
+    <base target="_top">
+    <style>
+      body {
+        font-family: Arial, sans-serif;
+        font-size: 12px;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 16px;
+        margin: 0 0 8px;
+      }
+      .section {
+        margin-bottom: 8px;
+      }
+      .form-row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+        margin-bottom: 6px;
+      }
+      .form-row label {
+        font-size: 11px;
+        display: flex;
+        flex-direction: column;
+      }
+      input[type="month"] {
+        font-size: 11px;
+        padding: 3px 4px;
+        min-width: 130px;
+      }
+      .btn-bar {
+        margin-top: 6px;
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+      }
+      button {
+        font-size: 11px;
+        padding: 4px 10px;
+        cursor: pointer;
+      }
+      #status {
+        margin-top: 4px;
+        font-size: 11px;
+        color: #555;
+      }
+      #summary {
+        margin-top: 4px;
+        font-size: 11px;
+        font-weight: bold;
+      }
+      #tableWrapper {
+  margin-top: 8px;
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid #ddd;
+  position: relative;              /* needed for sticky header */
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 11px;
+}
+th, td {
+  border: 1px solid #ddd;
+  padding: 3px 4px;
+  white-space: normal;             /* allow header wrap */
+}
+
+/* make the header row stick to the top of the scroll area */
+#previewTable thead th {
+  position: sticky;
+  top: 0;
+  background: #f3f3f3;
+  text-align: center;
+  vertical-align: middle;
+  z-index: 6;
+}
+
+/* raise z-index for frozen ID/Name header cells so they sit above body cells */
+#previewTable thead th.freeze-col-0,
+#previewTable thead th.freeze-col-1 {
+  z-index: 7;
+}
+
+      td.num {
+        text-align: right;
+      }
+      .sticky-header {
+        position: sticky;
+        top: 0;
+        background: #fff;
+        z-index: 3;
+        padding-bottom: 4px;
+      }
+      input.preann-edit {
+        font-size: 11px;
+        padding: 1px 3px;
+        box-sizing: border-box;
+        width: 80px;
+        text-align: right;
+      }
+      /* Freeze first 2 columns (ID + Name) */
+      .freeze-col-0,
+      .freeze-col-1 {
+        position: sticky;
+        background: #fff;
+        z-index: 4;
+      }
+      .freeze-col-0 {
+        left: 0;
+      }
+      /* LEFT OFFSET FOR COL 2 = ACTUAL WIDTH OF COL 1 (SET BY JS) */
+      .freeze-col-1 {
+        left: var(--fcol1-left, 140px);
+      }
+
+/* ✅ Brand logo INSIDE modal (sticky bottom, does not overlay scrollbar) */
+.brand-sticky-bottom{
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;  /* lower-right */
+  padding: 8px 0 2px;
+  background: #fff;
+}
+
+
+    </style>
+    <?!= include_('UiTheme'); ?>
+  </head>
+  <body>
+    <h1>Pre-Annualization</h1>
+    <div class="section sticky-header">
+      <div class="form-row">
+        <label>
+          Payroll Month (YYYY-MM)
+          <input type="month" id="monthInput">
+        </label>
+      </div>
+
+      <div class="btn-bar">
+        <button type="button" id="btnPreview" onclick="onPreview()">Preview</button>
+        <button type="button" id="btnGenerate" onclick="onGenerate()">Generate Sheet</button>
+        <button type="button" onclick="google.script.host.close()">Close</button>
+      </div>
+
+      <div id="status"></div>
+      <div id="summary"></div>
+    </div>
+
+    <div id="tableWrapper">
+      <table id="previewTable"></table>
+    </div>
+
+    <div class="brand-sticky-bottom">
+  <?!= include_('BrandWatermarkInline'); ?>
+</div>
+
+    <script>
+      // base data from server, keyed by empId
+      var baseRowsByEmp = {};
+      // user overrides / extra projections, keyed by empId
+      var editsByEmp = {};
+
+      // BIR ANNUAL BRACKETS (same as BIR_TABLE I–L)
+      var BIR_ANNUAL_BRACKETS = [
+        { ex: 0,       max: 250000,   fixed: 0,      rate: 0.00 },
+        { ex: 250000,  max: 400000,   fixed: 0,      rate: 0.15 },
+        { ex: 400000,  max: 800000,   fixed: 22500,  rate: 0.20 },
+        { ex: 800000,  max: 2000000,  fixed: 102500, rate: 0.25 },
+        { ex: 2000000, max: 8000000,  fixed: 402500, rate: 0.30 },
+        { ex: 8000000, max: 99999999, fixed: 2202500,rate: 0.35 }
+      ];
+
+      (function init() {
+        var now = new Date();
+        var year = now.getFullYear();
+        var monthNum = now.getMonth() + 1;
+        var month = (monthNum < 10 ? '0' + monthNum : '' + monthNum);
+        document.getElementById('monthInput').value = year + '-' + month;
+      })();
+
+      function getFormData() {
+        var payrollMonth = document.getElementById('monthInput').value;
+        return {
+          payrollMonth: payrollMonth
+        };
+      }
+
+      function setBusy(isBusy, msg) {
+        document.getElementById('btnPreview').disabled = isBusy;
+        document.getElementById('btnGenerate').disabled = isBusy;
+        document.getElementById('status').textContent = msg || '';
+      }
+
+      function onPreview() {
+        setBusy(true, 'Generating preview...');
+        var form = getFormData();
+        google.script.run
+          .withSuccessHandler(function (rows) {
+            setBusy(false, '');
+            renderPreview(rows || []);
+          })
+          .withFailureHandler(function (err) {
+            setBusy(false, 'Error: ' + (err && err.message ? err.message : err));
+          })
+          .getPreAnnualizationPreview(form);
+      }
+
+      function onGenerate() {
+        if (!confirm('Generate Pre-Annualization sheet for this payroll month (including overrides from preview)?')) return;
+        setBusy(true, 'Creating Pre-Annualization sheet...');
+        var form = getFormData();
+        form.overrides = collectOverrides();
+        google.script.run
+          .withSuccessHandler(function (info) {
+            setBusy(false, '');
+            var name = info && info.sheetName ? info.sheetName : '(unknown)';
+            alert('Pre-Annualization sheet created: ' + name);
+          })
+          .withFailureHandler(function (err) {
+            setBusy(false, 'Error: ' + (err && err.message ? err.message : err));
+          })
+          .createPreAnnualizationSheet(form);
+      }
+
+      function renderPreview(rows) {
+        var table = document.getElementById('previewTable');
+        var summary = document.getElementById('summary');
+
+        baseRowsByEmp = {};
+        editsByEmp = {};
+
+        if (!rows || !rows.length) {
+          table.innerHTML = '';
+          summary.textContent = 'No data found for the selected period.';
+          return;
+        }
+
+        // stash base rows
+        rows.forEach(function (r) {
+          if (r && r.empId) {
+            baseRowsByEmp[String(r.empId)] = r;
+          }
+        });
+
+        // Dynamic labels from Masterfile columns D and E
+        var tc1Label = 'Tracking Category 1';
+        var tc2Label = 'Tracking Category 2';
+        if (rows[0]) {
+          if (rows[0].trackingCat1Label) tc1Label = rows[0].trackingCat1Label;
+          if (rows[0].trackingCat2Label) tc2Label = rows[0].trackingCat2Label;
+        }
+
+        summary.textContent =
+          'Employees in preview (Contract Type = Employee only): ' + rows.length;
+
+        // COLUMN DEFINITIONS
+                var headers = [
+          'Employee ID',                                // 0
+          'Employee Name',                              // 1
+          'Payroll Group',                              // 2
+          tc1Label,                                     // 3
+          tc2Label,                                     // 4
+          'Basic (Annual)',                             // 5
+          'Basic – Extra Projection',                   // 6  (editable)
+          'Taxable Earnings – Other (Annual)',          // 7
+          'Taxable – Extra Projection',                 // 8  (editable)
+          'Non-tax De Minimis (Annual)',                // 9
+          'Non-tax De Minimis – Extra Projection',      // 10 (editable)
+          'Non-tax Other (Annual)',                     // 11
+          'Non-tax Other – Extra Projection',           // 12 (editable)
+          '13th Month & Other Benefits – YTD',          // 13
+          '13th Month & Other – YTD Extra Projection',  // 14 (editable)
+          'Projected 13th Month Pay',                   // 15
+          'Projected 13th – Extra Projection',          // 16 (editable)
+          'Total 13th Month & Other Benefits (Annual)', // 17 (computed)
+          'Gross Compensation – Present Employer',      // 18 (computed)
+          'Non-tax De Minimis',                         // 19 (computed)
+          'Non-tax Other',                              // 20 (computed)
+          'Non-tax 13th+Other (≤90k)',                  // 21 (computed)
+          'SSS EE MC (Annual)',                         // 22
+          'SSS EE MPF (Annual)',                        // 23
+          'PhilHealth EE (Annual)',                     // 24
+          'Pag-IBIG EE (Annual)',                       // 25
+          'Taxable Comp – Present Employer',            // 26 (computed)
+          'Taxable Comp – Previous Employer',           // 27 (editable)
+          'Total Taxable Compensation',                 // 28 (computed)
+          'Annual Tax Due',                             // 29 (computed)
+
+          // NEW SPLIT FOR PRESENT W/TAX
+          'Tax Withheld – Present (YTD)',               // 30
+          'Tax Withheld – Present (Assumed)',           // 31
+          'Total Tax Withheld – Present',               // 32 (computed)
+
+          'Tax Withheld – Previous',                    // 33 (editable)
+          'Total Tax Withheld (Base)',                  // 34 (computed)
+          'Total WTax Adjustment (Tax Due – Total WTax)', // 35 (computed)
+          'Remaining Cutoffs',                          // 36
+          'Recommended WTax Adjustment / Cutoff'        // 37 (computed)
+        ];
+
+
+        var keyOrder = [
+          'empId',                  // 0
+          'empName',                // 1
+          'group',                  // 2
+          'trackingCat1',           // 3
+          'trackingCat2',           // 4
+          'basicAnnual',            // 5
+          null,                     // 6  extra Basic (editable)
+          'taxableAnnual',          // 7
+          null,                     // 8  extra Taxable (editable)
+          'nonTaxDemAnnual',        // 9
+          null,                     //10  extra Deminimis (editable)
+          'nonTaxOtherAnnual',      //11
+          null,                     //12  extra Other (editable)
+          'ytd13thOther',           //13
+          null,                     //14  extra 13th YTD (editable)
+          'projected13thMonth',     //15
+          null,                     //16  extra projected 13th (editable)
+          'total13thOtherAnnual',   //17
+          'grossCompPresent',       //18
+          'nonTaxDemAnnual',        //19
+          'nonTaxOtherAnnual',      //20
+          'nonTax13thOtherAnnual',  //21
+          'sssEeMcAnnual',          //22
+          'sssEeMpfAnnual',         //23
+          'phEeAnnual',             //24
+          'piEeAnnual',             //25
+          'taxableCompPresent',     //26
+          'taxablePrev',            //27
+          'totalTaxableComp',       //28
+          'taxDueAnnual',           //29
+
+          // NEW FIELDS FROM SERVER
+          'taxWithheldPresentYtd',      //30
+          'taxWithheldPresentAssumed',  //31
+          'totalWtaxPresent',           //32
+
+          'wtaxPrev',               //33
+          'totalWtaxBase',          //34
+          'totalAdjustment',        //35
+          'remainingCutoffs',       //36
+          'perCutoffAdj'            //37
+        ];
+
+
+        // which columns are editable and their field names for overrides
+        var editableFieldByIndex = {
+          6:  'basicExtra',
+          8:  'taxableExtra',
+          10: 'nonTaxDemExtra',
+          12: 'nonTaxOtherExtra',
+          14: 'ytd13thExtra',
+          16: 'proj13thExtra',
+          27: 'taxablePrev',
+          33: 'wtaxPrev'   // was 31
+        };
+
+        var html = '<thead><tr>';
+        headers.forEach(function (h, colIdx) {
+          var cls = 'col-' + colIdx;
+          if (colIdx === 0) cls += ' freeze-col-0';
+          if (colIdx === 1) cls += ' freeze-col-1';
+          html += '<th class="' + cls + '">' + h + '</th>';
+        });
+        html += '</tr></thead><tbody>';
+
+        rows.forEach(function (r) {
+          var empId = (r && r.empId) ? String(r.empId) : '';
+          html += '<tr data-emp="' + empId + '">';
+          headers.forEach(function (h, colIdx) {
+            var key = keyOrder[colIdx];
+            var field = editableFieldByIndex[colIdx];
+            var isEditable = !!field;
+            var isNumericCol = (colIdx >= 5);
+            var baseVal = key ? (r && r[key] != null ? r[key] : '') : '';
+
+            var classes = (isNumericCol ? 'num ' : '') + 'col-' + colIdx;
+            if (colIdx === 0) classes += ' freeze-col-0';
+            if (colIdx === 1) classes += ' freeze-col-1';
+
+            if (isEditable) {
+              var rawVal = '';
+              if (field === 'taxablePrev' || field === 'wtaxPrev') {
+                if (baseVal != null && baseVal !== '') rawVal = baseVal;
+              }
+              var dispVal = rawVal === '' ? '' : formatNumber(rawVal);
+              html += '<td class="' + classes + '">';
+              html += '<input type="text" ' +
+                      'class="preann-edit" ' +
+                      'data-emp="' + empId + '" ' +
+                      'data-field="' + field + '" ' +
+                      'data-col="' + colIdx + '" ' +
+                      'value="' + dispVal + '">';
+              html += '</td>';
+            } else {
+              var displayVal = baseVal;
+              if (isNumericCol && typeof baseVal === 'number') {
+                displayVal = formatNumber(baseVal);
+              }
+              html += '<td class="' + classes + '">' + displayVal + '</td>';
+            }
+          });
+          html += '</tr>';
+        });
+
+        html += '</tbody>';
+        table.innerHTML = html;
+
+        attachEditHandlers();
+        adjustNumericColumnWidths();
+        adjustFrozenOffsets();   // <<< NEW: align name column with actual ID width
+      }
+
+      function attachEditHandlers() {
+        var inputs = document.querySelectorAll('#previewTable input.preann-edit');
+        inputs.forEach(function (inp) {
+          inp.addEventListener('blur', onEditChanged);
+          inp.addEventListener('change', onEditChanged);
+        });
+      }
+
+      function onEditChanged(e) {
+        var inp = e.target;
+        var empId = inp.getAttribute('data-emp') || '';
+        var field = inp.getAttribute('data-field') || '';
+        if (!empId || !field) return;
+
+        var raw = (inp.value || '').trim();
+        if (raw === '') {
+          // clear override
+          if (editsByEmp[empId]) {
+            delete editsByEmp[empId][field];
+            if (Object.keys(editsByEmp[empId]).length === 0) {
+              delete editsByEmp[empId];
+            }
+          }
+          inp.value = '';
+        } else {
+          // parse number, store, and autoformat
+          var num = Number(String(raw).replace(/,/g, ''));
+          if (isNaN(num)) {
+            // invalid -> revert to last good or blank
+            var last = (editsByEmp[empId] && editsByEmp[empId][field] != null)
+              ? editsByEmp[empId][field]
+              : '';
+            inp.value = last === '' ? '' : formatNumber(last);
+            return;
+          }
+          if (!editsByEmp[empId]) editsByEmp[empId] = { empId: empId };
+          editsByEmp[empId][field] = num;
+          inp.value = formatNumber(num);
+        }
+
+        recomputeRow(empId);
+      }
+
+      function computeAnnualTaxFromBirClient(annualTaxable) {
+        var val = Number(annualTaxable) || 0;
+        if (val <= 0) return 0;
+        for (var i = 0; i < BIR_ANNUAL_BRACKETS.length; i++) {
+          var b = BIR_ANNUAL_BRACKETS[i];
+          if (val >= b.ex && val <= b.max) {
+            return b.fixed + (val - b.ex) * b.rate;
+          }
+        }
+        // fallback if above last max
+        var last = BIR_ANNUAL_BRACKETS[BIR_ANNUAL_BRACKETS.length - 1];
+        return last.fixed + (val - last.ex) * last.rate;
+      }
+
+      function recomputeRow(empId) {
+        var base = baseRowsByEmp[empId];
+        if (!base) return;
+
+        var ed = editsByEmp[empId] || {};
+
+        function nz(v) {
+          return (v == null || v === '') ? 0 : Number(v);
+        }
+
+        // extras (0 if not provided)
+        var basicExtra       = nz(ed.basicExtra);
+        var taxableExtra     = nz(ed.taxableExtra);
+        var nonTaxDemExtra   = nz(ed.nonTaxDemExtra);
+        var nonTaxOtherExtra = nz(ed.nonTaxOtherExtra);
+        var ytd13thExtra     = nz(ed.ytd13thExtra);
+        var proj13thExtra    = nz(ed.proj13thExtra);
+
+        // previous employer overrides fall back to base if empty
+        var taxablePrev = (ed.hasOwnProperty('taxablePrev')
+          ? nz(ed.taxablePrev)
+          : nz(base.taxablePrev));
+        var wtaxPrev = (ed.hasOwnProperty('wtaxPrev')
+          ? nz(ed.wtaxPrev)
+          : nz(base.wtaxPrev));
+
+        // === Recompute using same logic as sheet formulas ===
+
+        var basicAnnualBase       = nz(base.basicAnnual);
+        var taxableAnnualBase     = nz(base.taxableAnnual);
+        var nonTaxDemAnnualBase   = nz(base.nonTaxDemAnnual);
+        var nonTaxOtherAnnualBase = nz(base.nonTaxOtherAnnual);
+        var ytd13thBase           = nz(base.ytd13thOther);
+        var proj13thBase          = nz(base.projected13thMonth);
+
+                var sssEeMcAnnual  = nz(base.sssEeMcAnnual);
+        var sssEeMpfAnnual = nz(base.sssEeMpfAnnual);
+        var phEeAnnual     = nz(base.phEeAnnual);
+        var piEeAnnual     = nz(base.piEeAnnual);
+
+        // NEW: split present employer WTax
+        var taxWithheldPresentYtd     = nz(base.taxWithheldPresentYtd);
+        var taxWithheldPresentAssumed = nz(base.taxWithheldPresentAssumed);
+        var totalWtaxPresent          = nz(base.totalWtaxPresent);
+
+        var remainingCutoffs = nz(base.remainingCutoffs);
+
+
+        // total 13th & other
+        var total13thAnnual =
+          ytd13thBase + ytd13thExtra + proj13thBase + proj13thExtra;
+
+        // totals including extra
+        var basicTotal       = basicAnnualBase       + basicExtra;
+        var taxableTotal     = taxableAnnualBase     + taxableExtra;
+        var nonTaxDemTotal   = nonTaxDemAnnualBase   + nonTaxDemExtra;
+        var nonTaxOtherTotal = nonTaxOtherAnnualBase + nonTaxOtherExtra;
+
+        // gross comp = all income including 13th
+        var grossCompPresent =
+          basicTotal +
+          taxableTotal +
+          nonTaxDemTotal +
+          nonTaxOtherTotal +
+          total13thAnnual;
+
+        // non-tax 13th + other w/ 90k cap
+        var nonTax13thOtherAnnual = Math.min(90000, Math.max(0, total13thAnnual));
+
+        // taxable comp – present
+        var taxableCompPresent =
+          grossCompPresent
+          - nonTaxDemTotal
+          - nonTaxOtherTotal
+          - nonTax13thOtherAnnual
+          - sssEeMcAnnual
+          - sssEeMpfAnnual
+          - phEeAnnual
+          - piEeAnnual;
+
+        // totals
+        var totalTaxableComp = taxableCompPresent + taxablePrev;
+
+        // recompute Annual Tax Due via BIR brackets
+        var taxDueAnnual = computeAnnualTaxFromBirClient(totalTaxableComp);
+
+                // Present WTax (YTD + assumed) is taken as-is from the server
+        var totalWtaxBase   = totalWtaxPresent + wtaxPrev;
+        var totalAdjustment = taxDueAnnual - totalWtaxBase;
+
+        var perCutoffAdj     = remainingCutoffs > 0
+          ? (totalAdjustment / remainingCutoffs)
+          : 0;
+
+        // === Write back to DOM ===
+        var rowEl = document.querySelector('#previewTable tr[data-emp="' + empId + '"]');
+        if (!rowEl) return;
+        var cells = rowEl.cells;
+
+        function setCell(idx, val, numeric) {
+          if (!cells[idx]) return;
+          if (numeric) {
+            cells[idx].textContent = formatNumber(val);
+          } else {
+            cells[idx].textContent = val;
+          }
+        }
+
+                // 17: Total 13th
+        setCell(17, total13thAnnual, true);
+        // 18: Gross Compensation
+        setCell(18, grossCompPresent, true);
+        // 19: Non-tax De Minimis
+        setCell(19, nonTaxDemTotal, true);
+        // 20: Non-tax Other
+        setCell(20, nonTaxOtherTotal, true);
+        // 21: Non-tax 13th+Other (≤90k)
+        setCell(21, nonTax13thOtherAnnual, true);
+        // 26: Taxable Comp – Present Employer
+        setCell(26, taxableCompPresent, true);
+        // 28: Total Taxable Compensation
+        setCell(28, totalTaxableComp, true);
+        // 29: Annual Tax Due (recomputed)
+        setCell(29, taxDueAnnual, true);
+        // 34: Total Tax Withheld (Base)
+        setCell(34, totalWtaxBase, true);
+        // 35: Total WTax Adjustment
+        setCell(35, totalAdjustment, true);
+        // 37: Recommended WTax Adjustment / Cutoff
+        setCell(37, perCutoffAdj, true);
+      }
+
+      function collectOverrides() {
+        // just dump editsByEmp as array (only numeric fields we stored)
+        var out = [];
+        Object.keys(editsByEmp).forEach(function (empId) {
+          var ed = editsByEmp[empId];
+          if (!ed) return;
+          var copy = { empId: empId };
+          Object.keys(ed).forEach(function (k) {
+            if (k === 'empId') return;
+            copy[k] = ed[k];
+          });
+          out.push(copy);
+        });
+        return out;
+      }
+
+      function adjustNumericColumnWidths() {
+        var table = document.getElementById('previewTable');
+        if (!table) return;
+        var rows = table.rows;
+        if (!rows.length) return;
+
+        var headerRow = rows[0];
+        var colCount = headerRow.cells.length;
+
+        // From Basic (Annual) onwards: index 5..last
+        var firstNumericCol = 5;
+        var lastNumericCol = colCount - 1;
+
+        var maxLen = 0;
+
+        for (var r = 1; r < rows.length; r++) {
+          for (var c = firstNumericCol; c <= lastNumericCol; c++) {
+            var cell = rows[r].cells[c];
+            if (!cell) continue;
+            var text = cell.textContent || '';
+            // strip non-digits for length
+            text = text.replace(/[^\d\-]/g, '');
+            if (!text) continue;
+            if (text.length > maxLen) maxLen = text.length;
+          }
+        }
+
+        if (maxLen === 0) maxLen = 6; // fallback
+
+        var basePerChar = 7; // px per char (approx)
+        var padding = 18;
+        var widthPx = Math.max(80, maxLen * basePerChar + padding);
+
+        for (var c = firstNumericCol; c <= lastNumericCol; c++) {
+          var sel = '.col-' + c;
+          var cells = table.querySelectorAll(sel);
+          for (var i = 0; i < cells.length; i++) {
+            cells[i].style.minWidth = widthPx + 'px';
+            cells[i].style.maxWidth = widthPx + 'px';
+          }
+        }
+      }
+
+      // NEW: make Employee Name sticky start exactly after Employee ID width
+      function adjustFrozenOffsets() {
+        var table = document.getElementById('previewTable');
+        if (!table) return;
+        var firstHeader = table.querySelector('thead tr th.col-0');
+        if (!firstHeader) return;
+        var w = firstHeader.getBoundingClientRect().width;
+        table.style.setProperty('--fcol1-left', w + 'px');
+      }
+
+      function formatNumber(v) {
+        var n = Number(String(v).replace(/,/g, ''));
+        if (isNaN(n)) return v;
+        return n.toLocaleString('en-PH', {
+          minimumFractionDigits: 2,
+          maximumFractionDigits: 2
+        });
+      }
+    </script>
+
+
+  </body>
+</html>

@@ -1,0 +1,23 @@
+<? var BRAND = getBranding(); ?>
+<? if (BRAND && BRAND.showBranding && BRAND.logoUrl) { ?>
+  <style>
+    .brand-inline{
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      opacity: 1;                 /* ✅ opaque */
+      filter: grayscale(100%);    /* keep discreet; remove if you want full color */
+      pointer-events: none;
+      user-select: none;
+    }
+    .brand-inline img{
+      height: 16px;
+      width: auto;
+      display: block;
+    }
+  </style>
+
+  <div class="brand-inline">
+    <img src="<?!= BRAND.logoUrl ?>" alt="Netpay PH">
+  </div>
+<? } ?>

@@ -1,0 +1,356 @@
+<style>
+  :root{
+    --bg:#ffffff;
+    --surface:#ffffff;
+    --surface-2:#f8f9fa;
+    --border:#e0e0e0;
+    --text:#202124;
+    --muted:#5f6368;
+
+    --primary:#1a73e8;
+    --primary-2:#155fcf;
+
+    --danger:#d93025;
+    --danger-2:#b3261e;
+
+    --radius:12px;
+    --shadow:0 1px 2px rgba(0,0,0,.06), 0 2px 10px rgba(0,0,0,.05);
+    --ring:0 0 0 3px rgba(26,115,232,.18);
+
+    --t:.18s;
+    --ease:cubic-bezier(.2,.8,.2,1);
+  }
+
+  html, body { height: 100%; }
+  body{
+    margin:0;
+    padding:16px;
+    background:var(--bg);
+    color:var(--text);
+    font-family:"Segoe UI", Roboto, Arial, sans-serif;
+    font-size:13px;
+    line-height:1.35;
+    -webkit-font-smoothing:antialiased;
+    box-sizing:border-box;
+  }
+  *, *:before, *:after { box-sizing:inherit; }
+
+    /* ===== Branding Header (Logo on top of all dialogs) ===== */
+  .brandbar{
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    gap:10px;
+    padding:10px 12px 6px;
+    margin:0 0 6px;
+    border-bottom:1px solid var(--border);
+    background:var(--surface);
+  }
+  .brandbar__logo{
+    height:34px;
+    width:auto;
+    display:block;
+  }
+  .brandbar__name{
+    font-size:12px;
+    color:var(--muted);
+    font-weight:600;
+    letter-spacing:.2px;
+  }
+
+
+  h1,h2,h3{
+    margin:0 0 10px;
+    font-weight:650;
+    letter-spacing:.2px;
+    color:var(--text);
+  }
+  h1{ font-size:18px; color:var(--primary); }
+  h2{ font-size:16px; color:var(--primary); }
+  h3{ font-size:14px; color:var(--primary); }
+  p{ margin:0 0 10px; color:var(--muted); }
+
+  .ui-page{ display:flex; flex-direction:column; gap:12px; }
+
+  .card{
+    background:var(--surface);
+    border:1px solid var(--border);
+    border-radius:var(--radius);
+    box-shadow:var(--shadow);
+    padding:12px;
+  }
+
+  .row{ display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .stack{ display:flex; flex-direction:column; gap:10px; }
+
+  label{
+    display:block;
+    margin:10px 0 4px;
+    font-weight:600;
+    color:var(--text);
+    font-size:12px;
+  }
+  input, select, textarea{
+    width:100%;
+    font:inherit;
+    padding:8px 10px;
+    border:1px solid #cfcfcf;
+    border-radius:10px;
+    background:#fff;
+    outline:none;
+    transition:border-color var(--t) var(--ease), box-shadow var(--t) var(--ease);
+  }
+  textarea{ min-height:90px; resize:vertical; }
+  input:focus, select:focus, textarea:focus{
+    border-color:var(--primary);
+    box-shadow:var(--ring);
+  }
+  .hint, .text-muted{
+    font-size:12px;
+    color:var(--muted);
+    margin-top:4px;
+  }
+
+  table{ width:100%; border-collapse:collapse; }
+  th, td{
+    border:1px solid var(--border);
+    padding:8px 10px;
+    font-size:12px;
+    vertical-align:middle;
+  }
+  th{
+    background:var(--surface-2);
+    font-weight:650;
+  }
+  tbody tr:hover td{ background:#f6fafe; }
+
+  button, .btn{
+    border:none;
+    border-radius:12px;
+    padding:9px 12px;
+    cursor:pointer;
+    font:inherit;
+    font-weight:600;
+    transition:transform var(--t) var(--ease), filter var(--t) var(--ease), background var(--t) var(--ease), box-shadow var(--t) var(--ease), opacity var(--t) var(--ease);
+    user-select:none;
+    -webkit-tap-highlight-color:transparent;
+  }
+  button:hover, .btn:hover{ transform:translateY(-1px); }
+  button:active, .btn:active{ transform:translateY(0); filter:saturate(.98); }
+  button:focus-visible, .btn:focus-visible{ box-shadow:var(--ring); outline:none; }
+
+  button.primary, .btn.primary, .btn-primary{
+    background:var(--primary);
+    color:#fff;
+  }
+  button.primary:hover, .btn.primary:hover, .btn-primary:hover{ background:var(--primary-2); }
+
+  button.secondary, .btn.secondary, .btn-secondary{
+    background:#f1f3f4;
+    color:var(--text);
+  }
+  button.secondary:hover, .btn.secondary:hover, .btn-secondary:hover{ background:#e8eaed; }
+
+  button.danger, .btn.danger, .btn-danger{
+    background:var(--danger);
+    color:#fff;
+  }
+  button.danger:hover, .btn.danger:hover, .btn-danger:hover{ background:var(--danger-2); }
+
+  .mini{ padding:6px 10px; border-radius:10px; font-size:12px; }
+
+  button:disabled, .btn:disabled{
+    opacity:.55;
+    cursor:not-allowed;
+    transform:none;
+  }
+
+  #status, #result, #cd_status{
+    margin-top:10px;
+    font-size:12px;
+    color:var(--text);
+    white-space:pre-line;
+    background:var(--surface-2);
+    border:1px solid var(--border);
+    border-radius:12px;
+    padding:10px 12px;
+  }
+
+  .ui-footer{
+    display:flex;
+    align-items:center;
+    justify-content:flex-end;
+    gap:10px;
+    flex-wrap:wrap;
+    padding:12px;
+    border-top:1px solid var(--border);
+    background:linear-gradient(#fff, #fbfbfb);
+    position:sticky;
+    bottom:0;
+    z-index:5;
+  }
+
+  /* =========================
+     Smooth UI transitions
+     - Use with: UI.show(el) / UI.hide(el)
+     ========================= */
+
+  .ui-anim{
+    transition:
+      opacity var(--t) var(--ease),
+      transform var(--t) var(--ease),
+      max-height var(--t) var(--ease);
+    will-change: opacity, transform, max-height;
+  }
+
+  /* collapsed/hidden state (animatable) */
+  .ui-hidden{
+    opacity:0;
+    transform: translateY(4px);
+    max-height:0;
+    overflow:hidden;
+    pointer-events:none;
+  }
+
+  /* shown state (animatable) */
+  .ui-shown{
+    opacity:1;
+    transform:none;
+    max-height:2000px; /* big enough for your sections */
+    pointer-events:auto;
+  }
+
+  /* nice “fade-in” even if you still use display none/block for tabcontent */
+  .tabcontent.active{
+    animation: uiFadeIn var(--t) var(--ease);
+  }
+  @keyframes uiFadeIn{
+    from { opacity:0; transform: translateY(4px); }
+    to   { opacity:1; transform: none; }
+  }
+
+
+  @media (prefers-reduced-motion: reduce){
+    *{ transition:none !important; animation:none !important; }
+  }
+
+  .is-busy{ position:relative; pointer-events:none; opacity:.75; }
+  .is-busy:after{
+    content:"";
+    width:14px; height:14px;
+    border-radius:50%;
+    border:2px solid rgba(255,255,255,.55);
+    border-top-color:#fff;
+    display:inline-block;
+    margin-left:8px;
+    vertical-align:-2px;
+    animation:uiSpin .7s linear infinite;
+  }
+  button.secondary.is-busy:after{ border-color:rgba(32,33,36,.25); border-top-color:rgba(32,33,36,.75); }
+  @keyframes uiSpin{ to{ transform:rotate(360deg);} }
+</style>
+
+<script>
+    window.UI = window.UI || {
+    setBusy(btn, busy, label){
+      if (!btn) return;
+      if (busy){
+        btn.dataset._oldText = btn.textContent;
+        if (label) btn.textContent = label;
+        btn.classList.add('is-busy');
+        btn.disabled = true;
+      } else {
+        btn.classList.remove('is-busy');
+        btn.disabled = false;
+        if (btn.dataset._oldText) btn.textContent = btn.dataset._oldText;
+      }
+    },
+
+    // Smoothly show an element (works even if it was display:none)
+    show(el, displayValue){
+      if (!el) return;
+
+      // remember original display
+      if (!el.dataset._uiDisplay) {
+        const cs = window.getComputedStyle(el);
+        el.dataset._uiDisplay = (cs.display && cs.display !== 'none') ? cs.display : 'block';
+      }
+
+      el.classList.add('ui-anim');
+      el.style.display = displayValue || el.dataset._uiDisplay || 'block';
+
+      // start hidden then animate to shown
+      el.classList.remove('ui-hidden');
+      el.classList.add('ui-shown');
+
+      // ensure a reflow so transitions apply reliably
+      void el.offsetWidth;
+      el.classList.add('ui-shown');
+    },
+
+    // Smoothly hide an element, then sets display:none after transition
+    hide(el){
+      if (!el) return;
+
+      el.classList.add('ui-anim');
+      el.classList.remove('ui-shown');
+      el.classList.add('ui-hidden');
+
+      const done = () => {
+        el.style.display = 'none';
+        el.removeEventListener('transitionend', done);
+      };
+
+      // if reduced motion or no transition, finish immediately
+      const cs = window.getComputedStyle(el);
+      const dur = parseFloat(cs.transitionDuration || '0') || 0;
+      if (dur === 0) {
+        el.style.display = 'none';
+        return;
+      }
+
+      el.addEventListener('transitionend', done);
+    }
+  };
+
+
+  // Auto-standardize buttons so older dialogs immediately match the theme.
+  document.addEventListener('DOMContentLoaded', () => {
+    const primaryIdRe = /(generate|run|export|save|submit|send|create|apply|import|post)/i;
+    const cancelIdRe = /(close|cancel|back)/i;
+
+    document.querySelectorAll('button').forEach(btn => {
+      btn.classList.add('btn');
+
+      const cls = btn.className || '';
+      const text = (btn.textContent || '').trim();
+      const id = btn.id || '';
+      const onclick = (btn.getAttribute('onclick') || '');
+
+      const hasTone = /(\bprimary\b|\bsecondary\b|\bdanger\b|\bbtn-primary\b|\bbtn-secondary\b|\bbtn-danger\b)/i.test(cls);
+      if (hasTone) return;
+
+      // Common existing classes in your dialogs
+      if (/delBtn/i.test(cls) || /delete/i.test(onclick) || /delete/i.test(text)) {
+        btn.classList.add('danger','mini');
+        return;
+      }
+      if (/editBtn/i.test(cls)) {
+        btn.classList.add('secondary','mini');
+        return;
+      }
+
+      if (cancelIdRe.test(id) || /google\.script\.host\.close/i.test(onclick) || /^close$/i.test(text) || /^cancel$/i.test(text) || /^back$/i.test(text)) {
+        btn.classList.add('secondary');
+        return;
+      }
+
+      if (primaryIdRe.test(id) || primaryIdRe.test(text)) {
+        btn.classList.add('primary');
+        return;
+      }
+
+      btn.classList.add('secondary');
+    });
+  });
+</script>

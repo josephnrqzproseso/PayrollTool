@@ -1,0 +1,608 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ════════════════════════════════════════
+// Multi-Tenancy Core
+// ════════════════════════════════════════
+
+model Tenant {
+  id        String   @id @default(uuid())
+  name      String
+  slug      String   @unique
+  active    Boolean  @default(true)
+  plan      String   @default("starter")
+  maxUsers  Int      @default(10)
+  timezone  String   @default("Asia/Manila")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  companyProfile CompanyProfile?
+  memberships    Membership[]
+  employees      Employee[]
+  payrollRuns    PayrollRun[]
+  payrollHistory PayrollHistory[]
+  adjustmentTypes      AdjustmentType[]
+  adjustments          Adjustment[]
+  recurringAdjustments RecurringAdjustment[]
+  birTables            BirTable[]
+  sssTables      SssTable[]
+  integrations   Integration[]
+  jobs           Job[]
+  auditLogs      AuditLog[]
+  payrollGroupDefs          PayrollGroupDef[]
+  trackingCategoryKinds     TrackingCategoryKind[]
+  invitations               Invitation[]
+
+  @@map("tenants")
+}
+
+model CompanyProfile {
+  id                  String  @id @default(uuid())
+  tenantId            String  @unique
+  tin                 String  @default("")
+  registeredName      String  @default("")
+  registeredAddress1  String  @default("")
+  registeredAddress2  String  @default("")
+  zipCode             String  @default("")
+  authorizedRep       String  @default("")
+  authorizedRepTin    String  @default("")
+  coaMappings         Json    @default("[]")
+  defaultExpenseAcct  String  @default("6100")
+  defaultPayableAcct  String  @default("2100")
+  payslipTemplate     String  @default("")
+  payFrequency        String  @default("Semi-Monthly")
+  workingDaysPerYear  Int     @default(261)
+  pagibigEeRate       Float   @default(0.02)
+  pagibigErRate       Float   @default(0.02)
+  pagibigMaxBase      Float   @default(10000)
+  philhealthRate      Float   @default(0.05)
+  philhealthMinBase   Float   @default(10000)
+  philhealthMaxBase   Float   @default(100000)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@map("company_profiles")
+}
+
+// ════════════════════════════════════════
+// Users & Access
+// ════════════════════════════════════════
+
+model User {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  name          String?
+  passwordHash  String?
+  image         String?
+  emailVerified DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  memberships Membership[]
+  accounts    Account[]
+  sessions    Session[]
+
+  @@map("users")
+}
+
+model Account {
+  id                String  @id @default(uuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(uuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model Membership {
+  id       String @id @default(uuid())
+  userId   String
+  tenantId String
+  role     Role   @default(MEMBER)
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, tenantId])
+  @@map("memberships")
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  APPROVER
+  MEMBER
+  VIEWER
+}
+
+// ════════════════════════════════════════
+// Employee Masterfile
+// ════════════════════════════════════════
+
+model Employee {
+  id                    String    @id @default(uuid())
+  tenantId              String
+  employeeId            String
+  employeeName          String
+  lastName              String    @default("")
+  firstName             String    @default("")
+  middleName            String    @default("")
+  status                String    @default("Active")
+  contractType          String    @default("Employee")
+  consultantTaxRate     Float     @default(0)
+  dateHired             DateTime?
+  dateSeparated         DateTime?
+  payBasis              String    @default("MONTHLY")
+  basicPay              Float     @default(0)
+  workingDaysPerYear    Int       @default(261)
+  payrollGroup          String    @default("")
+  trackingCategory1     String    @default("")
+  trackingCategory2     String    @default("")
+  tin                   String    @default("")
+  sss                   String    @default("")
+  philhealth            String    @default("")
+  pagibig               String    @default("")
+  bankName              String    @default("")
+  bankAccountNumber     String    @default("")
+  bankAccountName       String    @default("")
+  nationality           String    @default("Filipino")
+  birthday              DateTime?
+  isPwd                 Boolean   @default(false)
+  isMwe                 Boolean   @default(false)
+  appliedForRetirement  Boolean   @default(false)
+  position              String    @default("")
+  allocation            String    @default("")
+
+  dynamicFields Json @default("{}")
+
+  tenant               Tenant                @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  payrollRows          PayrollRow[]
+  adjustments          Adjustment[]
+  recurringAdjustments RecurringAdjustment[]
+  payrollHistory       PayrollHistory[]
+  trackingAssignments  EmployeeTrackingAssignment[]
+
+  @@unique([tenantId, employeeId])
+  @@index([tenantId])
+  @@map("employees")
+}
+
+// ════════════════════════════════════════
+// Payroll Runs & Computation
+// ════════════════════════════════════════
+
+model PayrollRun {
+  id                String        @id @default(uuid())
+  tenantId          String
+  payrollFrequency  String
+  payrollCode       String
+  periodLabel       String
+  periodKey         String
+  payrollMonth      String
+  entity            String        @default("")
+  payrollGroups     String[]
+  startDate         DateTime
+  endDate           DateTime
+  creditingDate     DateTime?
+  computeTax        Boolean       @default(true)
+  computeContrib    Boolean       @default(true)
+  status            PayrollStatus @default(DRAFT)
+  totalEmployees    Int           @default(0)
+  totalGrossPay     Float         @default(0)
+  totalNetPay       Float         @default(0)
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  approvedAt        DateTime?
+  postedAt          DateTime?
+  statutoryVersionId String?
+
+  tenant           Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  statutoryVersion StatutoryVersion? @relation(fields: [statutoryVersionId], references: [id])
+  rows             PayrollRow[]
+
+  @@index([tenantId])
+  @@index([tenantId, periodKey])
+  @@map("payroll_runs")
+}
+
+enum PayrollStatus {
+  DRAFT
+  COMPUTING
+  COMPUTED
+  APPROVED
+  POSTED
+  CANCELLED
+}
+
+model PayrollRow {
+  id            String @id @default(uuid())
+  payrollRunId  String
+  employeeId    String
+  employeeName  String
+  periodLabel   String
+
+  basicPay        Float @default(0)
+  grossPay        Float @default(0)
+  taxableIncome   Float @default(0)
+  withholdingTax  Float @default(0)
+  sssEeMc         Float @default(0)
+  sssEeMpf        Float @default(0)
+  sssErMc         Float @default(0)
+  sssErMpf        Float @default(0)
+  sssEc           Float @default(0)
+  philhealthEe    Float @default(0)
+  philhealthEr    Float @default(0)
+  pagibigEe       Float @default(0)
+  pagibigEr       Float @default(0)
+  netPay          Float @default(0)
+  totalDeductions Float @default(0)
+
+  componentValues  Json @default("{}")
+  inputsSnapshot   Json?
+
+  payrollRun PayrollRun @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+  employee   Employee   @relation(fields: [employeeId], references: [id])
+
+  @@index([payrollRunId])
+  @@map("payroll_rows")
+}
+
+model PayrollHistory {
+  id           String   @id @default(uuid())
+  tenantId     String
+  employeeId   String
+  periodKey    String
+  periodLabel  String
+  partLabel    String
+  columnValues Json
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@index([tenantId, periodKey])
+  @@index([tenantId, employeeId])
+  @@map("payroll_history")
+}
+
+// ════════════════════════════════════════
+// Adjustments & Rate Lookup
+// ════════════════════════════════════════
+
+model AdjustmentType {
+  id       String @id @default(uuid())
+  tenantId String
+  name     String
+  category String
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, name])
+  @@map("adjustment_types")
+}
+
+model Adjustment {
+  id         String @id @default(uuid())
+  tenantId   String
+  employeeId String
+  name       String
+  category   String
+  amount     Float  @default(0)
+  periodKey  String
+  source     String @default("manual")
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@index([tenantId, periodKey])
+  @@index([tenantId, employeeId])
+  @@map("adjustments")
+}
+
+model RecurringAdjustment {
+  id         String    @id @default(uuid())
+  tenantId   String
+  employeeId String
+  name       String
+  category   String
+  amount     Float     @default(0)
+  mode       String    @default("SPLIT")
+  maxAmount  Float?
+  startDate  DateTime?
+  endDate    DateTime?
+  active     Boolean   @default(true)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  tenant   Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  employee Employee @relation(fields: [employeeId], references: [id])
+
+  @@index([tenantId])
+  @@index([tenantId, employeeId])
+  @@map("recurring_adjustments")
+}
+
+// ════════════════════════════════════════
+// Statutory Tables
+// ════════════════════════════════════════
+
+model BirTable {
+  id              String @id @default(uuid())
+  tenantId        String
+  bracketMin      Float
+  bracketMax      Float
+  fixedTax        Float
+  rate            Float
+  period          String @default("SEMI_MONTHLY")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("bir_tables")
+}
+
+model SssTable {
+  id              String @id @default(uuid())
+  tenantId        String
+  compensationMin Float
+  compensationMax Float
+  eeMc            Float  @default(0)
+  eeMpf           Float  @default(0)
+  erMc            Float  @default(0)
+  erMpf           Float  @default(0)
+  ec              Float  @default(0)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("sss_tables")
+}
+
+// ════════════════════════════════════════
+// Global Statutory Versioning
+// ════════════════════════════════════════
+
+model StatutoryVersion {
+  id            String    @id @default(uuid())
+  country       String    @default("PH")
+  effectiveFrom DateTime
+  effectiveTo   DateTime?
+  status        String    @default("DRAFT")
+  notes         String    @default("")
+  publishedAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  birRows      BirTableGlobal[]
+  sssRows      SssTableGlobal[]
+  payrollRuns  PayrollRun[]
+
+  @@index([country, status])
+  @@index([effectiveFrom])
+  @@map("statutory_versions")
+}
+
+model BirTableGlobal {
+  id                 String @id @default(uuid())
+  statutoryVersionId String
+  // Maps to legacy column names; interpreted as MONTHLY brackets (E–H in PayrollGenerator BIR_TABLE)
+  exMonth    Float @map("bracketMin")
+  maxMonth   Float @map("bracketMax")
+  fixedMonth Float @map("fixedTax")
+  rateMonth  Float @map("rate")
+
+  // Semi-monthly brackets (A–D)
+  exSemi    Float @default(0)
+  maxSemi   Float @default(999999999999)
+  fixedSemi Float @default(0)
+  rateSemi  Float @default(0)
+
+  // Optional annual brackets (I–L)
+  exAnnual    Float @default(0)
+  maxAnnual   Float @default(999999999999)
+  fixedAnnual Float @default(0)
+  rateAnnual  Float @default(0)
+
+  statutoryVersion StatutoryVersion @relation(fields: [statutoryVersionId], references: [id], onDelete: Cascade)
+
+  @@index([statutoryVersionId])
+  @@map("bir_tables_global")
+}
+
+model SssTableGlobal {
+  id                 String @id @default(uuid())
+  statutoryVersionId String
+  compensationMin    Float
+  compensationMax    Float
+  eeMc               Float  @default(0)
+  eeMpf              Float  @default(0)
+  erMc               Float  @default(0)
+  erMpf              Float  @default(0)
+  ec                 Float  @default(0)
+
+  statutoryVersion StatutoryVersion @relation(fields: [statutoryVersionId], references: [id], onDelete: Cascade)
+
+  @@index([statutoryVersionId])
+  @@map("sss_tables_global")
+}
+
+// ════════════════════════════════════════
+// Org Structure: Payroll Groups & Tracking
+// ════════════════════════════════════════
+
+model PayrollGroupDef {
+  id       String  @id @default(uuid())
+  tenantId String
+  name     String
+  code     String  @default("")
+  active   Boolean @default(true)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("payroll_group_defs")
+}
+
+model TrackingCategoryKind {
+  id       String  @id @default(uuid())
+  tenantId String
+  name     String
+  sortOrder Int    @default(0)
+  active   Boolean @default(true)
+
+  tenant  Tenant                   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  options TrackingCategoryOption[]
+
+  @@unique([tenantId, name])
+  @@index([tenantId])
+  @@map("tracking_category_kinds")
+}
+
+model TrackingCategoryOption {
+  id     String  @id @default(uuid())
+  kindId String
+  name   String
+  code   String  @default("")
+  active Boolean @default(true)
+
+  kind        TrackingCategoryKind         @relation(fields: [kindId], references: [id], onDelete: Cascade)
+  assignments EmployeeTrackingAssignment[]
+
+  @@unique([kindId, name])
+  @@index([kindId])
+  @@map("tracking_category_options")
+}
+
+model EmployeeTrackingAssignment {
+  id         String @id @default(uuid())
+  employeeId String
+  optionId   String
+
+  employee Employee               @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  option   TrackingCategoryOption @relation(fields: [optionId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, optionId])
+  @@index([employeeId])
+  @@map("employee_tracking_assignments")
+}
+
+// ════════════════════════════════════════
+// Invitations
+// ════════════════════════════════════════
+
+model Invitation {
+  id        String    @id @default(uuid())
+  tenantId  String
+  email     String
+  role      Role      @default(MEMBER)
+  token     String    @unique
+  expiresAt DateTime
+  accepted  Boolean   @default(false)
+  acceptedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([token])
+  @@map("invitations")
+}
+
+// ════════════════════════════════════════
+// Integrations (Odoo, Xero)
+// ════════════════════════════════════════
+
+model Integration {
+  id        String @id @default(uuid())
+  tenantId  String
+  provider  String
+  config    Json   @default("{}")
+  secretRef String @default("")
+  active    Boolean @default(true)
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@unique([tenantId, provider])
+  @@map("integrations")
+}
+
+// ════════════════════════════════════════
+// Background Jobs
+// ════════════════════════════════════════
+
+model Job {
+  id         String    @id @default(uuid())
+  tenantId   String
+  type       String
+  status     JobStatus @default(PENDING)
+  payload    Json      @default("{}")
+  result     Json?
+  progress   Int       @default(0)
+  message    String    @default("")
+  attempts   Int       @default(0)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  startedAt  DateTime?
+  finishedAt DateTime?
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([status])
+  @@map("jobs")
+}
+
+enum JobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
+}
+
+// ════════════════════════════════════════
+// Audit Trail
+// ════════════════════════════════════════
+
+model AuditLog {
+  id        String   @id @default(uuid())
+  tenantId  String
+  userId    String?
+  action    String
+  entity    String
+  entityId  String?
+  details   Json     @default("{}")
+  createdAt DateTime @default(now())
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([tenantId, entity])
+  @@map("audit_logs")
+}

@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <meta charset="utf-8">
+  <style>
+    body {
+      font-family: "Segoe UI", Roboto, sans-serif;
+      margin: 0;
+      padding: 16px;
+      box-sizing: border-box;
+      color: #202124;
+    }
+    h2 {
+      margin: 0 0 12px;
+      font-size: 18px;
+      color: #1a73e8;
+    }
+    p {
+      margin: 0 0 12px;
+      font-size: 12px;
+      color: #555;
+    }
+    .btn-row {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      margin-top: 4px;
+    }
+    button {
+      font-size: 13px;
+      padding: 8px 10px;
+      border-radius: 4px;
+      border: none;
+      cursor: pointer;
+      font-weight: 500;
+      text-align: left;
+    }
+    button.primary {
+      background-color: #1a73e8;
+      color: #fff;
+    }
+    button.secondary {
+      background-color: #f1f3f4;
+      color: #202124;
+    }
+    .btn-label {
+      font-weight: 600;
+      display: block;
+    }
+    .btn-desc {
+      font-size: 11px;
+      opacity: 0.8;
+      display: block;
+    }
+    .footer {
+      margin-top: 14px;
+      display: flex;
+      justify-content: flex-end;
+    }
+    .footer button {
+      min-width: 80px;
+      text-align: center;
+    }
+  </style>
+  <?!= include_('UiTheme'); ?>
+</head>
+<body class="ui-page">
+  
+  <p>Select what you want to configure for this file.</p>
+
+  <div class="btn-row">
+    <button class="secondary" onclick="openCoa()">
+      <span class="btn-label">Chart of Accounts</span>
+      <span class="btn-desc">Maintain GL codes and descriptions.</span>
+    </button>
+
+    <button class="secondary" onclick="openPosting()">
+      <span class="btn-label">Payroll Posting Mapping</span>
+      <span class="btn-desc">Map payroll items to employee / consultant GL accounts and tracking categories.</span>
+    </button>
+
+   
+  </div>
+
+  <div class="footer">
+    <button class="primary" onclick="google.script.host.close()">Close</button>
+  </div>
+
+  <script>
+    // Each button opens the existing dialog on the server
+    // then closes this hub window.
+
+    function openCoa() {
+      google.script.run
+        .withSuccessHandler(() => google.script.host.close())
+        .showCoaDialog();
+    }
+
+    function openPosting() {
+      google.script.run
+        .withSuccessHandler(() => google.script.host.close())
+        .showPayrollPostingDialog();
+    }
+
+    
+  </script>
+</body>
+</html>

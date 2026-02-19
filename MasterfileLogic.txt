@@ -1,0 +1,1269 @@
+/**************************************************
+ * FULLY AUTOMATED PAYROLL CHANGE SYSTEM (v4.0)
+ * - Recurring Adjustments + Masterfile Change Log
+ **************************************************/
+
+const CONFIG = {
+  HR_EMAIL: "joseph@proseso-consulting.com",
+  SHEETS: {
+    HISTORY: "Employment History",
+    MASTER: "Masterfile Import",      // default main masterfile
+    LOG: "Change Log",
+    HELPER: "_DropdownData",
+    ADJUST_SCHEDULE: "Recurring Adjustments",
+  },
+  VIEW_SHEET_SUFFIX: " Payroll Group",
+  BACKUP_LIMIT: 5,
+  HISTORY_HEADERS: [
+    "Employee ID", "Employee Name", "Information to Update", "New Value",
+    "Effective Date", "Date Processed", "Updated By",
+  ],
+};
+
+// NEW: where we remember which sheet is the "main" masterfile
+const PROP_MAIN_MASTER_SHEET = "PAYROLL_MAIN_MASTER_SHEET";
+
+// Snapshots for structural-change tracking (row deletions)
+const SNAPSHOT_MASTER_SHEET = "_MasterSnapshot_v2";
+const SNAPSHOT_ADJUST_SHEET = "_AdjustSnapshot_v2";
+
+
+function getOrCreateSnapshotSheet_(sheetName, snapshotName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let snapshot = ss.getSheetByName(snapshotName);
+  if (!snapshot) {
+    const source = ss.getSheetByName(sheetName);
+    if (!source) return null;
+    snapshot = ss.insertSheet(snapshotName);
+    snapshot.hideSheet();
+    resyncSnapshot_(source, snapshot);
+  }
+  return snapshot;
+}
+
+function resyncSnapshot_(sourceSheet, snapshotSheet) {
+  if (!sourceSheet || !snapshotSheet) return;
+  snapshotSheet.clear();
+  const range = sourceSheet.getDataRange();
+  const values = range.getValues();
+  if (values.length && values[0].length) {
+    snapshotSheet
+      .getRange(1, 1, values.length, values[0].length)
+      .setValues(values);
+  }
+  snapshotSheet.setHiddenGridlines(true);
+}
+
+// Used by the menu "Set Main Masterfile Sheet…"
+function ensureMasterSnapshot_(masterName) {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const master =
+    ss.getSheetByName(masterName) ||
+    ss.getSheetByName(CONFIG.SHEETS.MASTER);
+  if (!master) return;
+  const snapshot = getOrCreateSnapshotSheet_(master.getName(), SNAPSHOT_MASTER_SHEET);
+  resyncSnapshot_(master, snapshot);
+}
+
+
+
+
+
+/**************************************************
+ * GENERIC HEADER HELPERS
+ **************************************************/
+function indexByHeader_(headers) {
+  const map = {};
+  if (!headers || !headers.length) return map;
+
+  headers.forEach((h, i) => {
+    if (!h) return;
+    const key = String(h).trim().toLowerCase();  // 👈 store lower-cased
+    if (key) map[key] = i; // 0-based
+  });
+
+  return map;
+}
+
+function findHeaderFuzzy_(headers, candidates) {
+  if (!headers || !headers.length) return -1;
+  const norm = s => String(s || "").trim().toLowerCase();
+  const normHeaders = headers.map(norm);
+  const normCandidates = candidates.map(norm);
+
+  // exact match first
+  for (let i = 0; i < normHeaders.length; i++) {
+    const h = normHeaders[i];
+    if (!h) continue;
+    if (normCandidates.includes(h)) return i;
+  }
+  // then contains
+  for (let i = 0; i < normHeaders.length; i++) {
+    const h = normHeaders[i];
+    if (!h) continue;
+    for (let j = 0; j < normCandidates.length; j++) {
+      if (h.indexOf(normCandidates[j]) !== -1) return i;
+    }
+  }
+  return -1;
+}
+
+/**************************************************
+ * EMPLOYMENT HISTORY HEADER HELPER
+ **************************************************/
+function ensureHistoryHeaders_(historySheet) {
+  if (!historySheet) return;
+
+  const requiredHeaders = CONFIG.HISTORY_HEADERS;
+  const lastCol = Math.max(historySheet.getLastColumn(), requiredHeaders.length);
+
+  let current = [];
+  if (lastCol > 0 && historySheet.getLastRow() > 0) {
+    current = historySheet.getRange(1, 1, 1, lastCol).getValues()[0];
+  }
+
+  let needsUpdate = false;
+  for (let i = 0; i < requiredHeaders.length; i++) {
+    if (String(current[i] || "") !== requiredHeaders[i]) {
+      needsUpdate = true;
+      break;
+    }
+  }
+
+  if (needsUpdate) {
+    historySheet
+      .getRange(1, 1, 1, requiredHeaders.length)
+      .setValues([requiredHeaders])
+      .setFontWeight("bold");
+  }
+}
+
+/**************************************************
+ * MAIN & TRIGGERS
+ **************************************************/
+function loadMasterfileMenu() {
+  const ui = SpreadsheetApp.getUi();
+
+  ui.createMenu("🔄 Payroll Tools")
+    .addItem("Set Main Masterfile Sheet…", "setMainMasterSheet")
+    .addItem("Open Change Log", "openChangeLog")
+    .addSeparator()
+    .addItem("Open Recurring Adjustments", "openAdjustmentSchedule")
+    .addSeparator()
+    .addItem('ℹ️ About / License', 'showAboutLicenseDialog')
+    .addItem("💬 Send Feedback", "showFeedbackDialog")
+    .addToUi();
+
+  // Make sure Recurring Adjustments sheet exists and is formatted
+  ensureAdjustmentScheduleSheet_();
+
+  // Make sure Change Log exists and has the correct headers
+  ensureChangeLogSheet_();
+
+  // Initialize snapshots (once per open)
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  const masterName = getMainMasterSheetName_();
+  const master =
+    ss.getSheetByName(masterName) ||
+    ss.getSheetByName(CONFIG.SHEETS.MASTER);
+  if (master) {
+    const snapMaster = getOrCreateSnapshotSheet_(master.getName(), SNAPSHOT_MASTER_SHEET);
+    resyncSnapshot_(master, snapMaster);
+  }
+
+  const adjust = ss.getSheetByName(CONFIG.SHEETS.ADJUST_SCHEDULE);
+  if (adjust) {
+    const snapAdjust = getOrCreateSnapshotSheet_(adjust.getName(), SNAPSHOT_ADJUST_SHEET);
+    resyncSnapshot_(adjust, snapAdjust);
+  }
+
+  refreshDropdowns();
+
+}
+
+function updateSnapshotsAfterEdit(sheet) {
+  const ss = sheet.getParent();
+  const sheetName = sheet.getName();
+  const masterName = getMainMasterSheetName_();
+
+  // Masterfile (by configured name or default)
+  if (sheetName === masterName || sheetName === CONFIG.SHEETS.MASTER) {
+    const snap = getOrCreateSnapshotSheet_(sheetName, SNAPSHOT_MASTER_SHEET);
+    if (snap) resyncSnapshot_(sheet, snap);
+  }
+
+  // Recurring Adjustments
+  if (sheetName === CONFIG.SHEETS.ADJUST_SCHEDULE) {
+    const snapAdj = getOrCreateSnapshotSheet_(sheetName, SNAPSHOT_ADJUST_SHEET);
+    if (snapAdj) resyncSnapshot_(sheet, snapAdj);
+  }
+}
+
+function installPayrollChangeSystemTriggers() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // Remove only our triggers (don’t touch others)
+  ScriptApp.getProjectTriggers().forEach(t => {
+    const fn = t.getHandlerFunction();
+    if (fn === 'handleMasterfileEdit' || fn === 'handleMasterfileChange') {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  // Install as YOU (the one running this function)
+  ScriptApp.newTrigger('handleMasterfileEdit')
+    .forSpreadsheet(ss)
+    .onEdit()
+    .create();
+
+  ScriptApp.newTrigger('handleMasterfileChange')
+    .forSpreadsheet(ss)
+    .onChange()
+    .create();
+
+  SpreadsheetApp.getUi().alert('✅ Installed/Repaired triggers: handleMasterfileEdit (onEdit) + handleMasterfileChange (onChange)');
+}
+
+
+function handleMasterfileEdit(e) {
+  if (!e || !e.range) return;
+
+  // 1) Log changes on the main masterfile sheet / Recurring Adjustments
+  trackMasterfileChanges(e);
+
+  const range = e.range;
+  const sh = range.getSheet();
+  const name = sh.getName();
+
+  // Employment History
+  if (name === CONFIG.SHEETS.HISTORY) {
+    autoFillEmployeeId(range);
+    updateSnapshotsAfterEdit(sh);
+    return;
+  }
+
+  // Recurring Adjustments
+  if (name === CONFIG.SHEETS.ADJUST_SCHEDULE) {
+    autoFillAdjustmentScheduleId(range);
+    updateSnapshotsAfterEdit(sh);
+    return;
+  }
+
+  // Main masterfile (configured OR default)
+  const masterName = getMainMasterSheetName_();
+  const isMaster = (name === masterName || name === CONFIG.SHEETS.MASTER);
+
+  if (isMaster) {
+  // If any data row in Masterfile is edited/added, rebuild the dropdown source + reapply validation
+  if (range.getRow() > 1) {
+    refreshDropdowns();
+  }
+
+  // Still refresh if header row is edited (in case columns change)
+  if (range.getRow() === 1) {
+    refreshDropdowns();
+  }
+}
+
+
+  // 3) After any edit, update snapshot for that sheet
+  updateSnapshotsAfterEdit(sh);
+}
+
+
+function handleMasterfileChange(e) {
+  if (!e || !e.changeType) return;
+
+  const ss = e.source;
+  const sheet = ss.getActiveSheet();
+  if (!sheet) return;
+
+  const sheetName = sheet.getName();
+  const masterName = getMainMasterSheetName_();
+  const defaultMaster = CONFIG.SHEETS.MASTER;
+
+  const isMaster = (sheetName === masterName || sheetName === defaultMaster);
+  const isAdjust = (sheetName === CONFIG.SHEETS.ADJUST_SCHEDULE);
+
+  // Only care about masterfile + Recurring Adjustments
+  if (!isMaster && !isAdjust) return;
+
+  const ct = e.changeType;
+
+  // Row deletions from the UI
+  if (ct === 'REMOVE_ROW') {
+    if (isMaster) {
+      logRowDeletions_(sheet, sheetName, SNAPSHOT_MASTER_SHEET);
+    } else if (isAdjust) {
+      logRowDeletions_(sheet, sheetName, SNAPSHOT_ADJUST_SHEET);
+    }
+    updateSnapshotsAfterEdit(sheet);
+    return;
+  }
+
+  // NEW: if structure changes in Masterfile (insert row/column, etc), refresh dropdowns
+  if (isMaster && (ct === 'INSERT_ROW' || ct === 'INSERT_COLUMN' || ct === 'INSERT_GRID' || ct === 'REMOVE_COLUMN' || ct === 'REMOVE_GRID')) {
+    refreshDropdowns();
+  }
+
+  // Always resync snapshot after structural changes we care about
+  if (ct === 'INSERT_ROW' || ct === 'INSERT_COLUMN' || ct === 'INSERT_GRID' || ct === 'REMOVE_COLUMN' || ct === 'REMOVE_GRID') {
+    updateSnapshotsAfterEdit(sheet);
+  }
+}
+
+
+/**************************************************
+ * DROPDOWNS & AUTO-FILL 
+ * (extended to feed Recurring Adjustments)
+ **************************************************/
+function refreshDropdowns() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  // 1) Use the configured main masterfile sheet (fallback to CONFIG.SHEETS.MASTER)
+  const masterName = getMainMasterSheetName_();
+  const master =
+    ss.getSheetByName(masterName) ||
+    ss.getSheetByName(CONFIG.SHEETS.MASTER);
+
+  if (!master) {
+    Logger.log("refreshDropdowns: master sheet not found: " + masterName);
+    return;
+  }
+
+  const mData = master.getDataRange().getValues();
+  if (!mData || mData.length < 2) return;
+
+  const mHeaders = mData[0];
+  const mIdx = indexByHeader_(mHeaders);
+
+  const nameIdx = mIdx["employee name"];
+  const idIdx   = mIdx["employee id"];
+
+  if (nameIdx == null || nameIdx < 0 || idIdx == null || idIdx < 0) {
+    Logger.log(
+      "refreshDropdowns: Employee Name / Employee ID not found in master headers (" +
+      masterName +
+      ")"
+    );
+    return;
+  }
+
+  // Unique list of employee names
+  const names = [...new Set(
+    mData
+      .slice(1)
+      .map(r => r[nameIdx])
+      .filter(v => v)
+  )].sort();
+
+  // Fields to update (for Employment History only)
+  const fields = mHeaders
+    .filter(h => {
+      if (!h) return false;
+      const norm = String(h).trim().toLowerCase();
+      return norm !== "employee id";
+    })
+    .sort();
+
+  // 2) _DropdownData helper sheet
+  let helperSheet = ss.getSheetByName(CONFIG.SHEETS.HELPER);
+  if (!helperSheet) {
+    helperSheet = ss.insertSheet(CONFIG.SHEETS.HELPER);
+    helperSheet.hideSheet();
+  }
+  helperSheet.clear();
+
+  helperSheet.getRange("A1").setValue("Employee Names");
+  if (names.length > 0) {
+    helperSheet
+      .getRange(2, 1, names.length, 1)
+      .setValues(names.map(n => [n]));
+  }
+
+  helperSheet.getRange("B1").setValue("Fields to Update");
+  if (fields.length > 0) {
+    helperSheet
+      .getRange(2, 2, fields.length, 1)
+      .setValues(fields.map(f => [f]));
+  }
+
+  const namesRange  = helperSheet.getRange(2, 1, Math.max(names.length, 1), 1);
+  const fieldsRange = helperSheet.getRange(2, 2, Math.max(fields.length, 1), 1);
+
+  // 3) Apply dropdowns to Employment History (if it exists)
+  const history = ss.getSheetByName(CONFIG.SHEETS.HISTORY);
+  if (history) {
+    ensureHistoryHeaders_(history);
+
+    const hHeaders = history
+      .getRange(1, 1, 1, history.getLastColumn())
+      .getValues()[0];
+    const hIdx = indexByHeader_(hHeaders);
+
+    const histNameIdx  = hIdx["employee name"];
+    const histFieldIdx = hIdx["information to update"];
+
+    if (
+      histNameIdx != null && histNameIdx >= 0 &&
+      histFieldIdx != null && histFieldIdx >= 0
+    ) {
+      const nameRule = SpreadsheetApp.newDataValidation()
+        .requireValueInRange(namesRange, true)
+        .setAllowInvalid(false)
+        .build();
+
+      const fieldRule = SpreadsheetApp.newDataValidation()
+        .requireValueInRange(fieldsRange, true)
+        .setAllowInvalid(false)
+        .build();
+
+      const maxRows = Math.max(history.getMaxRows(), 1000);
+      history
+        .getRange(2, histNameIdx + 1, maxRows - 1, 1)
+        .setDataValidation(nameRule);
+      history
+        .getRange(2, histFieldIdx + 1, maxRows - 1, 1)
+        .setDataValidation(fieldRule);
+    } else {
+      Logger.log("refreshDropdowns: Employment History headers missing for validation.");
+    }
+  }
+
+  // 4) Apply Employee Name dropdown to Recurring Adjustments
+  const adjSheet = ss.getSheetByName(CONFIG.SHEETS.ADJUST_SCHEDULE);
+  if (adjSheet) {
+    const adjMaxRows = Math.max(adjSheet.getMaxRows(), 1000);
+    const adjNameRule = SpreadsheetApp.newDataValidation()
+      .requireValueInRange(namesRange, true)
+      .setAllowInvalid(false)
+      .build();
+
+    // Column A = EMPLOYEE NAME (header in row 1)
+    adjSheet
+      .getRange(2, 1, adjMaxRows - 1, 1)
+      .setDataValidation(adjNameRule);
+  }
+}
+
+
+/**************************************************
+ * RECURRING ADJUSTMENTS SHEET
+ **************************************************/
+/**************************************************
+ * RECURRING ADJUSTMENTS SHEET
+ **************************************************/
+function ensureAdjustmentScheduleSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheetName = CONFIG.SHEETS.ADJUST_SCHEDULE;
+
+  // 👉 ALL CAPS headers
+  const headers = [
+    "EMPLOYEE NAME",
+    "EMPLOYEE ID",
+    "ADJUSTMENT NAME",
+    "AMOUNT PER PAYROLL",
+    "MAXIMUM AMOUNT",
+    "MODE (SPLIT / 1ST / 2ND)",
+    "PAYROLL CATEGORY",
+    "START DATE",
+    "END DATE",
+  ];
+
+  let sh = ss.getSheetByName(sheetName);
+  if (!sh) {
+    sh = ss.insertSheet(sheetName);
+  }
+
+  // Write headers
+  const headerRange = sh.getRange(1, 1, 1, headers.length);
+  headerRange.setValues([headers]);
+
+  // Copy header formatting from MASTERFILE IMPORT first header cell
+  // so it looks exactly the same (centered, wrapped, color, etc.)
+  const master = ss.getSheetByName(CONFIG.SHEETS.MASTER);
+  if (master) {
+    const masterHeaderCell = master.getRange(1, 1); // A1 of Masterfile
+    masterHeaderCell.copyFormatToRange(sh, 1, headers.length, 1, 1);
+  } else {
+    // Fallback formatting if master sheet not found
+    headerRange
+      .setFontWeight("bold")
+      .setHorizontalAlignment("center")
+      .setVerticalAlignment("middle")
+      .setWrap(true);
+  }
+
+  // Make header row taller and freeze it
+  sh.setRowHeight(1, 30);
+  sh.setFrozenRows(1);
+
+  // Hide gridlines so headers look clean (no gridline look)
+  sh.setHiddenGridlines(true);
+
+  // Basic formatting + data validation for the rest
+  setupAdjustmentScheduleValidations_(sh);
+
+  return sh;
+}
+
+
+function setupAdjustmentScheduleValidations_(sh) {
+  const lastRow = Math.max(sh.getMaxRows(), 1000);
+
+  // Amounts
+  sh.getRange("D2:E" + lastRow).setNumberFormat("#,##0.00");
+
+  // Dates
+  sh.getRange("H2:I" + lastRow).setNumberFormat("mmm d, yyyy");
+
+  // Mode: SPLIT / 1ST / 2ND
+  const modeRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(["SPLIT", "1ST", "2ND"], true)
+    .setAllowInvalid(false)
+    .build();
+  sh.getRange("F2:F" + lastRow).setDataValidation(modeRule);
+
+  // Payroll Category aligned to Payroll Generator
+  const categoryRule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(
+      [
+        "BASIC PAY RELATED",
+        "TAXABLE EARNING",
+        "NON-TAXABLE EARNING - DE MINIMIS",
+        "NON-TAXABLE EARNING - OTHER",
+        "13TH MONTH PAY AND OTHER BENEFITS",
+        "ADDITION",
+        "DEDUCTION",
+      ],
+      true
+    )
+    .setAllowInvalid(false)
+    .build();
+  sh.getRange("G2:G" + lastRow).setDataValidation(categoryRule);
+
+  sh.autoResizeColumns(1, 9);
+}
+
+function openAdjustmentSchedule() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ensureAdjustmentScheduleSheet_();
+
+  // Make sure dropdowns are applied whenever this sheet is opened from the menu
+  refreshDropdowns();
+
+  ss.setActiveSheet(sh);
+  ss.toast("✅ Recurring Adjustments is ready.", "Payroll Tools", 5);
+}
+
+/**************************************************
+ * AUTO-FILL EMPLOYEE ID IN RECURRING ADJUSTMENTS
+ **************************************************/
+/**
+ * Auto-fills Employee ID in Recurring Adjustments when EMPLOYEE NAME (col A) is changed.
+ * Works for single cell edits, bulk paste, and bulk delete.
+ */
+/**
+ * Auto-fills Employee ID in Recurring Adjustments when EMPLOYEE NAME (col A) is changed.
+ * - Works for single cell edits, bulk paste, and bulk delete
+ * - If EMPLOYEE NAME is cleared → clears dependent fields (B:I) like your adjustment sheets
+ */
+function autoFillAdjustmentScheduleId(range) {
+  if (!range || typeof range.getSheet !== "function") return;
+
+  const sh = range.getSheet();
+  if (!sh || sh.getName() !== CONFIG.SHEETS.ADJUST_SCHEDULE) return;
+
+  // Only react if the edited range INTERSECTS column A (EMPLOYEE NAME)
+  const startCol = range.getColumn();
+  const lastCol  = startCol + range.getNumColumns() - 1;
+  if (!(startCol <= 1 && lastCol >= 1)) return;
+
+  const startRow = range.getRow();
+  const numRows  = range.getNumRows();
+
+  // Skip header row safely
+  const firstDataRow = Math.max(2, startRow);
+  const offset = firstDataRow - startRow;
+  const rows = numRows - offset;
+  if (rows <= 0) return;
+
+  const ss = sh.getParent();
+  const masterName = getMainMasterSheetName_();
+  const master =
+    ss.getSheetByName(masterName) ||
+    ss.getSheetByName(CONFIG.SHEETS.MASTER);
+
+  // If master missing → clear IDs for affected rows (do not touch other columns)
+  if (!master) {
+    sh.getRange(firstDataRow, 2, rows, 1).clearContent();
+    return;
+  }
+
+  const mData = master.getDataRange().getValues();
+  if (!mData || mData.length < 2) {
+    sh.getRange(firstDataRow, 2, rows, 1).clearContent();
+    return;
+  }
+
+  const mHeaders = mData[0];
+  const mIdx = indexByHeader_(mHeaders);
+  const nameCol = mIdx["employee name"];
+  const idCol   = mIdx["employee id"];
+
+  if (nameCol == null || nameCol < 0 || idCol == null || idCol < 0) {
+    return;
+  }
+
+  const normName_ = s => String(s || "")
+    .replace(/\u00A0/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+
+  // Build name -> id map (stable: first non-empty ID wins)
+  const nameToId = {};
+  for (let r = 1; r < mData.length; r++) {
+    const n = normName_(mData[r][nameCol]);
+    const key = n.toLowerCase();
+    const id = String(mData[r][idCol] || "").trim();
+    if (!key) continue;
+
+    if (!Object.prototype.hasOwnProperty.call(nameToId, key) || (!nameToId[key] && id)) {
+      nameToId[key] = id;
+    }
+  }
+
+  // Always read the ACTUAL names from column A for the affected rows
+  // (handles pastes that include multiple columns)
+  const names2d = sh.getRange(firstDataRow, 1, rows, 1).getValues();
+
+  const idsOut = [];
+  const blankRowFlags = new Array(rows).fill(false);
+
+  for (let i = 0; i < rows; i++) {
+    const empName = normName_(names2d[i][0]);
+
+    if (!empName) {
+      idsOut.push([""]);
+      blankRowFlags[i] = true; // name cleared → clear dependent fields
+      continue;
+    }
+
+    const key = empName.toLowerCase();
+    idsOut.push([nameToId[key] || ""]);
+  }
+
+  
+
+  // Finally, write IDs for all affected rows in one shot (preserves other columns when name not blank)
+  sh.getRange(firstDataRow, 2, rows, 1).setValues(idsOut);
+}
+
+function ensureChangeLogSheet_() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheetName = CONFIG.SHEETS.LOG;
+
+  const headers = [
+    "Timestamp",
+    "Sheet Name",
+    "Action",
+    "Employee ID",
+    "Employee Name",
+    "Change Details (Field)",
+    "From",
+    "To",
+    "Updated By",
+  ];
+
+  let sh = ss.getSheetByName(sheetName);
+  if (!sh) {
+    sh = ss.insertSheet(sheetName);
+  }
+
+  const lastCol = Math.max(sh.getLastColumn(), headers.length);
+  let current = [];
+  if (sh.getLastRow() > 0) {
+    current = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+  }
+
+  let needsUpdate = false;
+  for (let i = 0; i < headers.length; i++) {
+    if (String(current[i] || "") !== headers[i]) {
+      needsUpdate = true;
+      break;
+    }
+  }
+
+  if (needsUpdate) {
+    sh.getRange(1, 1, 1, headers.length)
+      .setValues([headers])
+      .setFontWeight("bold");
+    sh.setFrozenRows(1);
+  }
+
+  return sh;
+}
+
+
+function openChangeLog() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ensureChangeLogSheet_();
+  ss.setActiveSheet(sh);
+}
+
+function getMainMasterSheetName_() {
+  const props = PropertiesService.getDocumentProperties();
+  const stored = props.getProperty(PROP_MAIN_MASTER_SHEET);
+  return stored || CONFIG.SHEETS.MASTER;
+}
+
+function setMainMasterSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheets = ss.getSheets();
+  const sheetNames = sheets.map(s => s.getName());
+  const ui = SpreadsheetApp.getUi();
+
+  const message =
+    "Enter the EXACT sheet name to use as the main masterfile.\n\n" +
+    "Available sheets:\n" +
+    sheetNames.join(", ");
+
+  const response = ui.prompt(
+    "Set Main Masterfile Sheet",
+    message,
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (response.getSelectedButton() !== ui.Button.OK) return;
+
+  const chosen = response.getResponseText().trim();
+  if (!sheetNames.includes(chosen)) {
+    ui.alert("Sheet not found: " + chosen);
+    return;
+  }
+
+  PropertiesService.getDocumentProperties()
+    .setProperty(PROP_MAIN_MASTER_SHEET, chosen);
+
+  ensureMasterSnapshot_(chosen);
+
+  ui.alert("Main masterfile sheet set to:\n" + chosen);
+}
+
+function trackMasterfileChanges(e) {
+  try {
+    if (!e || !e.range) return;
+
+    const range = e.range;
+    const sheet = range.getSheet();
+    const sheetName = sheet.getName();
+
+    const masterName    = getMainMasterSheetName_();
+    const defaultMaster = CONFIG.SHEETS.MASTER;
+
+    // Treat master as either the configured sheet OR the default sheet name
+    const isMaster = (sheetName === masterName || sheetName === defaultMaster);
+    const isAdjust = (sheetName === CONFIG.SHEETS.ADJUST_SCHEDULE);
+
+    // Only track main masterfile + Recurring Adjustments
+    if (!isMaster && !isAdjust) return;
+
+    // Never track edits on the Change Log sheet itself
+    if (sheetName === CONFIG.SHEETS.LOG) return;
+
+    const logSheet = ensureChangeLogSheet_();
+
+    const numRows  = range.getNumRows();
+    const numCols  = range.getNumColumns();
+    const startRow = range.getRow();
+    const startCol = range.getColumn();
+
+    // Header row for field names
+    const headerRow = sheet
+      .getRange(1, 1, 1, sheet.getLastColumn())
+      .getValues()[0];
+    const headerIdx = indexByHeader_(headerRow);
+    const empIdColIndex   = headerIdx["employee id"];   // 0-based
+    const empNameColIndex = headerIdx["employee name"]; // 0-based
+
+    const newValues = range.getValues();
+    const timestamp = new Date();
+    const userEmail =
+      (Session.getActiveUser && Session.getActiveUser().getEmail()) || "";
+
+    const rowsToAppend = [];
+
+    // ==== SNAPSHOT LOOKUP (for old values in multi-cell edits / mass delete) ====
+    const ss = sheet.getParent();
+    let snapshotName = null;
+    if (isMaster) {
+      snapshotName = SNAPSHOT_MASTER_SHEET;
+    } else if (isAdjust) {
+      snapshotName = SNAPSHOT_ADJUST_SHEET;
+    }
+
+    let snapValues = null;
+    if (snapshotName) {
+      const snapSheet = ss.getSheetByName(snapshotName);
+      if (snapSheet) {
+        const maxRow = snapSheet.getLastRow();
+        const maxCol = snapSheet.getLastColumn();
+
+        if (startRow <= maxRow && startCol <= maxCol) {
+          const height = Math.min(numRows, maxRow - startRow + 1);
+          const width  = Math.min(numCols, maxCol - startCol + 1);
+          if (height > 0 && width > 0) {
+            snapValues = snapSheet
+              .getRange(startRow, startCol, height, width)
+              .getValues();
+          }
+        }
+      }
+    }
+    // ==========================================================================
+
+    // ========== SINGLE CELL EDIT ==========
+    if (numRows === 1 && numCols === 1) {
+      const row = startRow;
+      const col = startCol;
+
+      // Skip header row
+      if (row === 1) return;
+
+      const newVal = newValues[0][0];
+
+      let oldVal;
+      if (typeof e.oldValue !== "undefined") {
+        oldVal = e.oldValue;
+      } else if (snapValues && snapValues[0] && typeof snapValues[0][0] !== "undefined") {
+        oldVal = snapValues[0][0];
+      } else {
+        oldVal = "";
+      }
+
+      // If truly no change, skip
+      if (String(oldVal) === String(newVal)) return;
+
+      let employeeId = "";
+      let employeeName = "";
+
+      if (empIdColIndex != null && empIdColIndex >= 0) {
+        employeeId = sheet.getRange(row, empIdColIndex + 1).getValue();
+      }
+      if (empNameColIndex != null && empNameColIndex >= 0) {
+        employeeName = sheet.getRange(row, empNameColIndex + 1).getValue();
+      }
+
+      const fieldName = headerRow[col - 1] || "Column " + col;
+
+      let action = "Edit";
+      if (oldVal === "" || oldVal == null) {
+        action = "Create/Set";
+      } else if (newVal === "" || newVal == null) {
+        action = "Clear";
+      }
+
+      rowsToAppend.push([
+        timestamp,
+        sheetName,
+        action,
+        employeeId,
+        employeeName,
+        fieldName,
+        oldVal,
+        newVal,
+        userEmail,
+      ]);
+
+    } else {
+      // ========== MULTI-CELL EDIT / PASTE / MASS CLEAR ==========
+      for (let r = 0; r < numRows; r++) {
+        const row = startRow + r;
+        if (row === 1) continue; // skip header
+
+        let employeeId = "";
+        let employeeName = "";
+
+        if (empIdColIndex != null && empIdColIndex >= 0) {
+          employeeId = sheet.getRange(row, empIdColIndex + 1).getValue();
+        }
+        if (empNameColIndex != null && empNameColIndex >= 0) {
+          employeeName = sheet
+            .getRange(row, empNameColIndex + 1)
+            .getValue();
+        }
+
+        for (let c = 0; c < numCols; c++) {
+          const col = startCol + c;
+          const newVal = newValues[r][c];
+
+          // oldVal from snapshot if available
+          let oldVal = "";
+          if (snapValues && snapValues[r] && typeof snapValues[r][c] !== "undefined") {
+            oldVal = snapValues[r][c];
+          }
+
+          // If old and new are the same, skip (no real change)
+          if (String(oldVal) === String(newVal)) continue;
+
+          const fieldName = headerRow[col - 1] || "Column " + col;
+
+          let action = "Edit";
+          if (oldVal === "" || oldVal == null) {
+            if (newVal === "" || newVal == null) {
+              // Was blank, still blank → no change
+              continue;
+            }
+            action = "Create/Set";
+          } else if (newVal === "" || newVal == null) {
+            action = "Clear";
+          }
+
+          rowsToAppend.push([
+            timestamp,
+            sheetName,
+            action,
+            employeeId,
+            employeeName,
+            fieldName,
+            oldVal,
+            newVal,
+            userEmail,
+          ]);
+        }
+      }
+    }
+
+    if (rowsToAppend.length > 0) {
+      const startLogRow = logSheet.getLastRow() + 1;
+      logSheet
+        .getRange(startLogRow, 1, rowsToAppend.length, 9)
+        .setValues(rowsToAppend);
+    }
+
+  } catch (err) {
+    Logger.log("trackMasterfileChanges error: " + err);
+  }
+}
+
+function logRowDeletions_(sheet, sheetName, snapshotSheetName) {
+  const ss = sheet.getParent();
+  const snapshot = ss.getSheetByName(snapshotSheetName);
+  if (!snapshot) return;
+
+  const logSheet = ensureChangeLogSheet_();
+
+  const oldValues = snapshot.getDataRange().getValues();
+  if (!oldValues || oldValues.length < 2) return; // header only
+
+  const newValues = sheet.getDataRange().getValues();
+
+  // Use header from snapshot
+  const headerRow = oldValues[0];
+  const headerIdx = indexByHeader_(headerRow);
+  const empIdIdx   = headerIdx["employee id"];
+  const empNameIdx = headerIdx["employee name"];
+
+  const keyFromRow = (row) => {
+    if (empIdIdx != null && empIdIdx >= 0) {
+      return "ID:" + String(row[empIdIdx]);
+    } else if (empNameIdx != null && empNameIdx >= 0) {
+      return "NM:" + String(row[empNameIdx]);
+    } else {
+      return "ROW:" + JSON.stringify(row);
+    }
+  };
+
+  // Build set of keys for current (post-deletion) sheet
+  const newKeySet = new Set();
+  for (let i = 1; i < newValues.length; i++) {
+    const row = newValues[i];
+    const key = keyFromRow(row);
+    newKeySet.add(key);
+  }
+
+  const timestamp = new Date();
+  const userEmail =
+    (Session.getActiveUser && Session.getActiveUser().getEmail()) || "";
+
+  const rowsToAppend = [];
+
+  // Any row that existed in snapshot but is not in new sheet = deleted
+  for (let i = 1; i < oldValues.length; i++) {
+    const row = oldValues[i];
+    const key = keyFromRow(row);
+    if (!newKeySet.has(key)) {
+      const employeeId = (empIdIdx != null && empIdIdx >= 0) ? row[empIdIdx] : "";
+      const employeeName = (empNameIdx != null && empNameIdx >= 0) ? row[empNameIdx] : "";
+
+      const fromText = JSON.stringify(row);
+
+      rowsToAppend.push([
+        timestamp,
+        sheetName,
+        "Row Deleted",
+        employeeId,
+        employeeName,
+        "(Entire Row)",
+        fromText,
+        "",          // To
+        userEmail,
+      ]);
+    }
+  }
+
+  if (rowsToAppend.length > 0) {
+    const startLogRow = logSheet.getLastRow() + 1;
+    logSheet
+      .getRange(startLogRow, 1, rowsToAppend.length, 9)
+      .setValues(rowsToAppend);
+  }
+}
+
+/**
+ * Exports the current (standalone) Apps Script project to a .zip file in Drive,
+ * saving into a specific folder and replacing older exports.
+ *
+ * Uses UrlFetchApp against Drive API export.
+ */
+function exportProjectZipToDrive() {
+  const DEST_FOLDER_ID = '1ffs3yMn3tZ8_HCiF1z-w2WJFq0NV4Q49'; // <- your folder
+
+  const scriptId = ScriptApp.getScriptId();
+  const token = ScriptApp.getOAuthToken();
+
+  const mime = 'application/vnd.google-apps.script+json';
+  const url =
+    'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(scriptId) +
+    '/export?mimeType=' + encodeURIComponent(mime) + '&alt=media';
+
+  const res = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: { Authorization: 'Bearer ' + token },
+    muteHttpExceptions: true,
+  });
+
+  const code = res.getResponseCode();
+  if (code !== 200) {
+    throw new Error('Drive export failed (' + code + '): ' + res.getContentText());
+  }
+
+  const exported = JSON.parse(res.getContentText()); // {name, files:[{name,type,source}]}
+  const projectName = exported.name || 'PayrollCore [test mode]';
+
+  const blobs = (exported.files || []).map(function (f) {
+    const ext = typeToExtension_(f.type);
+    const filename = String(f.name || 'file') + ext;
+    return Utilities.newBlob(String(f.source || ''), MimeType.PLAIN_TEXT, filename);
+  });
+
+    // Timestamp in filename (yyyyMMdd-HHmmss) using script timezone
+  const tz = Session.getScriptTimeZone();
+  const stamp = Utilities.formatDate(new Date(), tz, 'yyyyMMdd-HHmmss');
+
+  const zipName = projectName + ' - Backup ' + stamp + '.zip';
+  const zipBlob = Utilities.zip(blobs, zipName);
+
+  // --- Save into folder + replace old exports (delete older backups for this project) ---
+  const folder = DriveApp.getFolderById(DEST_FOLDER_ID);
+
+  // Delete older backups for THIS project (keeps only the latest run)
+  _deleteFilesByPrefixInFolder_(folder, projectName + ' - Backup ');
+
+  const zipFile = folder.createFile(zipBlob).setName(zipName);
+
+
+  Logger.log('Created ZIP in Drive folder: ' + zipFile.getUrl());
+  return { fileId: zipFile.getId(), url: zipFile.getUrl(), name: zipFile.getName() };
+}
+
+function typeToExtension_(type) {
+  switch (type) {
+    case 'SERVER_JS': return '.gs';
+    case 'HTML':      return '.html';
+    case 'JSON':      return '.json';
+    default:          return '.txt';
+  }
+}
+
+/**
+ * ==============================
+ * EXPORT ONE OR MULTIPLE FILES (to Drive folder)
+ * ==============================
+ * Usage:
+ *  - exportOneProjectFileToDrive('PayrollGenerator.gs')
+ *  - exportSelectedProjectFilesZipToDrive(['appsscript.json','PayrollGenerator.gs'])
+ *
+ * These create files in your DEST_FOLDER_ID so you can download from Drive.
+ */
+
+const EXPORT_FILES_DEST_FOLDER_ID = '1ffs3yMn3tZ8_HCiF1z-w2WJFq0NV4Q49'; // same as your backup folder
+
+function exportOneProjectFileToDrive(filename) {
+  const want = String(filename || '').trim();
+  if (!want) throw new Error('Missing filename.');
+
+  const exported = _fetchProjectExportJson_(); // uses Drive export API
+  const folder = DriveApp.getFolderById(EXPORT_FILES_DEST_FOLDER_ID);
+
+  const found = (exported.files || []).find(function (f) {
+    const ext = typeToExtension_(f.type);
+    const fname = String(f.name || 'file') + ext;
+    return fname === want;
+  });
+
+  if (!found) throw new Error('File not found in export: ' + want);
+
+  const ext = typeToExtension_(found.type);
+  const outName = String(found.name || 'file') + ext;
+
+  const tz = Session.getScriptTimeZone();
+  const stamp = Utilities.formatDate(new Date(), tz, 'yyyyMMdd-HHmmss');
+  const driveName = outName.replace(/\.[^.]+$/, '') + ' - ' + stamp + ext;
+
+  const blob = Utilities.newBlob(String(found.source || ''), MimeType.PLAIN_TEXT, driveName);
+  const file = folder.createFile(blob).setName(driveName);
+
+  Logger.log('Created file: ' + file.getUrl());
+  return { fileId: file.getId(), url: file.getUrl(), name: file.getName() };
+}
+
+function exportSelectedProjectFilesZipToDrive(filenames) {
+  if (!Array.isArray(filenames) || !filenames.length) {
+    throw new Error('Provide filenames array, e.g. ["appsscript.json","Code.gs"]');
+  }
+
+  const wantSet = {};
+  filenames.forEach(function (n) {
+    const s = String(n || '').trim();
+    if (s) wantSet[s] = true;
+  });
+  if (!Object.keys(wantSet).length) throw new Error('No valid filenames provided.');
+
+  const exported = _fetchProjectExportJson_();
+  const projectName = exported.name || 'PayrollCore [test mode]';
+  const folder = DriveApp.getFolderById(EXPORT_FILES_DEST_FOLDER_ID);
+
+  const blobs = (exported.files || [])
+    .map(function (f) {
+      const ext = typeToExtension_(f.type);
+      const fname = String(f.name || 'file') + ext;
+      return { f: f, filename: fname };
+    })
+    .filter(function (x) { return !!wantSet[x.filename]; })
+    .map(function (x) {
+      return Utilities.newBlob(String(x.f.source || ''), MimeType.PLAIN_TEXT, x.filename);
+    });
+
+  if (!blobs.length) throw new Error('None of the selected files were found in the export.');
+
+  const tz = Session.getScriptTimeZone();
+  const stamp = Utilities.formatDate(new Date(), tz, 'yyyyMMdd-HHmmss');
+
+  const zipName = projectName + ' - Selected Files ' + stamp + '.zip';
+  const zipBlob = Utilities.zip(blobs, zipName);
+
+  const zipFile = folder.createFile(zipBlob).setName(zipName);
+
+  Logger.log('Created ZIP: ' + zipFile.getUrl());
+  return { fileId: zipFile.getId(), url: zipFile.getUrl(), name: zipFile.getName() };
+}
+
+/** Internal: fetch export JSON from Drive API (same method as your backup function). */
+function _fetchProjectExportJson_() {
+  const scriptId = ScriptApp.getScriptId();
+  const token = ScriptApp.getOAuthToken();
+
+  const mime = 'application/vnd.google-apps.script+json';
+  const url =
+    'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(scriptId) +
+    '/export?mimeType=' + encodeURIComponent(mime) + '&alt=media';
+
+  const res = UrlFetchApp.fetch(url, {
+    method: 'get',
+    headers: { Authorization: 'Bearer ' + token },
+    muteHttpExceptions: true,
+  });
+
+  const code = res.getResponseCode();
+  if (code !== 200) {
+    throw new Error('Drive export failed (' + code + '): ' + res.getContentText());
+  }
+
+  return JSON.parse(res.getContentText()); // {name, files:[{name,type,source}]}
+}
+
+
+/**
+ * Deletes files with an exact name inside a specific folder.
+ */
+function _deleteFilesByExactNameInFolder_(folder, fileName) {
+  const it = folder.getFilesByName(String(fileName || ''));
+  while (it.hasNext()) {
+    const f = it.next();
+    try { f.setTrashed(true); } catch (e) {}
+  }
+}
+
+/**
+ * Deletes files whose names start with a prefix inside a specific folder.
+ * (Only needed if you later switch to timestamped filenames.)
+ */
+function _deleteFilesByPrefixInFolder_(folder, prefix) {
+  const p = String(prefix || '');
+  const it = folder.getFiles();
+  while (it.hasNext()) {
+    const f = it.next();
+    const name = String(f.getName() || '');
+    if (name.indexOf(p) === 0) {
+      try { f.setTrashed(true); } catch (e) {}
+    }
+  }
+}
+/**
+ * Installs (or reinstalls) a daily trigger to run exportProjectZipToDrive().
+ * Runs around 2:00 AM in your script's timezone.
+ */
+function installDailyProjectBackupTrigger() {
+  const handler = 'exportProjectZipToDrive';
+
+  // Remove existing triggers for this handler (avoid duplicates)
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(function (t) {
+    if (t.getHandlerFunction && t.getHandlerFunction() === handler) {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  // Create new daily trigger
+    ScriptApp.newTrigger(handler)
+    .timeBased()
+    .everyHours(6)
+    .create();
+
+}
+
+function _test_export_one() {
+  // PUT THE FILE NAME HERE:
+  exportOneProjectFileToDrive('PayrollPrompt.txt');
+}
+
+
+function _test_export_zip() {
+  // PUT THE FILE NAMES HERE:
+  exportSelectedProjectFilesZipToDrive([
+    'PayrollPosting.txt',
+    'PayrollPostingDialog.txt'
+  ]);
+}
+
+function listExportedProjectFilenames() {
+  const exported = _fetchProjectExportJson_();
+  const list = (exported.files || []).map(function (f) {
+    return String(f.name || 'file') + typeToExtension_(f.type);
+  }).sort();
+
+  Logger.log('=== EXPORTED FILES ===\n' + list.join('\n'));
+  return list;
+}

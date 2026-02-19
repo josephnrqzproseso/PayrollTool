@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top">
+    <?!= include_('UiTheme'); ?>
+    <style>
+      body { font-family: Arial, sans-serif; padding: 14px; }
+      .box { border: 1px solid #e0e0e0; border-radius: 10px; padding: 12px; margin-bottom: 12px; }
+      .row { margin-bottom: 10px; }
+      label { display:block; font-size: 12px; margin-bottom: 4px; opacity: 0.85; }
+      select, textarea { width: 100%; box-sizing: border-box; padding: 8px; border-radius: 8px; border: 1px solid #ddd; }
+      textarea { min-height: 110px; resize: vertical; }
+      .meta { font-size: 12px; line-height: 1.35; opacity: 0.9; word-break: break-word; white-space: pre-wrap; }
+      .actions { display:flex; gap:10px; justify-content:flex-end; margin-top: 10px; }
+      button { padding: 8px 12px; border-radius: 10px; border: 1px solid #ddd; cursor: pointer; }
+      button.primary { border: none; }
+      button:disabled { cursor: not-allowed; }
+
+      .err { color: #b00020; font-size: 12px; margin-top: 8px; white-space: pre-wrap; }
+
+      /* In-dialog toast */
+      .toast {
+        display: none;
+        margin-top: 10px;
+        padding: 10px 12px;
+        border-radius: 10px;
+        font-size: 12px;
+        white-space: pre-wrap;
+        border: 1px solid transparent;
+      }
+      .toast.info  { display: block; background: #f8f9fa; border-color: #e0e0e0; color: #202124; }
+      .toast.ok    { display: block; background: #e6f4ea; border-color: #34a853; color: #1b5e20; }
+      .toast.fail  { display: block; background: #fce8e6; border-color: #d93025; color: #b00020; }
+
+            /* Screenshot upload */
+      .drop {
+        border: 2px dashed #d0d7de;
+        border-radius: 12px;
+        padding: 12px;
+        text-align: center;
+        background: #fafbfc;
+        cursor: pointer;
+        user-select: none;
+      }
+      .drop.dragover {
+        background: #eef6ff;
+        border-color: #1a73e8;
+      }
+      .drop small { display:block; opacity: .75; margin-top: 4px; }
+      .previewWrap { margin-top: 10px; display:none; }
+      .previewWrap img { max-width: 100%; border-radius: 10px; border: 1px solid #e0e0e0; }
+      .previewActions { display:flex; gap:10px; justify-content:flex-end; margin-top: 8px; }
+      .muted { font-size: 12px; opacity: .8; }
+
+/* ✅ Brand logo INSIDE modal (sticky bottom, does not overlay scrollbar) */
+.brand-sticky-bottom{
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;  /* lower-right */
+  padding: 8px 0 2px;
+  background: #fff;
+}
+
+    </style>
+  </head>
+
+  <body>
+    <h3 style="margin-top:0">Send Feedback</h3>
+<div class="box">
+  <div class="meta" id="meta"></div>
+</div>
+
+
+    <div class="row">
+      <label for="issueType">Issue type</label>
+      <select id="issueType">
+  <option value="Pay amount looks off">Pay amount looks off</option>
+  <option value="Deduction/loan amount looks off">Deduction/loan amount looks off</option>
+  <option value="Payroll won’t run / shows an error">Payroll won’t run / shows an error</option>
+  <option value="Payslip doesn’t look right">Payslip doesn’t look right</option>
+  <option value="Report/Export issue">Report/Export issue</option>
+  <option value="Settings/Setup issue">Settings/Setup issue</option>
+  <option value="Data entry/import issue">Data entry/import issue</option>
+  <option value="Access/Permission issue">Access/Permission issue</option>
+  <option value="Bug">Bug</option>
+  <option value="UI/UX">UI/UX</option>
+  <option value="Feature request">Feature request</option>
+  <option value="Others">Others</option>
+</select>
+
+    </div>
+
+    <div class="row">
+      <label for="details">Details</label>
+      <textarea id="details" placeholder="Describe the issue, steps to reproduce, expected vs actual, screenshots link, etc."></textarea>
+    </div>
+
+    <div class="row">
+      <label>Screenshot (optional)</label>
+
+      <!-- hidden file input -->
+      <input id="ssFile" type="file" accept="image/*" multiple style="display:none" />
+
+      <!-- drop zone -->
+      <div class="drop" id="dropZone" title="Click to upload, drag & drop, or paste (Ctrl+V)">
+        📷 Click to upload • Drag & drop • Paste screenshot (Ctrl+V)
+        <small class="muted">PNG/JPG recommended. This will upload to Drive and save a link in the feedback.</small>
+      </div>
+
+      <div class="previewWrap" id="ssPreviewWrap">
+  <div id="ssList"></div>
+  <div class="previewActions">
+    <button type="button" onclick="clearScreenshots()">Remove all</button>
+  </div>
+</div>
+
+    </div>
+
+
+    <div class="row">
+      <label for="otherConcern">Other concerns (optional)</label>
+      <textarea id="otherConcern" placeholder="Any other concerns or notes not covered above."></textarea>
+    </div>
+
+    <div class="actions">
+      <button type="button" onclick="closeDialog()">Cancel</button>
+      <button type="button" class="primary" id="btnSubmit" onclick="submit()">Submit</button>
+    </div>
+
+    <div class="err" id="err"></div>
+    <div class="toast" id="toast"></div>
+
+    <div class="brand-sticky-bottom">
+  <?!= include_('BrandWatermarkInline'); ?>
+</div>
+
+    <script>
+      const CTX = <?!= JSON.stringify(ctx || {}) ?>;
+            // Screenshot state (data URL)
+      // Screenshots state (array)
+let SCREENSHOTS = []; // [{dataUrl,name,mimeType}]
+
+
+function _addScreenshotsFromFiles_(files) {
+  const arr = Array.isArray(files) ? files : (files ? Array.from(files) : []);
+  if (!arr.length) return;
+
+  let added = 0;
+  arr.forEach(function(file) {
+    if (!file) return;
+
+    if (!/^image\//i.test(file.type || '')) {
+      return; // ignore non-images
+    }
+
+    const reader = new FileReader();
+    reader.onload = function () {
+      SCREENSHOTS.push({
+        dataUrl: String(reader.result || ''),
+        name: String(file.name || 'screenshot.png'),
+        mimeType: String(file.type || 'image/png')
+      });
+      added++;
+      _renderScreenshotList_();
+      setToast('info', '✅ Attached ' + added + ' image(s).');
+    };
+    reader.onerror = function () {
+      setToast('fail', '❌ Failed reading one of the images.');
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function _renderScreenshotList_() {
+  const wrap = document.getElementById('ssPreviewWrap');
+  const list = document.getElementById('ssList');
+  if (!wrap || !list) return;
+
+  if (!SCREENSHOTS.length) {
+    list.innerHTML = '';
+    wrap.style.display = 'none';
+    return;
+  }
+
+  wrap.style.display = 'block';
+
+  const html = SCREENSHOTS.map(function(s, idx) {
+    const safeName = String(s.name || '');
+    return (
+      '<div style="display:flex;gap:10px;align-items:center;margin-top:8px;">' +
+        '<img src="' + String(s.dataUrl || '') + '" style="width:80px;height:80px;object-fit:cover;border-radius:10px;border:1px solid #e0e0e0;" />' +
+        '<div style="flex:1;min-width:0;">' +
+          '<div class="muted" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + safeName + '</div>' +
+        '</div>' +
+        '<button type="button" onclick="removeScreenshotAt(' + idx + ')">Remove</button>' +
+      '</div>'
+    );
+  }).join('');
+
+  list.innerHTML = html;
+}
+
+function removeScreenshotAt(i) {
+  const idx = Number(i);
+  if (isNaN(idx) || idx < 0 || idx >= SCREENSHOTS.length) return;
+  SCREENSHOTS.splice(idx, 1);
+  _renderScreenshotList_();
+}
+
+function clearScreenshots() {
+  SCREENSHOTS = [];
+  _renderScreenshotList_();
+  setToast('info', 'All screenshots removed.');
+}
+
+
+      function _wireScreenshotUi_() {
+        const dz = document.getElementById('dropZone');
+        const fi = document.getElementById('ssFile');
+
+        if (!dz || !fi) return;
+
+        // click -> file picker
+        dz.addEventListener('click', function () {
+          fi.click();
+        });
+
+        fi.addEventListener('change', function (e) {
+  const files = e && e.target && e.target.files ? e.target.files : null;
+  _addScreenshotsFromFiles_(files);
+  fi.value = '';
+});
+
+
+        // drag & drop
+        dz.addEventListener('dragover', function (e) {
+          e.preventDefault();
+          dz.classList.add('dragover');
+        });
+
+        dz.addEventListener('dragleave', function () {
+          dz.classList.remove('dragover');
+        });
+
+dz.addEventListener('drop', function (e) {
+  e.preventDefault();
+  dz.classList.remove('dragover');
+  const files = e && e.dataTransfer && e.dataTransfer.files ? e.dataTransfer.files : null;
+  _addScreenshotsFromFiles_(files);
+});
+
+
+document.addEventListener('paste', function (e) {
+  try {
+    const items = e && e.clipboardData && e.clipboardData.items ? e.clipboardData.items : [];
+    const files = [];
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i];
+      if (it && /^image\//i.test(it.type || '')) {
+        const f = it.getAsFile();
+        if (f) files.push(f);
+      }
+    }
+    if (files.length) _addScreenshotsFromFiles_(files);
+  } catch (_) {}
+});
+
+      }
+
+
+      function closeDialog() {
+        google.script.host.close();
+      }
+
+      function setErr(msg) {
+        document.getElementById('err').textContent = msg || '';
+      }
+
+      function setToast(kind, msg) {
+        const el = document.getElementById('toast');
+        el.className = 'toast' + (kind ? (' ' + kind) : '');
+        el.textContent = msg || '';
+        if (!msg) {
+          el.className = 'toast';
+          el.style.display = 'none';
+        } else {
+          el.style.display = 'block';
+        }
+      }
+
+      function setSubmitting(isSubmitting) {
+        const btn = document.getElementById('btnSubmit');
+        if (!btn) return;
+        btn.disabled = !!isSubmitting;
+        btn.style.opacity = isSubmitting ? '0.7' : '1';
+        btn.textContent = isSubmitting ? 'Submitting…' : 'Submit';
+      }
+
+      function renderMeta() {
+        const meta =
+          `Module: ${CTX.module || ''}\n` +
+          `User: ${CTX.userEmail || '(not available)'}\n` +
+          `File: ${CTX.fileName || ''}\n` +
+          `File ID: ${CTX.fileId || ''}\n` +
+          `URL: ${CTX.fileUrl || ''}\n` +
+          `Sheet: ${CTX.sheetName || ''}\n` +
+          `Cell: ${CTX.activeCellA1 || ''}\n` +
+          `Time: ${CTX.timestampIso || ''}`;
+        document.getElementById('meta').textContent = meta;
+      }
+
+      function submit() {
+        setErr('');
+        setToast('', '');
+
+        const issueType = (document.getElementById('issueType').value || '').trim();
+        const details = (document.getElementById('details').value || '').trim();
+        const otherConcern = (document.getElementById('otherConcern').value || '').trim();
+
+        if (!issueType) {
+          setErr('Issue type is required.');
+          setToast('fail', '❌ Please fill Issue type.');
+          return;
+        }
+        if (!details) {
+          setErr('Details are required.');
+          setToast('fail', '❌ Please fill Details.');
+          return;
+        }
+
+                const payload = {
+          moduleName: CTX.module || '',
+          issueType: issueType,
+          details: details,
+          otherConcern: otherConcern,
+          screenshots: SCREENSHOTS
+
+        };
+
+
+        setSubmitting(true);
+        setToast('info', 'Submitting…');
+
+        google.script.run
+          .withSuccessHandler(function(res) {
+            setSubmitting(false);
+
+            if (!res || res.ok === false) {
+              const msg = (res && res.message) ? res.message : 'Unknown error';
+              setErr('Submit failed: ' + msg);
+              setToast('fail', '❌ Failed to submit.\n' + msg);
+              return;
+            }
+
+                        const taskUrl = (res && res.odooTaskUrl) ? String(res.odooTaskUrl) : '';
+            const taskId  = (res && res.odooTaskId) ? String(res.odooTaskId) : '';
+            const warns   = (res && Array.isArray(res.warnings) && res.warnings.length)
+              ? ("\n\nWarnings:\n- " + res.warnings.join("\n- "))
+              : "";
+
+            setToast(
+              'ok',
+              '✅ Successfully submitted.\n' +
+              (taskUrl ? ('Odoo Task: ' + taskUrl) : ('Odoo Task ID: ' + (taskId || '(not available)'))) +
+              warns
+            );
+
+
+            setTimeout(function() {
+              google.script.host.close();
+            }, 900);
+          })
+          .withFailureHandler(function(err) {
+            setSubmitting(false);
+            const msg = (err && err.message) ? err.message : String(err || 'Submit failed');
+            setErr(msg);
+            setToast('fail', '❌ Failed to submit.\n' + msg);
+          })
+          .submitUserFeedback(payload);
+      }
+
+            renderMeta();
+      _wireScreenshotUi_();
+
+    </script>
+
+
+  </body>
+</html>

@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <style>
+    body {
+      font-family: "Segoe UI", Roboto, sans-serif;
+      margin: 20px;
+      color: #222;
+      background: #fff;
+    }
+    h2 {
+      font-size: 18px;
+      font-weight: 600;
+      margin-bottom: 14px;
+      color: #1a73e8;
+    }
+    label {
+      font-weight: 600;
+      font-size: 14px;
+      display: block;
+      margin-bottom: 6px;
+    }
+    select, input[type="date"], input[type="text"] {
+      width: 100%;
+      padding: 8px 10px;
+      border: 1px solid #ccc;
+      border-radius: 6px;
+      font-size: 13px;
+      box-sizing: border-box;
+    }
+    button {
+      border: none;
+      border-radius: 6px;
+      padding: 8px 12px;
+      cursor: pointer;
+      font-size: 13px;
+      transition: all 0.2s ease;
+    }
+    button.primary {
+      background: #1a73e8;
+      color: #fff;
+    }
+    button.primary:hover { background: #155fcf; }
+
+    button.secondary {
+      background: #f1f3f4;
+      color: #202124;
+    }
+    button.secondary:hover { background: #e4e7ea; }
+
+    .section {
+      margin-bottom: 18px;
+    }
+    .hint {
+      font-size: 12px;
+      color: #666;
+      margin-top: 4px;
+    }
+
+    .button-group {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .listBox {
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      background: #fafafa;
+      padding: 8px;
+      max-height: 150px;
+      overflow-y: auto;
+    }
+
+    .listBody label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-weight: normal;
+      font-size: 13px;
+      margin: 3px 0;
+      color: #333;
+    }
+
+    .listBody input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      accent-color: #1a73e8;
+      margin: 0;
+      vertical-align: middle;
+    }
+
+    /* Progress section */
+    #progressSection {
+      display: none;
+      text-align: center;
+    }
+    #progressBarContainer {
+      width: 100%;
+      background-color: #f0f0f0;
+      border-radius: 8px;
+      margin: 20px 0;
+      height: 24px;
+      overflow: hidden;
+    }
+    #progressBar {
+      width: 0%;
+      height: 100%;
+      background-color: #1a73e8;
+      color: white;
+      text-align: center;
+      line-height: 24px;
+      border-radius: 8px;
+      transition: width 0.2s ease;
+      font-size: 13px;
+    }
+    #status { font-size: 14px; color: #333; margin-top: 8px; }
+    #timers { margin-top: 6px; font-size: 12px; color: #666; }
+
+    .modalOverlay{
+  position:fixed; inset:0;
+  background:rgba(0,0,0,0.35);
+  display:flex; align-items:center; justify-content:center;
+  padding:16px; z-index:9999;
+}
+.modalCard{
+  background:#fff;
+  width:min(980px, 98vw);
+  max-height:85vh;
+  border-radius:14px;
+  box-shadow:0 12px 30px rgba(0,0,0,0.25);
+  display:flex; flex-direction:column;
+}
+.modalHeader{
+  display:flex; justify-content:space-between; align-items:flex-start;
+  padding:14px 16px; border-bottom:1px solid #eee;
+}
+.modalTitle{ font-size:18px; font-weight:700; }
+.modalSub{ font-size:12px; opacity:0.8; margin-top:2px; }
+.modalBody{ padding:12px 16px; overflow:auto; }
+.tableWrap{ overflow:auto; border:1px solid #eee; border-radius:10px; }
+.cbpTable{ width:100%; border-collapse:collapse; font-size:13px; }
+.cbpTable thead th{
+  position:sticky; top:0; background:#fafafa;
+  border-bottom:1px solid #e9e9e9;
+  padding:10px 8px; text-align:left;
+}
+.cbpTable tbody td{
+  border-bottom:1px solid #f0f0f0;
+  padding:8px;
+  vertical-align:middle;
+}
+.cbpTable tbody tr:hover{ background:#fcfcfc; }
+.modalFooter{
+  padding:12px 16px;
+  border-top:1px solid #eee;
+  display:flex; justify-content:flex-end; gap:10px;
+}
+
+.cbpTable select.cbpAction{
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  font-size: 13px;
+  box-sizing: border-box;
+  background: #fff;
+}
+
+/* ✅ Brand logo INSIDE modal (sticky bottom, does not overlay scrollbar) */
+.brand-sticky-bottom{
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;  /* lower-right */
+  padding: 8px 0 2px;
+  background: #fff;
+}
+
+
+  </style>
+  <?!= include_('UiTheme'); ?>
+</head>
+
+<body class="ui-page">
+
+  <h1>Generate Payroll</h1>
+  <div id="formSection">
+    
+    <!-- Payroll Frequency -->
+    <div class="section">
+      <label>Payroll Frequency</label>
+      <select id="payrollFrequency" onchange="toggleFrequencyUI()">
+        <option value="Semi-Monthly">Semi-Monthly</option>
+        <option value="Monthly">Monthly</option>
+        <option value="Special">Special</option>
+      </select>
+      <div class="hint">For Semi-Monthly use A/B codes. Special allows a custom label (e.g., BONUS).</div>
+    </div>
+
+    <!-- Payroll Code -->
+    <div id="payrollCodeContainer" class="section">
+      <label id="payrollCodeLabel">Payroll Code (A / B)</label>
+      <select id="payrollCodeSelect">
+        <option value="A">A (1st Half)</option>
+        <option value="B">B (2nd Half)</option>
+      </select>
+      <input type="text" id="payrollCodeText" placeholder="Enter special code (e.g., BONUS)" style="display:none;">
+    </div>
+
+    <!-- Dimension 1 (dynamic label from Masterfile) -->
+<div class="section">
+  <label id="entityLabel"></label>
+  <select id="entity" onchange="loadGroupsByEntity()">
+    <option>Loading…</option>
+  </select>
+  <div class="hint">Select a value for this tracking category to load its Payroll Groups.</div>
+</div>
+
+
+<!-- Payroll Groups -->
+<div class="section">
+  <label id="payrollGroupsLabel">Payroll Groups</label>
+  <div class="button-group">
+    <button class="secondary" type="button" onclick="toggleAllGroups(true)">Select All</button>
+    <button class="secondary" type="button" onclick="clearAllGroups()">Clear All</button>
+  </div>
+  <div class="listBox">
+    <div id="groupList" class="listBody"><div>Loading…</div></div>
+  </div>
+  <div id="groupsHint" class="hint">
+    Choose one or more Payroll Groups under the selected tracking category.
+  </div>
+</div>
+
+    <!-- Dates -->
+    <div class="section">
+      <label>Start Date</label>
+      <input type="date" id="startDate">
+
+      <label style="margin-top:10px;">End Date</label>
+      <input type="date" id="endDate">
+
+      <label style="margin-top:10px;">Crediting Date</label>
+      <input type="date" id="creditingDate">
+    </div>
+
+    <!-- Special Options -->
+    <div id="specialOptions" class="section" style="display:none;">
+      <label>Options</label>
+      <div style="display:flex;flex-direction:column;gap:6px;margin-top:4px;">
+        <label><input type="checkbox" id="computeTax" checked> Compute Tax</label>
+        <label><input type="checkbox" id="computeContrib" checked> Compute Contributions</label>
+      </div>
+    </div>
+
+    <button class="primary" onclick="startPayroll()">Generate Payroll</button>
+    <div id="loader" style="text-align:center;margin-top:10px;display:none;">Preparing payroll session...</div>
+  </div>
+
+  <!-- Progress Section -->
+  <div id="progressSection">
+    <h2>Payroll Progress</h2>
+    <div id="progressBarContainer"><div id="progressBar">0%</div></div>
+    <div id="status">Initializing...</div>
+    <div id="timers">Elapsed: 0s · ETA: --</div>
+  </div>
+
+<div class="brand-sticky-bottom">
+  <?!= include_('BrandWatermarkInline'); ?>
+</div>
+
+
+
+  <script>
+    let startTime = null;
+    let progressTimer = null;
+
+    window.addEventListener('load', () => {
+  if (google?.script?.run?.resetProgress)
+    google.script.run.resetProgress();
+  loadEntities();
+  loadDimensionLabels();   // <- NEW
+  toggleFrequencyUI();
+});
+
+function loadDimensionLabels() {
+  if (!google || !google.script || !google.script.run) return;
+
+  google.script.run
+    .withSuccessHandler(labels => {
+      if (!labels) return;
+
+      // 1) Main tracking category label above the dropdown
+      if (labels.dim1Label) {
+        const entLabel = document.getElementById('entityLabel');
+        if (entLabel) entLabel.textContent = labels.dim1Label;
+
+        // 2) Hint under the Payroll Groups box
+        const groupsHint = document.getElementById('groupsHint');
+        if (groupsHint) {
+          groupsHint.textContent =
+            'Choose one or more Payroll Groups under the selected ' + labels.dim1Label + '.';
+        }
+      }
+
+      // 3) Optional override for the Payroll Groups header itself
+      //    If your server DOESN'T return labels.groupLabel, this will just keep the default text.
+      if (labels.groupLabel) {
+        const gl = document.getElementById('payrollGroupsLabel');
+        if (gl) gl.textContent = labels.groupLabel;
+      }
+    })
+    .withFailureHandler(err => {
+      console.log('getDimensionLabels error', err);
+    })
+    .getDimensionLabels();
+}
+
+
+
+    // Load entities from Masterfile
+    function loadEntities() {
+      const sel = document.getElementById("entity");
+      sel.innerHTML = "<option>Loading…</option>";
+      google.script.run
+        .withSuccessHandler(entities => {
+          sel.innerHTML = "";
+          if (!entities || entities.length === 0) {
+            sel.innerHTML = "<option value=''>No entities found</option>";
+            return;
+          }
+          entities.forEach(e => {
+            const opt = document.createElement("option");
+            opt.value = e;
+            opt.textContent = e;
+            sel.appendChild(opt);
+          });
+          loadGroupsByEntity();
+        })
+        .withFailureHandler(err => {
+          sel.innerHTML = "<option value=''>Error loading entities</option>";
+          alert("Error loading entities:\n" + (err.message || err));
+        })
+        .getEntities();
+    }
+
+    // Load payroll groups based on entity
+    function loadGroupsByEntity() {
+      const entity = document.getElementById("entity").value || "";
+      const groupList = document.getElementById("groupList");
+      groupList.innerHTML = "<div>Loading…</div>";
+
+      google.script.run
+        .withSuccessHandler(groups => {
+          groupList.innerHTML = "";
+          if (!groups || groups.length === 0) {
+            groupList.innerHTML = "<div>No groups found</div>";
+            return;
+          }
+          groups
+            .filter(g => g.toUpperCase() !== "ALL") // remove ALL
+            .forEach(g => {
+              const row = document.createElement("label");
+              row.innerHTML = `<input type="checkbox" class="groupChk" value="${g}"> ${g}`;
+              groupList.appendChild(row);
+            });
+        })
+        .withFailureHandler(err => {
+          groupList.innerHTML = "<div>Error loading groups</div>";
+          alert("Error loading payroll groups:\n" + (err.message || err));
+        })
+        .getPayrollGroupsByEntity(entity);
+    }
+
+    function toggleAllGroups(checked) {
+      document.querySelectorAll(".groupChk").forEach(cb => cb.checked = checked);
+    }
+
+    function clearAllGroups() {
+      document.querySelectorAll(".groupChk").forEach(cb => cb.checked = false);
+    }
+
+    function getSelectedGroups() {
+      return Array.from(document.querySelectorAll(".groupChk:checked")).map(cb => cb.value);
+    }
+
+    function toggleFrequencyUI() {
+      const freq = document.getElementById("payrollFrequency").value;
+      const codeContainer = document.getElementById("payrollCodeContainer");
+      const specialOptions = document.getElementById("specialOptions");
+      const selectCode = document.getElementById("payrollCodeSelect");
+      const textCode = document.getElementById("payrollCodeText");
+      const label = document.getElementById("payrollCodeLabel");
+
+      if (freq === "Semi-Monthly") {
+        label.textContent = "Payroll Code (A / B)";
+        selectCode.style.display = "block";
+        textCode.style.display = "none";
+        codeContainer.style.display = "block";
+        specialOptions.style.display = "none";
+      } else if (freq === "Special") {
+        label.textContent = "Special Payroll Code";
+        selectCode.style.display = "none";
+        textCode.style.display = "block";
+        codeContainer.style.display = "block";
+        specialOptions.style.display = "block";
+      } else {
+        codeContainer.style.display = "none";
+        specialOptions.style.display = "none";
+      }
+    }
+
+    function startPayroll() {
+      const freq = document.getElementById("payrollFrequency").value;
+      let code = "";
+      if (freq === "Semi-Monthly") code = document.getElementById("payrollCodeSelect").value;
+      else if (freq === "Special") code = document.getElementById("payrollCodeText").value.trim() || "SPECIAL";
+      else if (freq === "Monthly")
+    code = "MONTHLY";   // ← FIX
+
+
+      const entity = document.getElementById("entity").value;
+      const selectedGroups = getSelectedGroups();
+
+      if (!entity) return alert("Please select an Entity.");
+      if (!selectedGroups.length) return alert("Please select at least one Payroll Group.");
+      if (!document.getElementById("startDate").value || !document.getElementById("endDate").value)
+        return alert("Please fill out both Start and End dates.");
+
+      const form = {
+        payrollFrequency: freq,
+        payrollCode: code,
+        entity: entity,
+        payrollGroups: selectedGroups,
+        startDate: document.getElementById("startDate").value,
+        endDate: document.getElementById("endDate").value,
+        creditingDate: document.getElementById("creditingDate").value,
+        computeTax: document.getElementById("computeTax").checked,
+        computeContrib: document.getElementById("computeContrib").checked
+      };
+
+                 // Save for modal actions
+      window.__lastPayrollForm = form;
+
+      // Instead of ugly confirm(), show a clean modal with a table
+      google.script.run
+        .withSuccessHandler(res => {
+          const rows = (res && res.rows) ? res.rows : [];
+          if (!rows.length) {
+            proceedPayroll(form);
+            return;
+          }
+          openCbpModal(res);
+        })
+        .withFailureHandler(err => {
+          alert("Error checking Computed Basic Pay:\n" + (err.message || err));
+        })
+        .listMasterfileComputedBasicPayRows(form);
+}
+
+function openCbpModal(res) {
+  const headerName = res.headerName || "Computed Basic Pay";
+  const sheetName  = res.sheetName || "Masterfile";
+  const rows = Array.isArray(res.rows) ? res.rows : [];
+
+  document.getElementById('cbpMeta').textContent =
+    `Sheet: ${sheetName} · Column: ${headerName} · Rows: ${rows.length}`;
+
+  const tb = document.getElementById('cbpTbody');
+  tb.innerHTML = "";
+
+  rows.forEach(r => {
+    const rn = Number(r.rowNumber || 0);
+    const empId = String(r.empId || "").trim();
+    const empName = String(r.empName || "").trim();
+
+    const comp = (typeof r.computed === "number")
+      ? r.computed.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+      : String(r.computed == null ? "" : r.computed);
+
+    const tr = document.createElement('tr');
+    tr.dataset.rowNumber = String(rn);
+
+    tr.innerHTML = `
+      <td>${escapeHtml(empId)}</td>
+      <td>${escapeHtml(empName)}</td>
+      <td style="text-align:right;">${escapeHtml(comp)}</td>
+      <td>
+        <select class="cbpAction" data-row="${rn}">
+          <option value="KEEP" selected>Keep</option>
+          <option value="DELETE">Delete</option>
+        </select>
+      </td>
+    `;
+    tb.appendChild(tr);
+  });
+
+  document.getElementById('cbpModal').style.display = 'flex';
+}
+
+
+function closeCbpModal() {
+  document.getElementById('cbpModal').style.display = 'none';
+}
+
+function deleteMarkedCbpAndProceed() {
+  const form = window.__lastPayrollForm;
+  if (!form) return;
+
+  const picked = Array.from(document.querySelectorAll('.cbpAction'))
+    .filter(sel => String(sel.value || '') === 'DELETE')
+    .map(sel => Number(sel.dataset.row || 0))
+    .filter(n => isFinite(n) && n >= 2);
+
+  // If nothing marked DELETE, just proceed
+  if (!picked.length) {
+    closeCbpModal();
+    proceedPayroll(form);
+    return;
+  }
+
+  google.script.run
+    .withSuccessHandler(() => {
+      closeCbpModal();
+      proceedPayroll(form);
+    })
+    .withFailureHandler(err => {
+      alert("Error deleting Computed Basic Pay:\n" + (err.message || err));
+    })
+    .clearMasterfileComputedBasicPayRows({ rowNumbers: picked });
+}
+
+
+function cancelPayrollStart() {
+  closeCbpModal();
+  // stay on form (do nothing)
+}
+
+
+function escapeHtml(s) {
+  return String(s || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+function proceedPayroll(form) {
+  document.getElementById("formSection").style.display = "none";
+  document.getElementById("progressSection").style.display = "block";
+  startTime = new Date();
+  updateProgress(0, "Starting payroll...", "--");
+  progressTimer = setInterval(fetchProgress, 1000);
+
+  google.script.run
+    .withSuccessHandler(() => {
+      // Backend completion is detected when getProgress() reaches 100%.
+    })
+    .withFailureHandler(err => {
+      updateProgress(100, "❌ Error: " + (err.message || err), "--");
+      clearInterval(progressTimer);
+    })
+    .runPayrollProgressive(form);
+}
+
+
+    function fetchProgress() {
+      google.script.run
+        .withSuccessHandler(progress => {
+          if (!progress) return;
+          const { percent, message, eta } = progress;
+          updateProgress(percent, message, eta);
+          if (percent >= 100) {
+  clearInterval(progressTimer);
+  setTimeout(() => google.script.host.close(), 2500);
+}
+
+        })
+        .getProgress();
+    }
+
+    function updateProgress(percent, message, eta) {
+      const now = new Date();
+      const elapsedSec = startTime ? ((now - startTime) / 1000).toFixed(1) : "0.0";
+      const bar = document.getElementById("progressBar");
+      bar.style.width = percent + "%";
+      bar.textContent = percent + "%";
+      document.getElementById("status").textContent = message || "";
+      document.getElementById("timers").textContent = `Elapsed: ${elapsedSec}s · ETA: ${eta || "--"}`;
+    }
+  </script>
+  <!-- Computed Basic Pay Modal -->
+<div id="cbpModal" class="modalOverlay" style="display:none;">
+  <div class="modalCard">
+    <div class="modalHeader">
+      <div>
+        <div class="modalTitle">Computed Basic Pay Found</div>
+        <div id="cbpMeta" class="modalSub"></div>
+      </div>
+      <button class="secondary" type="button" onclick="closeCbpModal()">Close</button>
+    </div>
+
+    <div class="modalBody">
+      <div class="tableWrap">
+        <table class="cbpTable">
+          <thead>
+  <tr>
+    <th style="width:140px;">Employee ID</th>
+    <th>Employee Name</th>
+    <th style="width:170px;text-align:right;">Computed Basic Pay</th>
+    <th style="width:140px;">Action</th>
+  </tr>
+</thead>
+<tbody id="cbpTbody"></tbody>
+
+        </table>
+      </div>
+    </div>
+
+    <div class="modalFooter">
+      <button class="secondary" type="button" onclick="proceedPayroll(window.__lastPayrollForm)">Proceed (Keep All)</button>
+      <button class="primary" type="button" onclick="deleteMarkedCbpAndProceed()">Delete Marked & Proceed</button>
+      <button class="secondary" type="button" onclick="cancelPayrollStart()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+
+</body>
+</html>

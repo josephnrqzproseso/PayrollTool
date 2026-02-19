@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <?!= include_('UiTheme'); ?>
+  <style>
+    body { font-family: "Segoe UI", Roboto, sans-serif; margin: 16px; color:#222; }
+    .grid { display:grid; grid-template-columns: 240px 1fr; gap: 10px 12px; align-items:center; }
+    input { width: 100%; padding: 8px; box-sizing:border-box; }
+    .row { margin-top: 14px; display:flex; gap:10px; }
+    button { padding: 8px 12px; cursor:pointer; }
+    pre { background:#f6f8fa; padding:10px; overflow:auto; }
+    h3 { margin: 18px 0 8px; }
+
+    /* ✅ Brand logo INSIDE modal (sticky bottom, does not overlay scrollbar) */
+.brand-sticky-bottom{
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  display: flex;
+  justify-content: flex-end;  /* lower-right */
+  padding: 8px 0 2px;
+  background: #fff;
+}
+
+  </style>
+</head>
+<body>
+  <h2>Final Pay (Postable Payroll Computation)</h2>
+
+  <div class="grid">
+    <div>Employee ID</div><div><input id="empId" placeholder="e.g., VISEO -91453"></div>
+
+    <div>End Date</div><div><input id="endDate" type="date"></div>
+    <div>From</div><div><input id="fromDate" type="date"></div>
+    <div>To</div><div><input id="toDate" type="date"></div>
+    <div>Crediting Date</div><div><input id="creditingDate" type="date"></div>
+
+    <h3 style="grid-column:1/-1;">Earnings (match your template)</h3>
+
+    <div>Unpaid Salary</div><div><input id="unpaidSalary" type="number" step="0.01"></div>
+    <div>Unpaid Allowance (Taxable)</div><div><input id="unpaidAllowanceTax" type="number" step="0.01"></div>
+    <div>Unpaid Allowance (Non-tax)</div><div><input id="unpaidAllowanceNonTax" type="number" step="0.01"></div>
+    <div>Deminimis</div><div><input id="deminimis" type="number" step="0.01"></div>
+    <div>Unpaid OT / On Call</div><div><input id="unpaidOt" type="number" step="0.01"></div>
+    <div>SL/PL Conversion (can be negative)</div><div><input id="slplConversion" type="number" step="0.01"></div>
+    <div>Other Compensation</div><div><input id="otherComp" type="number" step="0.01"></div>
+    <div>Unpaid 13th Month</div><div><input id="unpaid13th" type="number" step="0.01"></div>
+    <div>Redundancy Pay</div><div><input id="redundancyPay" type="number" step="0.01"></div>
+
+    <h3 style="grid-column:1/-1;">Deductions</h3>
+
+    <div>SSS EE MC</div><div><input id="sssEeMc" type="number" step="0.01"></div>
+    <div>SSS EE MPF</div><div><input id="sssEeMpf" type="number" step="0.01"></div>
+    <div>PhilHealth EE</div><div><input id="phEe" type="number" step="0.01"></div>
+    <div>Pag-IBIG EE</div><div><input id="piEe" type="number" step="0.01"></div>
+
+    <div>CTC Deduction</div><div><input id="ctcDeduction" type="number" step="0.01"></div>
+    <div>Other Deductions</div><div><input id="otherDeductions" type="number" step="0.01"></div>
+  </div>
+
+  <div class="row">
+    <button onclick="preview()">Preview</button>
+    <button onclick="createSheet()">Create Computation Sheet</button>
+  </div>
+
+  <h3>Preview</h3>
+  <pre id="out">(no preview yet)</pre>
+
+  <div class="brand-sticky-bottom">
+  <?!= include_('BrandWatermarkInline'); ?>
+</div>
+
+<script>
+  function getVal(id){ return document.getElementById(id).value; }
+  function payload(){
+    return {
+      empId: getVal('empId'),
+      endDate: getVal('endDate'),
+      fromDate: getVal('fromDate'),
+      toDate: getVal('toDate'),
+      creditingDate: getVal('creditingDate'),
+
+      unpaidSalary: getVal('unpaidSalary'),
+      unpaidAllowanceTax: getVal('unpaidAllowanceTax'),
+      unpaidAllowanceNonTax: getVal('unpaidAllowanceNonTax'),
+      deminimis: getVal('deminimis'),
+      unpaidOt: getVal('unpaidOt'),
+      slplConversion: getVal('slplConversion'),
+      otherComp: getVal('otherComp'),
+      unpaid13th: getVal('unpaid13th'),
+      redundancyPay: getVal('redundancyPay'),
+
+      sssEeMc: getVal('sssEeMc'),
+      sssEeMpf: getVal('sssEeMpf'),
+      phEe: getVal('phEe'),
+      piEe: getVal('piEe'),
+
+      ctcDeduction: getVal('ctcDeduction'),
+      otherDeductions: getVal('otherDeductions')
+    };
+  }
+
+  function preview(){
+    document.getElementById('out').textContent = 'Loading...';
+    google.script.run
+      .withSuccessHandler(res => {
+        document.getElementById('out').textContent = JSON.stringify(res, null, 2);
+      })
+      .withFailureHandler(err => {
+        document.getElementById('out').textContent = 'ERROR: ' + (err && err.message ? err.message : err);
+      })
+      .getFinalPayPreview(payload());
+  }
+
+  function createSheet(){
+    document.getElementById('out').textContent = 'Creating sheet...';
+    google.script.run
+      .withSuccessHandler(res => {
+        document.getElementById('out').textContent = 'Created: ' + res.sheetName + '\n\n' + JSON.stringify(res.preview, null, 2);
+      })
+      .withFailureHandler(err => {
+        document.getElementById('out').textContent = 'ERROR: ' + (err && err.message ? err.message : err);
+      })
+      .createFinalPaySheet(payload());
+  }
+</script>
+
+
+</body>
+</html>
