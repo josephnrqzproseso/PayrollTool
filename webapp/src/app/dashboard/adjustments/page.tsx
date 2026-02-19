@@ -25,6 +25,17 @@ interface Adjustment {
   periodKey: string;
 }
 
+type AdjustmentOperation = "upsert" | "delete";
+
+interface AdjustmentMutation {
+  employeeId: string;
+  name: string;
+  category: string;
+  amount?: number;
+  periodKey: string;
+  operation: AdjustmentOperation;
+}
+
 function buildPeriodOptions(): string[] {
   const options: string[] = [];
   const now = new Date();
@@ -119,14 +130,6 @@ export default function AdjustmentsPage() {
     setSaving(true);
     setMessage("");
 
-    const payloadAdjustments: Array<{
-      employeeId: string;
-      name: string;
-      category: string;
-      amount: number;
-      periodKey: string;
-    }> = [];
-
     const parsedAmount = Number(form.amount);
     if (Number.isNaN(parsedAmount)) {
       setMessage("Please enter a valid amount.");
@@ -134,28 +137,31 @@ export default function AdjustmentsPage() {
       return;
     }
 
-    payloadAdjustments.push({
+    const adjustments: AdjustmentMutation[] = [];
+
+    if (editingAdjustmentId && originalName && originalName !== form.name) {
+      adjustments.push({
+        employeeId,
+        name: originalName,
+        category: form.category,
+        periodKey,
+        operation: "delete",
+      });
+    }
+
+    adjustments.push({
       employeeId,
       name: form.name,
       category: form.category,
       amount: parsedAmount,
       periodKey,
+      operation: "upsert",
     });
-
-    if (editingAdjustmentId && originalName && originalName !== form.name) {
-      payloadAdjustments.unshift({
-        employeeId,
-        name: originalName,
-        category: form.category,
-        amount: 0,
-        periodKey,
-      });
-    }
 
     const res = await fetch("/api/adjustments/batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ adjustments: payloadAdjustments }),
+      body: JSON.stringify({ adjustments }),
     });
 
     if (res.ok) {
@@ -174,7 +180,15 @@ export default function AdjustmentsPage() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        adjustments: [{ employeeId: adj.employeeId, name: adj.name, category: adj.category, amount: 0, periodKey }],
+        adjustments: [
+          {
+            employeeId: adj.employeeId,
+            name: adj.name,
+            category: adj.category,
+            periodKey,
+            operation: "delete",
+          },
+        ],
       }),
     });
 
