@@ -10,12 +10,13 @@ export async function GET(req: NextRequest) {
 
   const url = new URL(req.url);
   const periodKey = url.searchParams.get("periodKey");
+  const employeeId = url.searchParams.get("employeeId");
 
   if (!periodKey)
     return NextResponse.json({ error: "periodKey query param required" }, { status: 400 });
 
   const adjustments = await prisma.adjustment.findMany({
-    where: { tenantId: ctx.tenantId, periodKey },
+    where: { tenantId: ctx.tenantId, periodKey, ...(employeeId ? { employeeId } : {}) },
     orderBy: { employeeId: "asc" },
   });
 

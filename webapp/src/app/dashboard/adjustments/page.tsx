@@ -25,8 +25,6 @@ interface Adjustment {
   periodKey: string;
 }
 
-type GridData = Record<string, Record<string, number>>;
-
 function buildPeriodOptions(): string[] {
   const options: string[] = [];
   const now = new Date();
@@ -41,12 +39,20 @@ function buildPeriodOptions(): string[] {
 export default function AdjustmentsPage() {
   const [employees, setEmployees] = useState<Employee[]>([]);
   const [adjTypes, setAdjTypes] = useState<AdjType[]>([]);
+  const [employeeId, setEmployeeId] = useState("");
   const [periodKey, setPeriodKey] = useState(() => {
     const now = new Date();
     const ym = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
     return `${ym} A`;
   });
-  const [grid, setGrid] = useState<GridData>({});
+  const [adjustments, setAdjustments] = useState<Adjustment[]>([]);
+  const [editingAdjustmentId, setEditingAdjustmentId] = useState<string | null>(null);
+  const [originalName, setOriginalName] = useState("");
+  const [form, setForm] = useState({
+    name: "",
+    category: "",
+    amount: "",
+  });
   const [saving, setSaving] = useState(false);
   const [applying, setApplying] = useState(false);
   const [message, setMessage] = useState("");
@@ -58,40 +64,62 @@ export default function AdjustmentsPage() {
       fetch("/api/adjustment-types").then((r) => r.json()),
     ]).then(([emps, types]) => {
       if (Array.isArray(emps)) setEmployees(emps);
+      if (Array.isArray(emps) && emps.length > 0) setEmployeeId(emps[0].id);
       if (Array.isArray(types)) setAdjTypes(types);
       setLoading(false);
     });
   }, []);
 
-  const loadAdjustments = useCallback(async () => {
-    const res = await fetch(`/api/adjustments?periodKey=${encodeURIComponent(periodKey)}`);
-    const data: Adjustment[] = await res.json();
-    if (!Array.isArray(data)) return;
-
-    const g: GridData = {};
-    for (const adj of data) {
-      if (!g[adj.employeeId]) g[adj.employeeId] = {};
-      g[adj.employeeId][adj.name] = adj.amount;
+  const loadAdjustments = useCallback(async (selectedEmployeeId: string) => {
+    if (!selectedEmployeeId) {
+      setAdjustments([]);
+      return;
     }
-    setGrid(g);
+
+    const res = await fetch(
+      `/api/adjustments?periodKey=${encodeURIComponent(periodKey)}&employeeId=${encodeURIComponent(selectedEmployeeId)}`,
+    );
+    const data: Adjustment[] = await res.json();
+    setAdjustments(Array.isArray(data) ? data : []);
   }, [periodKey]);
 
   useEffect(() => {
-    if (!loading) loadAdjustments();
-  }, [periodKey, loading, loadAdjustments]);
+    if (loading || !employeeId) return;
 
-  function setCellValue(empId: string, adjName: string, value: number) {
-    setGrid((prev) => ({
-      ...prev,
-      [empId]: { ...prev[empId], [adjName]: value },
-    }));
+    const timer = setTimeout(() => {
+      void loadAdjustments(employeeId);
+    }, 0);
+
+    return () => clearTimeout(timer);
+  }, [loading, employeeId, loadAdjustments]);
+
+  function resetForm() {
+    setForm({ name: "", category: "", amount: "" });
+    setEditingAdjustmentId(null);
+    setOriginalName("");
+  }
+
+  function onTypeChange(typeName: string) {
+    const t = adjTypes.find((a) => a.name === typeName);
+    setForm((f) => ({ ...f, name: typeName, category: t?.category ?? f.category }));
+  }
+
+  function onEditAdjustment(adj: Adjustment) {
+    setEditingAdjustmentId(adj.id);
+    setOriginalName(adj.name);
+    setForm({ name: adj.name, category: adj.category, amount: String(adj.amount) });
   }
 
   async function handleSave() {
+    if (!employeeId || !form.name || form.amount === "") {
+      setMessage("Please select employee/type and enter amount.");
+      return;
+    }
+
     setSaving(true);
     setMessage("");
 
-    const adjustments: Array<{
+    const payloadAdjustments: Array<{
       employeeId: string;
       name: string;
       category: string;
@@ -99,32 +127,59 @@ export default function AdjustmentsPage() {
       periodKey: string;
     }> = [];
 
-    for (const emp of employees) {
-      for (const t of adjTypes) {
-        const amount = grid[emp.id]?.[t.name] ?? 0;
-        adjustments.push({
-          employeeId: emp.id,
-          name: t.name,
-          category: t.category,
-          amount,
-          periodKey,
-        });
-      }
+    const parsedAmount = Number(form.amount);
+
+    payloadAdjustments.push({
+      employeeId,
+      name: form.name,
+      category: form.category,
+      amount: parsedAmount,
+      periodKey,
+    });
+
+    if (editingAdjustmentId && originalName && originalName !== form.name) {
+      payloadAdjustments.unshift({
+        employeeId,
+        name: originalName,
+        category: form.category,
+        amount: 0,
+        periodKey,
+      });
     }
 
     const res = await fetch("/api/adjustments/batch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ adjustments }),
+      body: JSON.stringify({ adjustments: payloadAdjustments }),
     });
 
     if (res.ok) {
       const result = await res.json();
       setMessage(`Saved: ${result.upserted} updated, ${result.removed} cleared.`);
+      resetForm();
+      loadAdjustments(employeeId);
     } else {
       setMessage("Failed to save.");
     }
     setSaving(false);
+  }
+
+  async function handleRemove(adj: Adjustment) {
+    const res = await fetch("/api/adjustments/batch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        adjustments: [{ employeeId: adj.employeeId, name: adj.name, category: adj.category, amount: 0, periodKey }],
+      }),
+    });
+
+    if (res.ok) {
+      setMessage(`Removed ${adj.name}.`);
+      if (editingAdjustmentId === adj.id) resetForm();
+      loadAdjustments(employeeId);
+    } else {
+      setMessage("Failed to remove adjustment.");
+    }
   }
 
   async function handleApplyRecurring() {
@@ -139,7 +194,7 @@ export default function AdjustmentsPage() {
     if (res.ok) {
       const data = await res.json();
       setMessage(`Recurring applied: ${data.created} created, ${data.skipped} skipped.`);
-      loadAdjustments();
+      loadAdjustments(employeeId);
     } else {
       const err = await res.json().catch(() => null);
       setMessage(err?.error || "Failed to apply recurring adjustments.");
@@ -157,6 +212,18 @@ export default function AdjustmentsPage() {
         <h1 style={{ fontSize: 24, fontWeight: 700 }}>Adjustments</h1>
         <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
           <select
+            value={employeeId}
+            onChange={(e) => {
+              setEmployeeId(e.target.value);
+              resetForm();
+            }}
+            style={{ padding: "8px 12px", borderRadius: 6, border: "1px solid #ddd", fontSize: 13, minWidth: 220 }}
+          >
+            {employees.map((emp) => (
+              <option key={emp.id} value={emp.id}>{emp.employeeName} ({emp.employeeId})</option>
+            ))}
+          </select>
+          <select
             value={periodKey}
             onChange={(e) => setPeriodKey(e.target.value)}
             style={{ padding: "8px 12px", borderRadius: 6, border: "1px solid #ddd", fontSize: 13 }}
@@ -167,9 +234,6 @@ export default function AdjustmentsPage() {
           </select>
           <button className="btn btn-secondary" onClick={handleApplyRecurring} disabled={applying}>
             {applying ? "Applying..." : "Apply Recurring"}
-          </button>
-          <button className="btn btn-primary" onClick={handleSave} disabled={saving}>
-            {saving ? "Saving..." : "Save All"}
           </button>
           {message && (
             <span style={{ fontSize: 13, color: message.includes("Failed") ? "#dc2626" : "#16a34a" }}>
@@ -186,55 +250,94 @@ export default function AdjustmentsPage() {
           </p>
         </div>
       ) : (
-        <div className="card" style={{ overflowX: "auto" }}>
-          <table style={{ fontSize: 13, minWidth: "100%" }}>
-            <thead>
-              <tr>
-                <th style={{ position: "sticky", left: 0, background: "#fff", zIndex: 1, minWidth: 180 }}>Employee</th>
-                <th style={{ position: "sticky", left: 180, background: "#fff", zIndex: 1, minWidth: 80 }}>Pay Basis</th>
+        <>
+          <form
+            onSubmit={(e) => {
+              e.preventDefault();
+              handleSave();
+            }}
+            className="card"
+            style={{ padding: 16, marginBottom: 16, display: "grid", gridTemplateColumns: "1fr 1fr 1fr auto", gap: 12, alignItems: "end" }}
+          >
+            <div>
+              <label style={{ display: "block", marginBottom: 4, fontSize: 13, fontWeight: 500 }}>Adjustment Type</label>
+              <select
+                value={form.name}
+                onChange={(e) => onTypeChange(e.target.value)}
+                style={{ width: "100%", padding: 8, borderRadius: 4, border: "1px solid #d1d5db" }}
+                required
+              >
+                <option value="">Select...</option>
                 {adjTypes.map((t) => (
-                  <th key={t.id} style={{ minWidth: 100, textAlign: "center", whiteSpace: "nowrap" }}>
-                    {t.name}
-                  </th>
+                  <option key={t.id} value={t.name}>{t.name}</option>
                 ))}
-              </tr>
-            </thead>
-            <tbody>
-              {employees.map((emp) => (
-                <tr key={emp.id}>
-                  <td style={{ position: "sticky", left: 0, background: "#fff", fontWeight: 500, whiteSpace: "nowrap" }}>
-                    {emp.employeeName}
-                  </td>
-                  <td style={{ position: "sticky", left: 180, background: "#fff", fontSize: 12, color: "var(--text-muted)" }}>
-                    {emp.payBasis}
-                  </td>
-                  {adjTypes.map((t) => (
-                    <td key={t.id} style={{ padding: 2 }}>
-                      <input
-                        type="number"
-                        step="any"
-                        value={grid[emp.id]?.[t.name] ?? ""}
-                        onChange={(e) =>
-                          setCellValue(emp.id, t.name, e.target.value === "" ? 0 : Number(e.target.value))
-                        }
-                        style={{
-                          width: "100%",
-                          padding: "6px 8px",
-                          border: "1px solid #e5e7eb",
-                          borderRadius: 4,
-                          fontSize: 13,
-                          textAlign: "right",
-                          background: "transparent",
-                        }}
-                        placeholder="0"
-                      />
-                    </td>
-                  ))}
+              </select>
+            </div>
+            <div>
+              <label style={{ display: "block", marginBottom: 4, fontSize: 13, fontWeight: 500 }}>Category</label>
+              <input
+                value={form.category}
+                readOnly
+                style={{ width: "100%", padding: 8, borderRadius: 4, border: "1px solid #d1d5db", background: "#f3f4f6" }}
+              />
+            </div>
+            <div>
+              <label style={{ display: "block", marginBottom: 4, fontSize: 13, fontWeight: 500 }}>Amount</label>
+              <input
+                type="number"
+                step="any"
+                value={form.amount}
+                onChange={(e) => setForm((prev) => ({ ...prev, amount: e.target.value }))}
+                style={{ width: "100%", padding: 8, borderRadius: 4, border: "1px solid #d1d5db" }}
+                required
+              />
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button type="submit" className="btn btn-primary" disabled={saving}>
+                {saving ? "Saving..." : editingAdjustmentId ? "Save" : "Add"}
+              </button>
+              {editingAdjustmentId && (
+                <button type="button" className="btn btn-secondary" onClick={resetForm}>
+                  Cancel
+                </button>
+              )}
+            </div>
+          </form>
+
+          <div className="card" style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", fontSize: 13, borderCollapse: "collapse" }}>
+              <thead>
+                <tr style={{ borderBottom: "1px solid #e5e7eb", textAlign: "left" }}>
+                  <th style={{ padding: "10px 12px" }}>Type</th>
+                  <th style={{ padding: "10px 12px" }}>Category</th>
+                  <th style={{ padding: "10px 12px", textAlign: "right" }}>Amount</th>
+                  <th style={{ padding: "10px 12px" }}>Actions</th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+              </thead>
+              <tbody>
+                {adjustments.length === 0 ? (
+                  <tr>
+                    <td colSpan={4} style={{ padding: "14px 12px", color: "var(--text-muted)" }}>
+                      No adjustments found for the selected employee and period.
+                    </td>
+                  </tr>
+                ) : (
+                  adjustments.map((adj) => (
+                    <tr key={adj.id} style={{ borderBottom: "1px solid #f3f4f6" }}>
+                      <td style={{ padding: "10px 12px" }}>{adj.name}</td>
+                      <td style={{ padding: "10px 12px" }}>{adj.category}</td>
+                      <td style={{ padding: "10px 12px", textAlign: "right" }}>{adj.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}</td>
+                      <td style={{ padding: "10px 12px", display: "flex", gap: 6 }}>
+                        <button className="btn btn-secondary" onClick={() => onEditAdjustment(adj)}>Edit</button>
+                        <button className="btn btn-secondary" onClick={() => handleRemove(adj)}>Remove</button>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </>
       )}
     </div>
   );
