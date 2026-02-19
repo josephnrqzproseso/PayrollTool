@@ -25,7 +25,26 @@ interface Adjustment {
   periodKey: string;
 }
 
-type GridData = Record<string, Record<string, number>>;
+type GridData = Record<string, Record<string, number | undefined>>;
+
+type AdjustmentOperation = "upsert" | "delete";
+
+interface AdjustmentMutation {
+  employeeId: string;
+  name: string;
+  category: string;
+  amount?: number;
+  periodKey: string;
+  operation: AdjustmentOperation;
+}
+
+function cloneGridData(data: GridData): GridData {
+  const cloned: GridData = {};
+  for (const [employeeId, values] of Object.entries(data)) {
+    cloned[employeeId] = { ...values };
+  }
+  return cloned;
+}
 
 function buildPeriodOptions(): string[] {
   const options: string[] = [];
@@ -47,6 +66,7 @@ export default function AdjustmentsPage() {
     return `${ym} A`;
   });
   const [grid, setGrid] = useState<GridData>({});
+  const [originalGrid, setOriginalGrid] = useState<GridData>({});
   const [saving, setSaving] = useState(false);
   const [applying, setApplying] = useState(false);
   const [message, setMessage] = useState("");
@@ -73,43 +93,66 @@ export default function AdjustmentsPage() {
       if (!g[adj.employeeId]) g[adj.employeeId] = {};
       g[adj.employeeId][adj.name] = adj.amount;
     }
-    setGrid(g);
+    setOriginalGrid(g);
+    setGrid(cloneGridData(g));
   }, [periodKey]);
 
   useEffect(() => {
     if (!loading) loadAdjustments();
   }, [periodKey, loading, loadAdjustments]);
 
-  function setCellValue(empId: string, adjName: string, value: number) {
+  function setCellValue(empId: string, adjName: string, value: number | undefined) {
     setGrid((prev) => ({
       ...prev,
       [empId]: { ...prev[empId], [adjName]: value },
     }));
   }
 
+  function getGridValue(source: GridData, employeeId: string, name: string) {
+    return source[employeeId]?.[name];
+  }
+
   async function handleSave() {
     setSaving(true);
     setMessage("");
 
-    const adjustments: Array<{
-      employeeId: string;
-      name: string;
-      category: string;
-      amount: number;
-      periodKey: string;
-    }> = [];
+    const adjustments: AdjustmentMutation[] = [];
 
     for (const emp of employees) {
       for (const t of adjTypes) {
-        const amount = grid[emp.id]?.[t.name] ?? 0;
+        const originalValue = getGridValue(originalGrid, emp.id, t.name);
+        const currentValue = getGridValue(grid, emp.id, t.name);
+
+        if (originalValue === currentValue) continue;
+
+        if (currentValue === undefined) {
+          if (originalValue !== undefined) {
+            adjustments.push({
+              employeeId: emp.id,
+              name: t.name,
+              category: t.category,
+              periodKey,
+              operation: "delete",
+            });
+          }
+          continue;
+        }
+
         adjustments.push({
           employeeId: emp.id,
           name: t.name,
           category: t.category,
-          amount,
+          amount: currentValue,
           periodKey,
+          operation: "upsert",
         });
       }
+    }
+
+    if (adjustments.length === 0) {
+      setMessage("No changes to save.");
+      setSaving(false);
+      return;
     }
 
     const res = await fetch("/api/adjustments/batch", {
@@ -120,6 +163,7 @@ export default function AdjustmentsPage() {
 
     if (res.ok) {
       const result = await res.json();
+      setOriginalGrid(cloneGridData(grid));
       setMessage(`Saved: ${result.upserted} updated, ${result.removed} cleared.`);
     } else {
       setMessage("Failed to save.");
@@ -214,9 +258,20 @@ export default function AdjustmentsPage() {
                         type="number"
                         step="any"
                         value={grid[emp.id]?.[t.name] ?? ""}
-                        onChange={(e) =>
-                          setCellValue(emp.id, t.name, e.target.value === "" ? 0 : Number(e.target.value))
-                        }
+                        onChange={(e) => {
+                          const nextValue = e.target.value === "" ? undefined : Number(e.target.value);
+                          if (nextValue !== undefined && Number.isNaN(nextValue)) return;
+
+                          const hadExistingValue = getGridValue(originalGrid, emp.id, t.name) !== undefined;
+                          if (nextValue === undefined && hadExistingValue) {
+                            const shouldDelete = window.confirm(
+                              `Delete ${t.name} adjustment for ${emp.employeeName} in ${periodKey}?`,
+                            );
+                            if (!shouldDelete) return;
+                          }
+
+                          setCellValue(emp.id, t.name, nextValue);
+                        }}
                         style={{
                           width: "100%",
                           padding: "6px 8px",
